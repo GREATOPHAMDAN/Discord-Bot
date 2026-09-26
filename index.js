@@ -1,5 +1,5 @@
 // ==========================================
-// EAGLE COUNTY ROLEPLAY BOT - V.1.4.1
+// EAGLE COUNTY ROLEPLAY BOT - V.1.6
 // ==========================================
 
 const {
@@ -42,9 +42,8 @@ const DAILY_LIMIT = 15;
 const WEBHOOK_COLOR = 0x2563EB;
 const EMBED_ACCENT = 0xFF8C00;
 
-// Anti-nuke
-const REJOIN_WATCH_MS = 24 * 60 * 60 * 1000;   // 24 hours
-const REJOIN_MUTE_MS = 24 * 60 * 60 * 1000;    // 24 hour timeout
+const REJOIN_WATCH_MS = 24 * 60 * 60 * 1000;
+const REJOIN_MUTE_MS = 24 * 60 * 60 * 1000;
 
 const DEFAULT_ANTINUKE = {
     enabled: true,
@@ -52,7 +51,55 @@ const DEFAULT_ANTINUKE = {
     windowMs: 60000,
     whitelist: [],
     counters: {},
-    watchlist: {} // userId -> expiry timestamp
+    watchlist: {}
+};
+
+// ==========================================
+// TIER DEFINITIONS
+// ==========================================
+
+const TIERS = ["staff", "admin", "highrank", "management"];
+
+const TIER_INCLUDES = {
+    staff: ["staff"],
+    admin: ["admin", "staff"],
+    highrank: ["highrank", "admin", "staff"],
+    management: ["management", "highrank", "admin", "staff"]
+};
+
+// Default permissions per command (V.1.6)
+const DEFAULT_COMMAND_PERMS = {
+    // Setup / config — ONLY Management can run these
+    "setup": ["management"],
+    "setprefix": ["management"],
+    "setupverify": ["management"],
+    "setuptickets": ["management"],
+    "set-webhook": ["management"],
+    "remove-webhook": ["management"],
+    "antinuke": ["management"],
+
+    // HR / Applications
+    "acceptsetup": ["highrank", "management"],
+    "accept": ["highrank", "management"],
+    "promote": ["highrank", "management"],
+    "demote": ["highrank", "management"],
+    "infract": ["highrank", "management"],
+
+    // Moderation
+    "mute": ["staff", "admin", "highrank", "management"],
+    "unmute": ["staff", "admin", "highrank", "management"],
+    "warn": ["staff", "admin", "highrank", "management"],
+    "kick": ["staff", "admin", "highrank", "management"],
+    "ban": ["admin", "highrank", "management"],
+    "unban": ["admin", "highrank", "management"],
+
+    // Logging (unified /loguser now supports Warn / Kick / Ban)
+    "loguser": ["staff", "admin", "highrank", "management"],
+
+    // Public
+    "suggest": ["everyone"],
+    "staff-feedback": ["everyone"],
+    "help": ["everyone"]
 };
 
 // ==========================================
@@ -88,6 +135,7 @@ const client = new Client({
 function createDefaultGuildConfig() {
     return {
         prefix: DEFAULT_PREFIX,
+
         logChannelId: null,
         verificationLogChannelId: null,
         transcriptChannelId: null,
@@ -108,10 +156,13 @@ function createDefaultGuildConfig() {
 
         staffRoles: [],
         adminRoles: [],
+        highRankRoles: [],
         managementRoles: [],
         exemptRoles: [],
         verifyRoleId: null,
         acceptRoleIds: [],
+
+        commandPerms: {},
 
         dmTemplates: {
             accept: "Congratulations! Your application for **{server}** has been accepted.\n\nPlease review the server for next steps.",
@@ -165,14 +216,71 @@ function getGuildConfig(guildId) {
     for (const key of Object.keys(defaults)) {
         if (gc[key] === undefined) gc[key] = defaults[key];
     }
+    // Migrations
     if (gc.acceptRoleId && (!gc.acceptRoleIds || gc.acceptRoleIds.length === 0)) gc.acceptRoleIds = [gc.acceptRoleId];
     if (gc.ticketCategoryId && !gc.ticketSupportCategoryId) gc.ticketSupportCategoryId = gc.ticketCategoryId;
     if (gc.ticketCategoryHighRankId && !gc.ticketHighRankCategoryId) gc.ticketHighRankCategoryId = gc.ticketCategoryHighRankId;
+    if (!Array.isArray(gc.highRankRoles)) gc.highRankRoles = [];
+    if (!gc.commandPerms) gc.commandPerms = {};
     if (!gc.antinuke) gc.antinuke = JSON.parse(JSON.stringify(DEFAULT_ANTINUKE));
     if (!gc.antinuke.counters) gc.antinuke.counters = {};
     if (!Array.isArray(gc.antinuke.whitelist)) gc.antinuke.whitelist = [];
     if (!gc.antinuke.watchlist) gc.antinuke.watchlist = {};
+
+    // Migration for V.1.5 -> V.1.6:
+    // If user previously had admin allowed for setup commands, force it to management-only
+    // UNLESS the user explicitly overrode it (we can't tell, so we leave it — but
+    // we change the DEFAULT for fresh configs).
+    // Since default is now ["management"], any guild with no override gets the new default.
+
     return gc;
+}
+
+// ==========================================
+// PERMISSION SYSTEM
+// ==========================================
+
+function getRequiredTiers(guildId, commandName) {
+    const gc = getGuildConfig(guildId);
+    if (gc.commandPerms && gc.commandPerms[commandName]) {
+        return gc.commandPerms[commandName];
+    }
+    return DEFAULT_COMMAND_PERMS[commandName] || ["management"];
+}
+
+function getMemberTiers(member) {
+    const tiers = new Set();
+    if (!member) return tiers;
+
+    const gc = getGuildConfig(member.guild.id);
+    // Note: Native Administrator permission does NOT auto-grant setup rights in V.1.6.
+    // Only assigned Management roles do. Members with Administrator are still
+    // treated as "admin" tier for other commands.
+    if (member.permissions.has(PermissionFlagsBits.Administrator)) {
+        tiers.add("admin");
+        tiers.add("staff");
+    }
+    if (hasRole(member, gc.staffRoles)) tiers.add("staff");
+    if (hasRole(member, gc.adminRoles)) tiers.add("admin");
+    if (hasRole(member, gc.highRankRoles)) tiers.add("highrank");
+    if (hasRole(member, gc.managementRoles)) tiers.add("management");
+    return tiers;
+}
+
+function canRunCommand(member, commandName) {
+    if (!member) return false;
+
+    const required = getRequiredTiers(member.guild.id, commandName);
+    if (required.includes("everyone")) return true;
+
+    const memberTiers = getMemberTiers(member);
+    const expanded = new Set();
+    for (const t of memberTiers) {
+        const list = TIER_INCLUDES[t] || [t];
+        for (const x of list) expanded.add(x);
+    }
+
+    return required.some(t => expanded.has(t));
 }
 
 // ==========================================
@@ -201,20 +309,6 @@ function getOrdinalSuffix(n) {
 function hasRole(member, roleIds) {
     if (!member?.roles || !Array.isArray(roleIds)) return false;
     return member.roles.cache.some(role => roleIds.includes(role.id));
-}
-
-function isStaff(member) {
-    if (!member) return false;
-    if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
-    const gc = getGuildConfig(member.guild.id);
-    return hasRole(member, gc.adminRoles) || hasRole(member, gc.staffRoles) || hasRole(member, gc.managementRoles);
-}
-
-function isAdmin(member) {
-    if (!member) return false;
-    if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
-    const gc = getGuildConfig(member.guild.id);
-    return hasRole(member, gc.adminRoles) || hasRole(member, gc.managementRoles);
 }
 
 function isExempt(member) {
@@ -350,7 +444,7 @@ async function lookupRobloxUser(username) {
 }
 
 // ==========================================
-// ANTI-NUKE CORE
+// ANTI-NUKE
 // ==========================================
 
 async function fetchAuditExecutor(guild, eventType, targetId, withinMs = 15000) {
@@ -376,80 +470,48 @@ function recordAntinukeEvent(guildId, userId) {
     return gc.antinuke.counters[userId].length;
 }
 
-/**
- * Removes every role from a member (except @everyone).
- * Also handles hierarchy: if a role is not manageable by the bot,
- * it skips only THAT role but continues with the rest.
- */
 async function stripAllRoles(member, reason) {
     if (!member) return { removed: 0, failed: 0 };
     const me = member.guild.members.me;
-
-    // Every role except @everyone
     const allRoles = member.roles.cache.filter(r => r.id !== member.guild.id);
-
-    let removed = 0;
-    let failed = 0;
-
+    let removed = 0, failed = 0;
     for (const role of allRoles.values()) {
         const manageable = role.position < me.roles.highest.position && !role.managed;
         if (!manageable) { failed++; continue; }
-        try {
-            await member.roles.remove(role, reason);
-            removed++;
-        } catch (e) {
-            failed++;
-            console.error("stripAllRoles remove fail:", role.name, e.message);
-        }
+        try { await member.roles.remove(role, reason); removed++; }
+        catch (e) { failed++; console.error("strip fail:", role.name, e.message); }
     }
-
-    // Small delay to let Discord process
     await new Promise(r => setTimeout(r, 500));
-
-    // Re-fetch to verify
     try {
         const fresh = await member.guild.members.fetch({ user: member.id, force: true });
         const stillHas = fresh.roles.cache.filter(r => r.id !== member.guild.id);
-        if (stillHas.size > 0) {
-            console.warn("stripAllRoles: still has " + stillHas.size + " roles after strip:", stillHas.map(r => r.name).join(", "));
-        }
-    } catch (e) { /* ignore */ }
-
+        if (stillHas.size > 0) console.warn("still has " + stillHas.size + " roles:", stillHas.map(r => r.name).join(", "));
+    } catch (e) {}
     return { removed, failed };
 }
 
 async function triggerAntinuke(guild, member, trigger, count) {
     const gc = getGuildConfig(guild.id);
-
-    // 1) STRIP ALL ROLES
     const { removed, failed } = await stripAllRoles(member, "Anti-Nuke: " + trigger);
 
-    // 2) KICK THE USER
     let kicked = false;
-    try {
-        await member.kick("Anti-Nuke triggered: " + trigger);
-        kicked = true;
-    } catch (e) {
-        console.error("anti-nuke kick failed:", e.message);
-    }
+    try { await member.kick("Anti-Nuke triggered: " + trigger); kicked = true; }
+    catch (e) { console.error("kick:", e.message); }
 
-    // 3) ADD TO 24h REJOIN WATCHLIST
     const expiry = Date.now() + REJOIN_WATCH_MS;
     gc.antinuke.watchlist[member.id] = expiry;
-    // Reset counter
     gc.antinuke.counters[member.id] = [];
     saveConfig();
 
-    // 4) LOG
     const logEmbed = new EmbedBuilder()
         .setTitle("🚨 ANTI-NUKE TRIGGERED")
         .setDescription(
             "**User:** " + member.user.tag + " (" + member.id + ")\n" +
             "**Trigger:** " + trigger + "\n" +
-            "**Count in window:** " + count + "\n" +
-            "**Roles Removed:** " + removed + (failed ? " (failed: " + failed + " — above my role)" : "") + "\n" +
-            "**Kicked:** " + (kicked ? "Yes" : "No (missing Kick Members?)") + "\n" +
-            "**Watchlist Expires:** <t:" + Math.floor(expiry / 1000) + ":R>"
+            "**Count:** " + count + "\n" +
+            "**Roles Removed:** " + removed + (failed ? " (failed: " + failed + ")" : "") + "\n" +
+            "**Kicked:** " + (kicked ? "Yes" : "No") + "\n" +
+            "**Watch Expires:** <t:" + Math.floor(expiry / 1000) + ":R>"
         )
         .setColor(0xED4245)
         .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
@@ -458,46 +520,18 @@ async function triggerAntinuke(guild, member, trigger, count) {
     await sendLog(guild, logEmbed);
     await sendWebhook(guild, logEmbed);
 
-    // 5) DM the offender
     try {
-        await member.send({
-            embeds: [
-                new EmbedBuilder()
-                    .setTitle("⚠️ Anti-Nuke Triggered")
-                    .setDescription(
-                        "You triggered the anti-nuke protection in **" + guild.name + "**.\n\n" +
-                        "**Trigger:** " + trigger + "\n" +
-                        "**Count:** " + count + "\n\n" +
-                        "All of your roles were removed and you were kicked.\n" +
-                        "**If you rejoin within 24 hours, you will be instantly muted for 24 hours.**"
-                    )
-                    .setColor(0xED4245)
-                    .setTimestamp()
-            ]
-        }).catch(() => {});
-    } catch (e) { /* DMs closed */ }
+        await member.send({ embeds: [new EmbedBuilder().setTitle("⚠️ Anti-Nuke Triggered")
+            .setDescription("You triggered anti-nuke in **" + guild.name + "**.\n**Trigger:** " + trigger + "\n**Count:** " + count + "\n\nAll roles removed + kicked.\n**Rejoin within 24h = 24h mute.**")
+            .setColor(0xED4245).setTimestamp()] }).catch(() => {});
+    } catch (e) {}
 
-    // 6) DM the owner
     try {
         const owner = await guild.fetchOwner();
-        await owner.send({
-            embeds: [
-                new EmbedBuilder()
-                    .setTitle("🚨 Anti-Nuke Triggered in " + guild.name)
-                    .setDescription(
-                        "**User:** " + member.user.tag + " (" + member.id + ")\n" +
-                        "**Trigger:** " + trigger + "\n" +
-                        "**Count in window:** " + count + "\n" +
-                        "**Roles Removed:** " + removed + "\n" +
-                        "**Kicked:** " + (kicked ? "Yes" : "No") + "\n\n" +
-                        "The user is now on a **24-hour rejoin watch**. If they rejoin, they will be auto-muted for 24h."
-                    )
-                    .setColor(0xED4245)
-                    .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
-                    .setTimestamp()
-            ]
-        }).catch(() => {});
-    } catch (e) { /* owner DMs closed */ }
+        await owner.send({ embeds: [new EmbedBuilder().setTitle("🚨 Anti-Nuke Triggered in " + guild.name)
+            .setDescription("**User:** " + member.user.tag + " (" + member.id + ")\n**Trigger:** " + trigger + "\n**Count:** " + count + "\n**Roles Removed:** " + removed + "\n**Kicked:** " + (kicked ? "Yes" : "No") + "\n\n**24h rejoin watch active.**")
+            .setColor(0xED4245).setThumbnail(member.user.displayAvatarURL({ dynamic: true })).setTimestamp()] }).catch(() => {});
+    } catch (e) {}
 }
 
 async function handleAntinukeEvent(guild, userId, trigger) {
@@ -507,7 +541,6 @@ async function handleAntinukeEvent(guild, userId, trigger) {
         if (gc.antinuke.whitelist.includes(userId)) return;
         if (userId === guild.ownerId) return;
         if (userId === client.user.id) return;
-
         const count = recordAntinukeEvent(guild.id, userId);
         if (count >= gc.antinuke.threshold) {
             const member = await guild.members.fetch(userId).catch(() => null);
@@ -517,95 +550,45 @@ async function handleAntinukeEvent(guild, userId, trigger) {
     } catch (e) { console.error("handleAntinukeEvent:", e); }
 }
 
-// ==========================================
-// REJOIN WATCH CHECK
-// ==========================================
-
 async function checkRejoinWatch(member) {
     try {
         const gc = getGuildConfig(member.guild.id);
         const expiry = gc.antinuke.watchlist[member.id];
         if (!expiry) return false;
+        if (Date.now() > expiry) { delete gc.antinuke.watchlist[member.id]; saveConfig(); return false; }
 
-        // Expired?
-        if (Date.now() > expiry) {
-            delete gc.antinuke.watchlist[member.id];
-            saveConfig();
-            return false;
-        }
-
-        // 1) Strip all roles again
         const { removed } = await stripAllRoles(member, "Anti-Nuke rejoin watch");
 
-        // 2) Apply 24h timeout
         let muted = false;
-        try {
-            await member.timeout(REJOIN_MUTE_MS, "Anti-Nuke: rejoined within 24h watch window");
-            muted = true;
-        } catch (e) {
-            console.error("rejoin mute failed:", e.message);
-        }
+        try { await member.timeout(REJOIN_MUTE_MS, "Anti-Nuke: rejoined within 24h watch"); muted = true; }
+        catch (e) { console.error("rejoin mute:", e.message); }
 
-        // 3) Log
-        const logEmbed = new EmbedBuilder()
-            .setTitle("🚨 Anti-Nuke Rejoin — Auto-Muted")
+        const logEmbed = new EmbedBuilder().setTitle("🚨 Anti-Nuke Rejoin — Auto-Muted")
             .setDescription(
                 "**User:** " + member.user.tag + " (" + member.id + ")\n" +
-                "**Action:** Roles stripped + 24h timeout applied\n" +
+                "**Action:** Roles stripped + 24h timeout\n" +
                 "**Roles Removed:** " + removed + "\n" +
-                "**Muted:** " + (muted ? "Yes" : "No (missing Moderate Members permission?)") + "\n" +
+                "**Muted:** " + (muted ? "Yes" : "No") + "\n" +
                 "**Watch Expires:** <t:" + Math.floor(expiry / 1000) + ":R>"
             )
-            .setColor(0xED4245)
-            .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
-            .setTimestamp();
+            .setColor(0xED4245).setThumbnail(member.user.displayAvatarURL({ dynamic: true })).setTimestamp();
 
         await sendLog(member.guild, logEmbed);
         await sendWebhook(member.guild, logEmbed);
 
-        // 4) DM the offender
-        try {
-            await member.send({
-                embeds: [
-                    new EmbedBuilder()
-                        .setTitle("🔇 Auto-Muted (Anti-Nuke)")
-                        .setDescription(
-                            "You rejoined **" + member.guild.name + "** while on anti-nuke watch.\n\n" +
-                            "You have been **muted for 24 hours** and all roles have been removed.\n" +
-                            "Contact the server owner if you believe this is a mistake."
-                        )
-                        .setColor(0xED4245)
-                        .setTimestamp()
-                ]
-            }).catch(() => {});
-        } catch (e) { /* ignore */ }
+        try { await member.send({ embeds: [new EmbedBuilder().setTitle("🔇 Auto-Muted (Anti-Nuke)")
+            .setDescription("You rejoined **" + member.guild.name + "** while on anti-nuke watch.\n\nMuted 24h + all roles removed.")
+            .setColor(0xED4245).setTimestamp()] }).catch(() => {}); } catch (e) {}
 
-        // 5) DM owner
         try {
             const owner = await member.guild.fetchOwner();
-            await owner.send({
-                embeds: [
-                    new EmbedBuilder()
-                        .setTitle("⚠️ Anti-Nuke Watch Triggered")
-                        .setDescription(
-                            "**" + member.user.tag + "** rejoined within the 24h anti-nuke watch window.\n\n" +
-                            "**Action taken:**\n" +
-                            "• Roles stripped (" + removed + " removed)\n" +
-                            "• 24-hour timeout applied\n" +
-                            "• Watch still active until <t:" + Math.floor(expiry / 1000) + ":R>"
-                        )
-                        .setColor(0xED4245)
-                        .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
-                        .setTimestamp()
-                ]
-            }).catch(() => {});
-        } catch (e) { /* ignore */ }
+            await owner.send({ embeds: [new EmbedBuilder().setTitle("⚠️ Anti-Nuke Watch Triggered")
+                .setDescription("**" + member.user.tag + "** rejoined during 24h watch.\n**Roles stripped + 24h mute applied.**\n**Watch expires <t:" + Math.floor(expiry / 1000) + ":R>**")
+                .setColor(0xED4245).setThumbnail(member.user.displayAvatarURL({ dynamic: true })).setTimestamp()] }).catch(() => {});
+        } catch (e) {}
 
         return true;
-    } catch (e) {
-        console.error("checkRejoinWatch:", e);
-        return false;
-    }
+    } catch (e) { console.error("checkRejoinWatch:", e); return false; }
 }
 
 // ==========================================
@@ -633,14 +616,14 @@ function getSlashCommands() {
             .addSubcommand(s => s.setName("list").setDescription("List accept roles"))
             .addSubcommand(s => s.setName("clear").setDescription("Clear all accept roles")),
 
-        new SlashCommandBuilder().setName("accept").setDescription("Accept a user's application (DMs them)")
+        new SlashCommandBuilder().setName("accept").setDescription("Accept a user's application")
             .addUserOption(o => o.setName("user").setDescription("User").setRequired(true))
             .addStringOption(o => o.setName("notes").setDescription("Notes").setRequired(false)),
-        new SlashCommandBuilder().setName("promote").setDescription("Promote a user (DMs them)")
+        new SlashCommandBuilder().setName("promote").setDescription("Promote a user")
             .addUserOption(o => o.setName("user").setDescription("User").setRequired(true))
             .addStringOption(o => o.setName("rank").setDescription("New rank").setRequired(true))
             .addStringOption(o => o.setName("notes").setDescription("Notes").setRequired(false)),
-        new SlashCommandBuilder().setName("demote").setDescription("Demote a user (DMs them)")
+        new SlashCommandBuilder().setName("demote").setDescription("Demote a user")
             .addUserOption(o => o.setName("user").setDescription("User").setRequired(true))
             .addStringOption(o => o.setName("rank").setDescription("New rank").setRequired(true))
             .addStringOption(o => o.setName("notes").setDescription("Notes").setRequired(false)),
@@ -669,6 +652,9 @@ function getSlashCommands() {
         new SlashCommandBuilder().setName("unmute").setDescription("Remove a timeout")
             .addUserOption(o => o.setName("user").setDescription("Member").setRequired(true))
             .addStringOption(o => o.setName("reason").setDescription("Reason").setRequired(false)),
+        new SlashCommandBuilder().setName("warn").setDescription("Warn a member")
+            .addUserOption(o => o.setName("user").setDescription("Member").setRequired(true))
+            .addStringOption(o => o.setName("reason").setDescription("Reason").setRequired(false)),
         new SlashCommandBuilder().setName("kick").setDescription("Kick a member")
             .addUserOption(o => o.setName("user").setDescription("Member").setRequired(true))
             .addStringOption(o => o.setName("reason").setDescription("Reason").setRequired(false)),
@@ -679,10 +665,20 @@ function getSlashCommands() {
             .addStringOption(o => o.setName("userid").setDescription("Discord User ID").setRequired(true))
             .addStringOption(o => o.setName("reason").setDescription("Reason").setRequired(false)),
 
-        new SlashCommandBuilder().setName("loguser").setDescription("Log a punishment with Roblox lookup")
+        // ---------- UNIFIED /loguser with dropdown ----------
+        new SlashCommandBuilder().setName("loguser").setDescription("Log a punishment for a Roblox user")
             .addStringOption(o => o.setName("username").setDescription("Roblox username").setRequired(true))
-            .addStringOption(o => o.setName("punishment").setDescription("Punishment type").setRequired(true))
-            .addStringOption(o => o.setName("reason").setDescription("Reason").setRequired(true)),
+            .addStringOption(o => o
+                .setName("punishment")
+                .setDescription("Punishment type")
+                .setRequired(true)
+                .addChoices(
+                    { name: "Warn", value: "warn" },
+                    { name: "Kick", value: "kick" },
+                    { name: "Ban", value: "ban" }
+                ))
+            .addStringOption(o => o.setName("reason").setDescription("Reason").setRequired(true))
+            .addStringOption(o => o.setName("notes").setDescription("Additional notes (optional)").setRequired(false)),
 
         new SlashCommandBuilder().setName("antinuke").setDescription("Anti-Nuke settings")
             .addSubcommand(s => s.setName("status").setDescription("Show anti-nuke status"))
@@ -725,9 +721,8 @@ client.once("ready", async () => {
         getGuildConfig(guild.id);
         await registerCommands(guild);
     }
-    client.user.setActivity("Eagle County Roleplay | V.1.4.1");
+    client.user.setActivity("Eagle County Roleplay | V.1.6");
 
-    // Cleanup expired watchlist entries
     for (const guild of client.guilds.cache.values()) {
         const gc = getGuildConfig(guild.id);
         const now = Date.now();
@@ -773,7 +768,7 @@ async function tryDM(user, embed) {
 }
 
 // ==========================================
-// SETUP MENU
+// SETUP MENU HELPERS
 // ==========================================
 
 function fmtCh(gc, key) { const id = gc[key]; return id ? "<#" + id + ">" : "❌ Not set"; }
@@ -785,8 +780,8 @@ function buildSetupEmbed(guild) {
     const an = gc.antinuke;
     const watchCount = Object.keys(an.watchlist).filter(uid => an.watchlist[uid] > Date.now()).length;
     return new EmbedBuilder()
-        .setTitle("⚙️ " + guild.name + " — Setup Menu (V.1.4.1)")
-        .setDescription("Use the buttons below to configure the bot.")
+        .setTitle("⚙️ " + guild.name + " — Setup Menu (V.1.6)")
+        .setDescription("**Management-only** setup menu. Use the buttons below to configure the bot.")
         .setColor(WEBHOOK_COLOR)
         .setThumbnail(guild.iconURL({ dynamic: true, size: 256 }))
         .addFields(
@@ -814,6 +809,7 @@ function buildSetupEmbed(guild) {
                 value: [
                     "**Staff:** " + fmtRoleList(gc.staffRoles),
                     "**Admin:** " + fmtRoleList(gc.adminRoles),
+                    "**⭐ High Rank:** " + fmtRoleList(gc.highRankRoles),
                     "**Management:** " + fmtRoleList(gc.managementRoles),
                     "**Exempt:** " + fmtRoleList(gc.exemptRoles),
                     "**Verify Role:** " + fmtRole(gc, "verifyRoleId"),
@@ -837,12 +833,12 @@ function buildSetupEmbed(guild) {
                     "**Enabled:** " + (an.enabled ? "Yes" : "No"),
                     "**Threshold:** " + an.threshold + " events / " + Math.floor(an.windowMs / 1000) + "s",
                     "**Whitelisted:** " + an.whitelist.length,
-                    "**On 24h Rejoin Watch:** " + watchCount
+                    "**On 24h Watch:** " + watchCount
                 ].join("\n"),
                 inline: false
             }
         )
-        .setFooter({ text: "V.1.4.1 • " + guild.name, iconURL: guild.iconURL({ dynamic: true }) || undefined })
+        .setFooter({ text: "V.1.6 • " + guild.name, iconURL: guild.iconURL({ dynamic: true }) || undefined })
         .setTimestamp();
 }
 
@@ -852,9 +848,10 @@ function buildSetupRows() {
             new ButtonBuilder().setCustomId("setup_channels").setLabel("Channels").setEmoji("📁").setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId("setup_roles").setLabel("Role Tiers").setEmoji("🎭").setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId("setup_tickets").setLabel("Tickets").setEmoji("🎫").setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId("setup_dm_templates").setLabel("DM Templates").setEmoji("✉️").setStyle(ButtonStyle.Secondary)
+            new ButtonBuilder().setCustomId("setup_perms").setLabel("Permissions").setEmoji("🔐").setStyle(ButtonStyle.Primary)
         ),
         new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("setup_dm_templates").setLabel("DM Templates").setEmoji("✉️").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_antinuke").setLabel("Anti-Nuke").setEmoji("🛡️").setStyle(ButtonStyle.Danger),
             new ButtonBuilder().setCustomId("setup_prefix").setLabel("Prefix").setEmoji("🔤").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_webhook").setLabel("Webhook").setEmoji("🔗").setStyle(ButtonStyle.Secondary)
@@ -893,17 +890,19 @@ function buildRolesMenuRows() {
         new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId("setup_role_staff").setLabel("Staff Roles").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_role_admin").setLabel("Admin Roles").setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId("setup_role_management").setLabel("Management Roles").setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId("setup_role_exempt").setLabel("Exempt Roles").setStyle(ButtonStyle.Secondary)
+            new ButtonBuilder().setCustomId("setup_role_highrank").setLabel("⭐ High Rank Roles").setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId("setup_role_management").setLabel("Management Roles").setStyle(ButtonStyle.Primary)
         ),
         new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("setup_role_exempt").setLabel("Exempt Roles").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_role_verify").setLabel("Verify Role").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_role_accept").setLabel("Accept Roles").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_clear_staff").setLabel("Clear Staff").setStyle(ButtonStyle.Danger),
-            new ButtonBuilder().setCustomId("setup_clear_admin").setLabel("Clear Admin").setStyle(ButtonStyle.Danger),
-            new ButtonBuilder().setCustomId("setup_clear_management").setLabel("Clear Mgmt").setStyle(ButtonStyle.Danger)
+            new ButtonBuilder().setCustomId("setup_clear_admin").setLabel("Clear Admin").setStyle(ButtonStyle.Danger)
         ),
         new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("setup_clear_highrank").setLabel("Clear HighRank").setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId("setup_clear_management").setLabel("Clear Mgmt").setStyle(ButtonStyle.Danger),
             new ButtonBuilder().setCustomId("setup_clear_exempt").setLabel("Clear Exempt").setStyle(ButtonStyle.Danger),
             new ButtonBuilder().setCustomId("setup_clear_accept").setLabel("Clear Accept").setStyle(ButtonStyle.Danger),
             new ButtonBuilder().setCustomId("setup_back").setLabel("Back to Menu").setEmoji("◀️").setStyle(ButtonStyle.Danger)
@@ -961,57 +960,112 @@ function buildAntinukeMenuRows() {
     ];
 }
 
-// ==========================================
-// SETUP NAVIGATION
-// ==========================================
+// -------- PERMISSIONS MENU --------
 
-async function updateSetupMessage(interaction, view) {
-    const guild = interaction.guild;
-    const gc = getGuildConfig(guild.id);
-    let embed, rows;
-
-    if (view === "main") { embed = buildSetupEmbed(guild); rows = buildSetupRows(); }
-    else if (view === "channels") {
-        embed = new EmbedBuilder().setTitle("📁 Channel Configuration")
-            .setDescription("**Main Log** — all events\n**Verification Log** — verifications\n**Transcript Channel** — ticket transcripts\n**Welcome** — welcome messages\n**Suggestions** — /suggest\n**Staff Feedback** — /staff-feedback\n**Staff Log** — punishments\n**HR Log** — accept/promote/demote/infract\n**Verify Panel Ch** — verify panel\n**Ticket Log** — ticket events")
-            .setColor(WEBHOOK_COLOR).setThumbnail(guild.iconURL({ dynamic: true })).setTimestamp();
-        rows = buildChannelsMenuRows();
-    } else if (view === "roles") {
-        embed = new EmbedBuilder().setTitle("🎭 Role Tiers")
-            .setDescription("**Staff** — basic staff\n**Admin** — full admin\n**Management** ⭐ — highest tier, pinged on High Rank tickets\n**Exempt** — cannot be moderated\n**Verify Role** — auto-given on verify\n**Accept Roles** — given on accept")
-            .setColor(WEBHOOK_COLOR).setThumbnail(guild.iconURL({ dynamic: true })).setTimestamp();
-        rows = buildRolesMenuRows();
-    } else if (view === "tickets") {
-        embed = new EmbedBuilder().setTitle("🎫 Ticket Configuration")
-            .setDescription("**Support:** Support Category + Support Ping Role\n**High Rank:** High Rank Category + High Rank Ping Role (Management always pinged)")
-            .setColor(WEBHOOK_COLOR).setThumbnail(guild.iconURL({ dynamic: true })).setTimestamp();
-        rows = buildTicketsMenuRows();
-    } else if (view === "templates") {
-        embed = new EmbedBuilder().setTitle("✉️ DM Templates")
-            .setDescription("**Variables:** `{server}` `{rank}` `{type}` `{reason}` `{notes}`\n\n**Accept:**\n" + gc.dmTemplates.accept + "\n\n**Promote:**\n" + gc.dmTemplates.promote + "\n\n**Demote:**\n" + gc.dmTemplates.demote + "\n\n**Infract:**\n" + gc.dmTemplates.infract)
-            .setColor(WEBHOOK_COLOR).setTimestamp();
-        rows = buildTemplatesMenuRows();
-    } else if (view === "antinuke") {
-        const an = gc.antinuke;
-        embed = new EmbedBuilder().setTitle("🛡️ Anti-Nuke Settings")
-            .setDescription(
-                "**What it does:**\n" +
-                "If a user deletes more than **" + an.threshold + "** channels/roles, kicks, or bans **" + an.threshold + "** members within **" + Math.floor(an.windowMs / 1000) + "s**, the bot:\n" +
-                "> 1. Removes **every role** from the user (except @everyone)\n" +
-                "> 2. **Kicks** the user\n" +
-                "> 3. **24-hour rejoin watch** — if they rejoin, roles stripped + **24h mute**\n" +
-                "> 4. DMs the offender + server owner\n" +
-                "> 5. Logs to main log + webhook\n\n" +
-                "**Current:**\n" +
-                "• Enabled: " + (an.enabled ? "✅" : "❌") + "\n" +
-                "• Threshold: **" + an.threshold + "**\n" +
-                "• Window: **" + Math.floor(an.windowMs / 1000) + "s**\n" +
-                "• Whitelisted: **" + an.whitelist.length + "**"
-            )
-            .setColor(0xED4245).setThumbnail(guild.iconURL({ dynamic: true })).setTimestamp();
-        rows = buildAntinukeMenuRows();
+const PERM_GROUPS = {
+    setup: {
+        name: "⚙️ Setup & Config",
+        commands: ["setup", "setprefix", "setupverify", "setuptickets", "set-webhook", "remove-webhook", "antinuke"]
+    },
+    hr: {
+        name: "👑 HR / Applications",
+        commands: ["acceptsetup", "accept", "promote", "demote", "infract"]
+    },
+    mod: {
+        name: "🔨 Moderation",
+        commands: ["mute", "unmute", "warn", "kick", "ban", "unban"]
+    },
+    logs: {
+        name: "📝 Logging",
+        commands: ["loguser"]
+    },
+    public: {
+        name: "🌐 Public",
+        commands: ["suggest", "staff-feedback", "help"]
     }
-    await interaction.update({ embeds: [embed], components: rows });
+};
+
+function buildPermsMenuRows() {
+    return [
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("setup_perms_group_setup").setLabel("Setup & Config").setEmoji("⚙️").setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId("setup_perms_group_hr").setLabel("HR / Applications").setEmoji("👑").setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId("setup_perms_group_mod").setLabel("Moderation").setEmoji("🔨").setStyle(ButtonStyle.Primary)
+        ),
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("setup_perms_group_logs").setLabel("Logging").setEmoji("📝").setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId("setup_perms_group_public").setLabel("Public").setEmoji("🌐").setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId("setup_perms_reset").setLabel("Reset All").setEmoji("♻️").setStyle(ButtonStyle.Danger)
+        ),
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("setup_back").setLabel("Back to Menu").setEmoji("◀️").setStyle(ButtonStyle.Danger)
+        )
+    ];
+}
+
+function buildPermsGroupRows(groupKey) {
+    const group = PERM_GROUPS[groupKey];
+    if (!group) return [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("setup_back").setLabel("Back").setStyle(ButtonStyle.Danger)
+    )];
+
+    const rows = [];
+    let currentRow = new ActionRowBuilder();
+    let count = 0;
+
+    for (const cmd of group.commands) {
+        currentRow.addComponents(
+            new ButtonBuilder()
+                .setCustomId("setup_perm_edit_" + cmd)
+                .setLabel("/" + cmd)
+                .setStyle(ButtonStyle.Secondary)
+        );
+        count++;
+        if (count === 5) { rows.push(currentRow); currentRow = new ActionRowBuilder(); count = 0; }
+    }
+    if (count > 0) rows.push(currentRow);
+    rows.push(new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("setup_perms").setLabel("Back to Groups").setEmoji("◀️").setStyle(ButtonStyle.Danger)
+    ));
+    return rows;
+}
+
+function fmtTiers(tiers) {
+    const map = {
+        staff: "🎭 Staff",
+        admin: "🔨 Admin",
+        highrank: "⭐ High Rank",
+        management: "🛡️ Management",
+        everyone: "🌐 Everyone"
+    };
+    return tiers.map(t => map[t] || t).join(", ");
+}
+
+async function showPermsOverview(interaction) {
+    const guild = interaction.guild;
+    const lines = [];
+
+    for (const [groupKey, group] of Object.entries(PERM_GROUPS)) {
+        lines.push("**" + group.name + "**");
+        for (const cmd of group.commands) {
+            const tiers = getRequiredTiers(guild.id, cmd);
+            lines.push("`/" + cmd + "` → " + fmtTiers(tiers));
+        }
+        lines.push("");
+    }
+
+    const embed = new EmbedBuilder()
+        .setTitle("🔐 Permission Configuration")
+        .setDescription(
+            "Set which tiers can run each command.\n\n" +
+            "**Tiers** (higher tiers inherit lower):\n" +
+            "🛡️ Management → ⭐ High Rank → 🔨 Admin → 🎭 Staff\n\n" +
+            "**Current Permissions:**\n" + lines.join("\n")
+        )
+        .setColor(WEBHOOK_COLOR)
+        .setTimestamp();
+
+    await interaction.update({ embeds: [embed], components: buildPermsMenuRows() });
 }
 
 // ==========================================
@@ -1031,42 +1085,55 @@ client.on("interactionCreate", async interaction => {
         const gc = getGuildConfig(guild.id);
         const command = interaction.commandName;
 
+        // ---- PERMISSION CHECK ----
+        if (!canRunCommand(interaction.member, command)) {
+            const required = getRequiredTiers(guild.id, command);
+            return interaction.reply({
+                embeds: [createErrorEmbed("You don't have permission to use this command.\n\n**Required tiers:** " + fmtTiers(required))],
+                ephemeral: true
+            });
+        }
+
+        // ---------- /setup ----------
         if (command === "setup") {
-            if (!isAdmin(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Admin only.")], ephemeral: true });
             return interaction.reply({ embeds: [buildSetupEmbed(guild)], components: buildSetupRows(), ephemeral: true });
         }
+
+        // ---------- /setprefix ----------
         if (command === "setprefix") {
-            if (!isAdmin(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Admin only.")], ephemeral: true });
             const prefix = interaction.options.getString("prefix");
             if (/\s/.test(prefix)) return interaction.reply({ embeds: [createErrorEmbed("No spaces.")], ephemeral: true });
             gc.prefix = prefix; saveConfig();
             return interaction.reply({ embeds: [createSuccessEmbed("Prefix set to `" + prefix + "`.")] });
         }
+
+        // ---------- /setupverify ----------
         if (command === "setupverify") {
-            if (!isAdmin(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Admin only.")], ephemeral: true });
             gc.verifyChannelId = interaction.channel.id; saveConfig();
             await interaction.channel.send({ embeds: [buildVerifyEmbed(guild)], components: buildVerifyRows() });
             return interaction.reply({ embeds: [createSuccessEmbed("Verification panel posted.")], ephemeral: true });
         }
+
+        // ---------- /setuptickets ----------
         if (command === "setuptickets") {
-            if (!isAdmin(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Admin only.")], ephemeral: true });
             await interaction.channel.send({ embeds: [buildTicketPanelEmbed(guild)], components: buildTicketPanelRows() });
             return interaction.reply({ embeds: [createSuccessEmbed("Ticket panel posted.")], ephemeral: true });
         }
+
+        // ---------- Webhook ----------
         if (command === "set-webhook") {
-            if (!isAdmin(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Admin only.")], ephemeral: true });
             const url = interaction.options.getString("url");
             if (!/^https:\/\/discord(app)?\.com\/api\/webhooks\//.test(url)) return interaction.reply({ embeds: [createErrorEmbed("Invalid URL.")], ephemeral: true });
             gc.webhookUrl = url; saveConfig();
             return interaction.reply({ embeds: [createSuccessEmbed("Webhook set.")], ephemeral: true });
         }
         if (command === "remove-webhook") {
-            if (!isAdmin(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Admin only.")], ephemeral: true });
             gc.webhookUrl = null; saveConfig();
             return interaction.reply({ embeds: [createSuccessEmbed("Removed.")], ephemeral: true });
         }
+
+        // ---------- /acceptsetup ----------
         if (command === "acceptsetup") {
-            if (!isAdmin(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Admin only.")], ephemeral: true });
             const sub = interaction.options.getSubcommand();
             if (sub === "add") { const role = interaction.options.getRole("role"); if (!gc.acceptRoleIds.includes(role.id)) gc.acceptRoleIds.push(role.id); saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed(role + " added.")] }); }
             if (sub === "remove") { const role = interaction.options.getRole("role"); gc.acceptRoleIds = gc.acceptRoleIds.filter(id => id !== role.id); saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed("Removed.")] }); }
@@ -1076,10 +1143,8 @@ client.on("interactionCreate", async interaction => {
 
         // ---------- /antinuke ----------
         if (command === "antinuke") {
-            if (!isAdmin(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Admin only.")], ephemeral: true });
             const sub = interaction.options.getSubcommand();
             const an = gc.antinuke;
-
             if (sub === "status") {
                 const watchCount = Object.keys(an.watchlist).filter(uid => an.watchlist[uid] > Date.now()).length;
                 const embed = new EmbedBuilder().setTitle("🛡️ Anti-Nuke Status").setColor(WEBHOOK_COLOR)
@@ -1092,26 +1157,24 @@ client.on("interactionCreate", async interaction => {
                     );
                 return interaction.reply({ embeds: [embed], ephemeral: true });
             }
-            if (sub === "enable") { an.enabled = true; saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed("Anti-Nuke enabled.")] }); }
-            if (sub === "disable") { an.enabled = false; saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed("Anti-Nuke disabled.")] }); }
-            if (sub === "threshold") { const count = interaction.options.getInteger("count"); an.threshold = count; saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed("Threshold set to **" + count + "**.")] }); }
-            if (sub === "whitelist-add") { const user = interaction.options.getUser("user"); if (!an.whitelist.includes(user.id)) an.whitelist.push(user.id); saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed(user.tag + " whitelisted.")] }); }
-            if (sub === "whitelist-remove") { const user = interaction.options.getUser("user"); an.whitelist = an.whitelist.filter(id => id !== user.id); saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed("Removed.")] }); }
+            if (sub === "enable") { an.enabled = true; saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed("Enabled.")] }); }
+            if (sub === "disable") { an.enabled = false; saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed("Disabled.")] }); }
+            if (sub === "threshold") { const n = interaction.options.getInteger("count"); an.threshold = n; saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed("Threshold: **" + n + "**.")] }); }
+            if (sub === "whitelist-add") { const u = interaction.options.getUser("user"); if (!an.whitelist.includes(u.id)) an.whitelist.push(u.id); saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed(u.tag + " whitelisted.")] }); }
+            if (sub === "whitelist-remove") { const u = interaction.options.getUser("user"); an.whitelist = an.whitelist.filter(id => id !== u.id); saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed("Removed.")] }); }
             if (sub === "whitelist-list") { const list = an.whitelist.length ? an.whitelist.map(id => "<@" + id + ">").join(", ") : "None"; return interaction.reply({ embeds: [createInfoEmbed("**Whitelisted:** " + list)], ephemeral: true }); }
             if (sub === "watchlist") {
                 const now = Date.now();
                 const entries = Object.entries(an.watchlist).filter(([, e]) => e > now);
-                if (!entries.length) return interaction.reply({ embeds: [createInfoEmbed("No users on 24h rejoin watch.")], ephemeral: true });
-                const lines = entries.map(([uid, e]) => "• <@" + uid + "> — expires <t:" + Math.floor(e / 1000) + ":R>");
-                return interaction.reply({ embeds: [createInfoEmbed("**On Rejoin Watch:**\n" + lines.join("\n"))], ephemeral: true });
+                if (!entries.length) return interaction.reply({ embeds: [createInfoEmbed("No users on watch.")], ephemeral: true });
+                return interaction.reply({ embeds: [createInfoEmbed("**Watch:**\n" + entries.map(([uid, e]) => "• <@" + uid + "> — <t:" + Math.floor(e / 1000) + ":R>").join("\n"))], ephemeral: true });
             }
-            if (sub === "unwatch") { const user = interaction.options.getUser("user"); delete an.watchlist[user.id]; saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed(user.tag + " removed from watch.")] }); }
-            if (sub === "reset") { an.counters = {}; saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed("Counters reset.")] }); }
+            if (sub === "unwatch") { const u = interaction.options.getUser("user"); delete an.watchlist[u.id]; saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed("Unwatched.")] }); }
+            if (sub === "reset") { an.counters = {}; saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed("Reset.")] }); }
         }
 
         // ---------- HR ----------
         if (command === "accept") {
-            if (!isStaff(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Staff only.")], ephemeral: true });
             const targetUser = interaction.options.getUser("user");
             const notes = interaction.options.getString("notes") || null;
             await interaction.deferReply();
@@ -1133,7 +1196,6 @@ client.on("interactionCreate", async interaction => {
             return interaction.editReply({ embeds: [createSuccessEmbed(targetUser.tag + " accepted.")] });
         }
         if (command === "promote") {
-            if (!isStaff(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Staff only.")], ephemeral: true });
             const targetUser = interaction.options.getUser("user");
             const rank = interaction.options.getString("rank");
             const notes = interaction.options.getString("notes") || null;
@@ -1151,7 +1213,6 @@ client.on("interactionCreate", async interaction => {
             return interaction.editReply({ embeds: [createSuccessEmbed(targetUser.tag + " promoted to **" + rank + "**.")] });
         }
         if (command === "demote") {
-            if (!isStaff(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Staff only.")], ephemeral: true });
             const targetUser = interaction.options.getUser("user");
             const rank = interaction.options.getString("rank");
             const notes = interaction.options.getString("notes") || null;
@@ -1169,7 +1230,6 @@ client.on("interactionCreate", async interaction => {
             return interaction.editReply({ embeds: [createSuccessEmbed(targetUser.tag + " demoted.")] });
         }
         if (command === "infract") {
-            if (!isStaff(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Staff only.")], ephemeral: true });
             const targetUser = interaction.options.getUser("user");
             const type = interaction.options.getString("type");
             const reason = interaction.options.getString("reason");
@@ -1192,7 +1252,6 @@ client.on("interactionCreate", async interaction => {
 
         // ---------- Moderation ----------
         if (command === "mute") {
-            if (!isStaff(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Staff only.")], ephemeral: true });
             const target = await guild.members.fetch(interaction.options.getUser("user").id).catch(() => null);
             if (!target) return interaction.reply({ embeds: [createErrorEmbed("Not found.")], ephemeral: true });
             if (isExempt(target)) return interaction.reply({ embeds: [createErrorEmbed("Exempt.")], ephemeral: true });
@@ -1207,23 +1266,30 @@ client.on("interactionCreate", async interaction => {
                 await target.timeout(duration, reason);
                 limit.mutes++; saveConfig();
                 const embed = createLogEmbed("Member Muted", "**User:** " + target + "\n**Mod:** " + interaction.user + "\n**Duration:** " + durationInput + "\n**Reason:** " + reason);
-                await sendLog(guild, embed); await sendWebhook(guild, embed);
+                await sendLog(guild, embed); await sendStaffLog(guild, embed); await sendWebhook(guild, embed);
                 return interaction.reply({ embeds: [createSuccessEmbed(target + " muted.")] });
             } catch (e) { return interaction.reply({ embeds: [createErrorEmbed("Failed.")], ephemeral: true }); }
         }
         if (command === "unmute") {
-            if (!isStaff(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Staff only.")], ephemeral: true });
             const t = await guild.members.fetch(interaction.options.getUser("user").id).catch(() => null);
             if (!t) return interaction.reply({ embeds: [createErrorEmbed("Not found.")], ephemeral: true });
             try {
                 await t.timeout(null, interaction.options.getString("reason") || "No reason provided");
                 const embed = createLogEmbed("Member Unmuted", "**User:** " + t + "\n**Mod:** " + interaction.user);
-                await sendLog(guild, embed); await sendWebhook(guild, embed);
+                await sendLog(guild, embed); await sendStaffLog(guild, embed); await sendWebhook(guild, embed);
                 return interaction.reply({ embeds: [createSuccessEmbed("Unmuted.")] });
             } catch (e) { return interaction.reply({ embeds: [createErrorEmbed("Failed.")], ephemeral: true }); }
         }
+        if (command === "warn") {
+            const target = await guild.members.fetch(interaction.options.getUser("user").id).catch(() => null);
+            if (!target) return interaction.reply({ embeds: [createErrorEmbed("Not found.")], ephemeral: true });
+            const reason = interaction.options.getString("reason") || "No reason provided";
+            const embed = createLogEmbed("Member Warned", "**User:** " + target + "\n**Mod:** " + interaction.user + "\n**Reason:** " + reason, 0xFEE75C);
+            await sendLog(guild, embed); await sendStaffLog(guild, embed); await sendWebhook(guild, embed);
+            try { await target.send({ embeds: [createLogEmbed("You were warned in " + guild.name, "**Reason:** " + reason, 0xFEE75C)] }).catch(() => {}); } catch (e) {}
+            return interaction.reply({ embeds: [createSuccessEmbed(target + " warned.")] });
+        }
         if (command === "kick") {
-            if (!isStaff(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Staff only.")], ephemeral: true });
             const t = await guild.members.fetch(interaction.options.getUser("user").id).catch(() => null);
             if (!t) return interaction.reply({ embeds: [createErrorEmbed("Not found.")], ephemeral: true });
             if (isExempt(t)) return interaction.reply({ embeds: [createErrorEmbed("Exempt.")], ephemeral: true });
@@ -1232,12 +1298,11 @@ client.on("interactionCreate", async interaction => {
             try {
                 await t.kick(reason);
                 const embed = createLogEmbed("Member Kicked", "**User:** " + t.user.tag + "\n**Mod:** " + interaction.user + "\n**Reason:** " + reason);
-                await sendLog(guild, embed); await sendWebhook(guild, embed);
+                await sendLog(guild, embed); await sendStaffLog(guild, embed); await sendWebhook(guild, embed);
                 return interaction.reply({ embeds: [createSuccessEmbed("Kicked.")] });
             } catch (e) { return interaction.reply({ embeds: [createErrorEmbed("Failed.")], ephemeral: true }); }
         }
         if (command === "ban") {
-            if (!isAdmin(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Admin only.")], ephemeral: true });
             const t = await guild.members.fetch(interaction.options.getUser("user").id).catch(() => null);
             if (!t) return interaction.reply({ embeds: [createErrorEmbed("Not found.")], ephemeral: true });
             if (isExempt(t)) return interaction.reply({ embeds: [createErrorEmbed("Exempt.")], ephemeral: true });
@@ -1246,43 +1311,73 @@ client.on("interactionCreate", async interaction => {
             try {
                 await t.ban({ reason });
                 const embed = createLogEmbed("Member Banned", "**User:** " + t.user.tag + "\n**Mod:** " + interaction.user + "\n**Reason:** " + reason);
-                await sendLog(guild, embed); await sendWebhook(guild, embed);
+                await sendLog(guild, embed); await sendStaffLog(guild, embed); await sendWebhook(guild, embed);
                 return interaction.reply({ embeds: [createSuccessEmbed("Banned.")] });
             } catch (e) { return interaction.reply({ embeds: [createErrorEmbed("Failed.")], ephemeral: true }); }
         }
         if (command === "unban") {
-            if (!isAdmin(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Admin only.")], ephemeral: true });
             const userId = interaction.options.getString("userid");
             const reason = interaction.options.getString("reason") || "No reason provided";
             try {
                 const u = await client.users.fetch(userId);
                 await guild.members.unban(userId, reason);
                 const embed = createLogEmbed("Member Unbanned", "**User:** " + u.tag + "\n**Mod:** " + interaction.user + "\n**Reason:** " + reason);
-                await sendLog(guild, embed); await sendWebhook(guild, embed);
+                await sendLog(guild, embed); await sendStaffLog(guild, embed); await sendWebhook(guild, embed);
                 return interaction.reply({ embeds: [createSuccessEmbed("Unbanned.")] });
             } catch (e) { return interaction.reply({ embeds: [createErrorEmbed("Failed.")], ephemeral: true }); }
         }
 
+        // ---------- UNIFIED /loguser ----------
         if (command === "loguser") {
-            if (!isStaff(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Staff only.")], ephemeral: true });
             const username = interaction.options.getString("username");
-            const punishment = interaction.options.getString("punishment");
+            const punishment = interaction.options.getString("punishment"); // "warn" | "kick" | "ban"
             const reason = interaction.options.getString("reason");
+            const notes = interaction.options.getString("notes") || null;
+
             await interaction.deferReply();
+
             const robloxData = await lookupRobloxUser(username);
-            const logEmbed = new EmbedBuilder().setTitle("Punishment Log").setColor(0xED4245)
+
+            // Colour + emoji per punishment
+            const meta = {
+                warn: { label: "Warn", emoji: "⚠️", color: 0xFEE75C },
+                kick: { label: "Kick", emoji: "👢", color: 0xE67E22 },
+                ban:  { label: "Ban",  emoji: "🔨", color: 0xED4245 }
+            }[punishment];
+
+            const logEmbed = new EmbedBuilder()
+                .setTitle(meta.emoji + " " + meta.label + " Logged")
+                .setColor(meta.color)
                 .addFields(
                     { name: "Roblox Username", value: robloxData ? robloxData.username : username, inline: true },
                     { name: "Roblox ID", value: robloxData ? String(robloxData.id) : "Not found", inline: true },
-                    { name: "Punishment", value: punishment, inline: true },
-                    { name: "Mod", value: interaction.user.tag, inline: true },
+                    { name: "Display Name", value: robloxData ? robloxData.displayName : "N/A", inline: true },
+                    { name: "Punishment", value: meta.label, inline: true },
+                    { name: "Moderator", value: interaction.user.tag, inline: true },
+                    { name: "Logged At", value: "<t:" + Math.floor(Date.now() / 1000) + ":F>", inline: true },
                     { name: "Reason", value: reason, inline: false }
-                ).setTimestamp();
+                )
+                .setFooter({ text: "Logged by " + interaction.user.tag })
+                .setTimestamp();
+
             if (robloxData?.avatarUrl) logEmbed.setThumbnail(robloxData.avatarUrl);
-            await sendStaffLog(guild, logEmbed); await sendLog(guild, logEmbed); await sendWebhook(guild, logEmbed);
-            return interaction.editReply({ embeds: [createSuccessEmbed("Recorded.")] });
+            if (robloxData) {
+                logEmbed.addFields(
+                    { name: "Profile", value: "[View Profile](" + robloxData.profileUrl + ")", inline: false }
+                );
+            }
+            if (notes) logEmbed.addFields({ name: "Notes", value: notes.slice(0, 1024), inline: false });
+
+            await sendStaffLog(guild, logEmbed);
+            await sendLog(guild, logEmbed);
+            await sendWebhook(guild, logEmbed);
+
+            return interaction.editReply({
+                embeds: [createSuccessEmbed("**" + meta.label + "** logged for **" + (robloxData ? robloxData.username : username) + "**.")]
+            });
         }
 
+        // ---------- Public ----------
         if (command === "suggest") {
             if (!gc.suggestionChannelId) return interaction.reply({ embeds: [createErrorEmbed("Suggestions channel not set.")], ephemeral: true });
             const suggestion = interaction.options.getString("suggestion");
@@ -1295,7 +1390,6 @@ client.on("interactionCreate", async interaction => {
             saveConfig();
             return interaction.editReply({ embeds: [createSuccessEmbed("Submitted!")] });
         }
-
         if (command === "staff-feedback") {
             if (!gc.staffFeedbackChannelId) return interaction.reply({ embeds: [createErrorEmbed("Staff feedback channel not set.")], ephemeral: true });
             const staffMember = interaction.options.getUser("staff");
@@ -1312,14 +1406,15 @@ client.on("interactionCreate", async interaction => {
 
         if (command === "help") {
             const prefix = getPrefix(guild.id);
-            const embed = new EmbedBuilder().setTitle(guild.name + " — Bot Commands V.1.4.1")
+            const embed = new EmbedBuilder().setTitle(guild.name + " — Bot Commands V.1.6")
                 .setColor(WEBHOOK_COLOR).setThumbnail(guild.iconURL({ dynamic: true }))
                 .addFields(
-                    { name: "Setup", value: ["`/setup`", "`/setupverify`", "`/setuptickets`"].join("\n") },
-                    { name: "Anti-Nuke", value: ["`/antinuke status`", "`/antinuke enable|disable`", "`/antinuke threshold <n>`", "`/antinuke whitelist-add|remove|list`", "`/antinuke watchlist`", "`/antinuke unwatch <user>`", "`/antinuke reset`"].join("\n") },
+                    { name: "Setup (Management only)", value: ["`/setup`", "`/setupverify`", "`/setuptickets`"].join("\n") },
+                    { name: "Anti-Nuke (Management only)", value: ["`/antinuke status|enable|disable`", "`/antinuke threshold <n>`", "`/antinuke whitelist-add|remove|list`", "`/antinuke watchlist`", "`/antinuke unwatch <user>`", "`/antinuke reset`"].join("\n") },
                     { name: "HR", value: ["`/acceptsetup`", "`/accept`", "`/promote`", "`/demote`", "`/infract`"].join("\n") },
-                    { name: "Moderation", value: ["`/mute`", "`/unmute`", "`/kick`", "`/ban`", "`/unban`"].join("\n") },
-                    { name: "Other", value: ["`/suggest`", "`/staff-feedback`", "`/loguser`", "`" + prefix + "loguser`"].join("\n") }
+                    { name: "Moderation", value: ["`/mute`", "`/unmute`", "`/warn`", "`/kick`", "`/ban`", "`/unban`"].join("\n") },
+                    { name: "Logging", value: ["`/loguser <username> <Warn|Kick|Ban> <reason>`", "`" + prefix + "loguser`"].join("\n") },
+                    { name: "Public", value: ["`/suggest`", "`/staff-feedback`"].join("\n") }
                 );
             return interaction.reply({ embeds: [embed] });
         }
@@ -1348,6 +1443,149 @@ async function handleButton(interaction) {
     if (id === "setup_tickets") return updateSetupMessage(interaction, "tickets");
     if (id === "setup_dm_templates") return updateSetupMessage(interaction, "templates");
     if (id === "setup_antinuke") return updateSetupMessage(interaction, "antinuke");
+    if (id === "setup_perms") return showPermsOverview(interaction);
+
+    if (id.startsWith("setup_perms_group_")) {
+        const groupKey = id.slice("setup_perms_group_".length);
+        const group = PERM_GROUPS[groupKey];
+        if (!group) return;
+        const lines = group.commands.map(cmd => {
+            const tiers = getRequiredTiers(guild.id, cmd);
+            return "`/" + cmd + "` → " + fmtTiers(tiers);
+        });
+        const embed = new EmbedBuilder()
+            .setTitle("🔐 " + group.name + " Permissions")
+            .setDescription("Click a command button to edit who can use it.\n\n**Current:**\n" + lines.join("\n"))
+            .setColor(WEBHOOK_COLOR)
+            .setTimestamp();
+        return interaction.update({ embeds: [embed], components: buildPermsGroupRows(groupKey) });
+    }
+
+    if (id.startsWith("setup_perm_edit_")) {
+        const cmd = id.slice("setup_perm_edit_".length);
+        const tiers = getRequiredTiers(guild.id, cmd);
+        const embed = new EmbedBuilder()
+            .setTitle("🔐 Edit `/" + cmd + "`")
+            .setDescription(
+                "Toggle which tiers can run this command.\n\n" +
+                "**Current:** " + fmtTiers(tiers) + "\n\n" +
+                "Higher tiers automatically include lower ones:\n" +
+                "🛡️ Management → ⭐ High Rank → 🔨 Admin → 🎭 Staff"
+            )
+            .setColor(WEBHOOK_COLOR)
+            .setTimestamp();
+        const required = tiers;
+        const makeToggle = (tierKey, label) => {
+            const enabled = required.includes(tierKey);
+            return new ButtonBuilder()
+                .setCustomId("setup_perm_toggle_" + cmd + "_" + tierKey)
+                .setLabel(label)
+                .setStyle(enabled ? ButtonStyle.Success : ButtonStyle.Secondary);
+        };
+        const rows = [
+            new ActionRowBuilder().addComponents(
+                makeToggle("staff", "🎭 Staff"),
+                makeToggle("admin", "🔨 Admin"),
+                makeToggle("highrank", "⭐ High Rank"),
+                makeToggle("management", "🛡️ Management")
+            ),
+            new ActionRowBuilder().addComponents(
+                makeToggle("everyone", "🌐 Everyone"),
+                new ButtonBuilder().setCustomId("setup_perm_reset_" + cmd).setLabel("Reset Default").setEmoji("♻️").setStyle(ButtonStyle.Danger),
+                new ButtonBuilder().setCustomId("setup_perms").setLabel("Back").setEmoji("◀️").setStyle(ButtonStyle.Danger)
+            )
+        ];
+        return interaction.update({ embeds: [embed], components: rows });
+    }
+
+    if (id.startsWith("setup_perm_toggle_")) {
+        const rest = id.slice("setup_perm_toggle_".length);
+        const idx = rest.lastIndexOf("_");
+        const cmd = rest.slice(0, idx);
+        const tierKey = rest.slice(idx + 1);
+
+        if (!gc.commandPerms[cmd]) gc.commandPerms[cmd] = [...(DEFAULT_COMMAND_PERMS[cmd] || ["management"])];
+
+        const current = gc.commandPerms[cmd];
+        if (current.includes(tierKey)) {
+            gc.commandPerms[cmd] = current.filter(t => t !== tierKey);
+        } else {
+            gc.commandPerms[cmd] = [...current, tierKey];
+        }
+        saveConfig();
+
+        const newTiers = gc.commandPerms[cmd];
+        const embed = new EmbedBuilder()
+            .setTitle("🔐 Edit `/" + cmd + "`")
+            .setDescription(
+                "Toggle which tiers can run this command.\n\n" +
+                "**Current:** " + fmtTiers(newTiers) + "\n\n" +
+                "Higher tiers automatically include lower ones:\n" +
+                "🛡️ Management → ⭐ High Rank → 🔨 Admin → 🎭 Staff"
+            )
+            .setColor(WEBHOOK_COLOR)
+            .setTimestamp();
+        const makeToggle = (tierKey2, label) => {
+            const enabled = newTiers.includes(tierKey2);
+            return new ButtonBuilder()
+                .setCustomId("setup_perm_toggle_" + cmd + "_" + tierKey2)
+                .setLabel(label)
+                .setStyle(enabled ? ButtonStyle.Success : ButtonStyle.Secondary);
+        };
+        const rows = [
+            new ActionRowBuilder().addComponents(
+                makeToggle("staff", "🎭 Staff"),
+                makeToggle("admin", "🔨 Admin"),
+                makeToggle("highrank", "⭐ High Rank"),
+                makeToggle("management", "🛡️ Management")
+            ),
+            new ActionRowBuilder().addComponents(
+                makeToggle("everyone", "🌐 Everyone"),
+                new ButtonBuilder().setCustomId("setup_perm_reset_" + cmd).setLabel("Reset Default").setEmoji("♻️").setStyle(ButtonStyle.Danger),
+                new ButtonBuilder().setCustomId("setup_perms").setLabel("Back").setEmoji("◀️").setStyle(ButtonStyle.Danger)
+            )
+        ];
+        return interaction.update({ embeds: [embed], components: rows });
+    }
+
+    if (id.startsWith("setup_perm_reset_")) {
+        const cmd = id.slice("setup_perm_reset_".length);
+        delete gc.commandPerms[cmd];
+        saveConfig();
+        const tiers = getRequiredTiers(guild.id, cmd);
+        const embed = new EmbedBuilder()
+            .setTitle("🔐 Edit `/" + cmd + "`")
+            .setDescription("**Reset to default.**\n\n**Current:** " + fmtTiers(tiers))
+            .setColor(WEBHOOK_COLOR)
+            .setTimestamp();
+        const makeToggle = (tierKey2, label) => {
+            const enabled = tiers.includes(tierKey2);
+            return new ButtonBuilder()
+                .setCustomId("setup_perm_toggle_" + cmd + "_" + tierKey2)
+                .setLabel(label)
+                .setStyle(enabled ? ButtonStyle.Success : ButtonStyle.Secondary);
+        };
+        const rows = [
+            new ActionRowBuilder().addComponents(
+                makeToggle("staff", "🎭 Staff"),
+                makeToggle("admin", "🔨 Admin"),
+                makeToggle("highrank", "⭐ High Rank"),
+                makeToggle("management", "🛡️ Management")
+            ),
+            new ActionRowBuilder().addComponents(
+                makeToggle("everyone", "🌐 Everyone"),
+                new ButtonBuilder().setCustomId("setup_perm_reset_" + cmd).setLabel("Reset Default").setEmoji("♻️").setStyle(ButtonStyle.Danger),
+                new ButtonBuilder().setCustomId("setup_perms").setLabel("Back").setEmoji("◀️").setStyle(ButtonStyle.Danger)
+            )
+        ];
+        return interaction.update({ embeds: [embed], components: rows });
+    }
+
+    if (id === "setup_perms_reset") {
+        gc.commandPerms = {};
+        saveConfig();
+        return showPermsOverview(interaction);
+    }
 
     if (id === "setup_prefix") {
         const modal = new ModalBuilder().setCustomId("modal_prefix").setTitle("Set Prefix");
@@ -1389,6 +1627,7 @@ async function handleButton(interaction) {
     const roleMap = {
         setup_role_staff: { key: "staffRoles", name: "Staff Roles", single: false },
         setup_role_admin: { key: "adminRoles", name: "Admin Roles", single: false },
+        setup_role_highrank: { key: "highRankRoles", name: "High Rank Roles", single: false },
         setup_role_management: { key: "managementRoles", name: "Management Roles", single: false },
         setup_role_exempt: { key: "exemptRoles", name: "Exempt Roles", single: false },
         setup_role_verify: { key: "verifyRoleId", name: "Verify Role", single: true },
@@ -1406,6 +1645,7 @@ async function handleButton(interaction) {
 
     if (id === "setup_clear_staff") { gc.staffRoles = []; saveConfig(); return updateSetupMessage(interaction, "roles"); }
     if (id === "setup_clear_admin") { gc.adminRoles = []; saveConfig(); return updateSetupMessage(interaction, "roles"); }
+    if (id === "setup_clear_highrank") { gc.highRankRoles = []; saveConfig(); return updateSetupMessage(interaction, "roles"); }
     if (id === "setup_clear_management") { gc.managementRoles = []; saveConfig(); return updateSetupMessage(interaction, "roles"); }
     if (id === "setup_clear_exempt") { gc.exemptRoles = []; saveConfig(); return updateSetupMessage(interaction, "roles"); }
     if (id === "setup_clear_accept") { gc.acceptRoleIds = []; saveConfig(); return updateSetupMessage(interaction, "roles"); }
@@ -1633,7 +1873,7 @@ async function handleTicketCreate(interaction, type, prefillReason) {
         { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks] },
         { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ReadMessageHistory] }
     ];
-    const viewRoleIds = new Set([...gc.staffRoles, ...gc.adminRoles, ...gc.managementRoles]);
+    const viewRoleIds = new Set([...gc.staffRoles, ...gc.adminRoles, ...gc.highRankRoles, ...gc.managementRoles]);
     if (gc[cfg.pingKey]) viewRoleIds.add(gc[cfg.pingKey]);
     for (const rid of viewRoleIds) if (!overwrites.find(o => o.id === rid)) overwrites.push({ id: rid, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
 
@@ -1684,7 +1924,9 @@ async function handleTicketClose(interaction) {
     const ticket = gc.tickets[interaction.channel.id];
     if (!ticket) return interaction.reply({ embeds: [createErrorEmbed("Not a ticket.")], ephemeral: true });
     const isOwner = interaction.user.id === ticket.userId;
-    if (!isOwner && !isStaff(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Only owner or staff.")], ephemeral: true });
+    const memberTiers = getMemberTiers(interaction.member);
+    const isStaffish = memberTiers.size > 0;
+    if (!isOwner && !isStaffish) return interaction.reply({ embeds: [createErrorEmbed("Only owner or staff.")], ephemeral: true });
     await interaction.reply({ embeds: [createInfoEmbed("🔒 Closing and generating transcript...")] });
     try {
         const messages = await interaction.channel.messages.fetch({ limit: 500 });
@@ -1818,6 +2060,61 @@ function buildTicketRulesEmbed(guild) {
 }
 
 // ==========================================
+// SETUP NAV
+// ==========================================
+
+async function updateSetupMessage(interaction, view) {
+    const guild = interaction.guild;
+    const gc = getGuildConfig(guild.id);
+    let embed, rows;
+
+    if (view === "main") { embed = buildSetupEmbed(guild); rows = buildSetupRows(); }
+    else if (view === "channels") {
+        embed = new EmbedBuilder().setTitle("📁 Channel Configuration")
+            .setDescription("**Main Log** — all events\n**Verification Log** — verifications\n**Transcript Channel** — ticket transcripts\n**Welcome** — welcome messages\n**Suggestions** — /suggest\n**Staff Feedback** — /staff-feedback\n**Staff Log** — punishments\n**HR Log** — accept/promote/demote/infract\n**Verify Panel Ch** — verify panel\n**Ticket Log** — ticket events")
+            .setColor(WEBHOOK_COLOR).setThumbnail(guild.iconURL({ dynamic: true })).setTimestamp();
+        rows = buildChannelsMenuRows();
+    } else if (view === "roles") {
+        embed = new EmbedBuilder().setTitle("🎭 Role Tiers")
+            .setDescription(
+                "**Hierarchy:** 🛡️ Management → ⭐ High Rank → 🔨 Admin → 🎭 Staff\n\n" +
+                "**Staff** — basic staff (mute/unmute/warn/kick/loguser)\n" +
+                "**Admin** — staff + ban/unban (no setup, no promote/demote/infract)\n" +
+                "**⭐ High Rank** — admin + accept/promote/demote/infract\n" +
+                "**Management** — everything including `/setup`\n" +
+                "**Exempt** — cannot be moderated\n" +
+                "**Verify Role** — auto-given on verify\n" +
+                "**Accept Roles** — given on accept"
+            )
+            .setColor(WEBHOOK_COLOR).setThumbnail(guild.iconURL({ dynamic: true })).setTimestamp();
+        rows = buildRolesMenuRows();
+    } else if (view === "tickets") {
+        embed = new EmbedBuilder().setTitle("🎫 Ticket Configuration")
+            .setDescription("**Support:** Support Category + Support Ping Role\n**High Rank:** High Rank Category + High Rank Ping Role (Management always pinged)")
+            .setColor(WEBHOOK_COLOR).setThumbnail(guild.iconURL({ dynamic: true })).setTimestamp();
+        rows = buildTicketsMenuRows();
+    } else if (view === "templates") {
+        embed = new EmbedBuilder().setTitle("✉️ DM Templates")
+            .setDescription("**Variables:** `{server}` `{rank}` `{type}` `{reason}` `{notes}`\n\n**Accept:**\n" + gc.dmTemplates.accept + "\n\n**Promote:**\n" + gc.dmTemplates.promote + "\n\n**Demote:**\n" + gc.dmTemplates.demote + "\n\n**Infract:**\n" + gc.dmTemplates.infract)
+            .setColor(WEBHOOK_COLOR).setTimestamp();
+        rows = buildTemplatesMenuRows();
+    } else if (view === "antinuke") {
+        const an = gc.antinuke;
+        embed = new EmbedBuilder().setTitle("🛡️ Anti-Nuke Settings")
+            .setDescription(
+                "**Threshold:** " + an.threshold + " events / " + Math.floor(an.windowMs / 1000) + "s\n" +
+                "**On trigger:** strip all roles + kick + 24h rejoin watch\n" +
+                "**Rejoin during watch:** re-strip + 24h timeout\n\n" +
+                "**Enabled:** " + (an.enabled ? "✅" : "❌") + "\n" +
+                "**Whitelisted:** " + an.whitelist.length
+            )
+            .setColor(0xED4245).setThumbnail(guild.iconURL({ dynamic: true })).setTimestamp();
+        rows = buildAntinukeMenuRows();
+    }
+    await interaction.update({ embeds: [embed], components: rows });
+}
+
+// ==========================================
 // PREFIX COMMANDS
 // ==========================================
 
@@ -1833,20 +2130,28 @@ client.on("messageCreate", async message => {
     try {
         if (command === "help") {
             const embed = new EmbedBuilder().setTitle(guild.name + " — Prefix Commands").setColor(WEBHOOK_COLOR)
-                .addFields({ name: "Prefix Commands", value: ["`" + prefix + "help`", "`" + prefix + "loguser <username> <punishment> <reason>`"].join("\n") });
+                .addFields({ name: "Prefix Commands", value: ["`" + prefix + "help`", "`" + prefix + "loguser <username> <Warn|Kick|Ban> <reason>`"].join("\n") });
             return message.reply({ embeds: [embed] });
         }
         if (command === "loguser") {
-            if (!isStaff(message.member)) return message.reply({ embeds: [createErrorEmbed("Staff only.")] });
-            const username = args[0], punishment = args[1], reason = args.slice(2).join(" ");
-            if (!username || !punishment || !reason) return message.reply({ embeds: [createErrorEmbed("Usage: `" + prefix + "loguser <username> <punishment> <reason>`")] });
+            if (!canRunCommand(message.member, "loguser")) return message.reply({ embeds: [createErrorEmbed("You don't have permission to use this command.")] });
+            const username = args[0], punishmentRaw = (args[1] || "").toLowerCase(), reason = args.slice(2).join(" ");
+            const valid = ["warn", "kick", "ban"];
+            if (!username || !valid.includes(punishmentRaw) || !reason) {
+                return message.reply({ embeds: [createErrorEmbed("Usage: `" + prefix + "loguser <username> <Warn|Kick|Ban> <reason>`")] });
+            }
             await message.channel.sendTyping();
             const robloxData = await lookupRobloxUser(username);
-            const logEmbed = new EmbedBuilder().setTitle("Punishment Log").setColor(0xED4245)
+            const meta = {
+                warn: { label: "Warn", emoji: "⚠️", color: 0xFEE75C },
+                kick: { label: "Kick", emoji: "👢", color: 0xE67E22 },
+                ban:  { label: "Ban",  emoji: "🔨", color: 0xED4245 }
+            }[punishmentRaw];
+            const logEmbed = new EmbedBuilder().setTitle(meta.emoji + " " + meta.label + " Logged").setColor(meta.color)
                 .addFields(
                     { name: "Roblox Username", value: robloxData ? robloxData.username : username, inline: true },
                     { name: "Roblox ID", value: robloxData ? String(robloxData.id) : "Not found", inline: true },
-                    { name: "Punishment", value: punishment, inline: true },
+                    { name: "Punishment", value: meta.label, inline: true },
                     { name: "Mod", value: message.author.tag, inline: true },
                     { name: "Reason", value: reason, inline: false }
                 ).setTimestamp();
@@ -1865,11 +2170,8 @@ client.on("guildMemberAdd", async member => {
     try {
         const guild = member.guild;
         const gc = getGuildConfig(guild.id);
-
-        // ---- CHECK REJOIN WATCH FIRST ----
         const wasMuted = await checkRejoinWatch(member);
 
-        // ---- WELCOME (still sent so they see context) ----
         if (gc.welcomeChannelId) {
             const ch = guild.channels.cache.get(gc.welcomeChannelId);
             if (ch) {
@@ -1877,8 +2179,6 @@ client.on("guildMemberAdd", async member => {
                 await ch.send({ content: member.toString() + " Hello, and welcome to **" + guild.name + "**! You are our **" + n + getOrdinalSuffix(n) + "** member, enjoy your stay!" });
             }
         }
-
-        // ---- LOG ----
         const accountAge = Math.floor((Date.now() - member.user.createdTimestamp) / 86400000);
         const embed = createLogEmbed("Member Joined",
             "**User:** " + member + " (" + member.user.tag + ")\n**ID:** " + member.id + "\n**Account Age:** " + accountAge + " days\n**Member Count:** " + guild.memberCount + (wasMuted ? "\n\n⚠️ **Auto-muted (24h rejoin watch)**" : ""),
@@ -1893,10 +2193,8 @@ client.on("guildMemberRemove", async member => {
         const embed = createLogEmbed("Member Left", "**User:** " + member.user.tag + "\n**ID:** " + member.id, 0xED4245);
         await sendLog(member.guild, embed);
         await sendWebhook(member.guild, embed);
-
-        // Antinuke: kick detection
         if (!member.guild.members.me.permissions.has(PermissionFlagsBits.ViewAuditLog)) return;
-        const executor = await fetchAuditExecutor(member.guild, 20 /* MEMBER_KICK */, member.id);
+        const executor = await fetchAuditExecutor(member.guild, 20, member.id);
         if (executor) await handleAntinukeEvent(member.guild, executor.id, "Kick");
     } catch (e) { console.error(e); }
 });
