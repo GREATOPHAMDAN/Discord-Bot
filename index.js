@@ -1,5 +1,5 @@
 // ==========================================
-// EAGLE COUNTY ROLEPLAY BOT - V.1.9
+// EAGLE COUNTY ROLEPLAY BOT - V.1.9.1
 // ==========================================
 
 const {
@@ -8,7 +8,6 @@ const {
     ActionRowBuilder, ButtonBuilder, ButtonStyle,
     ChannelType, ModalBuilder, TextInputBuilder, TextInputStyle,
     ChannelSelectMenuBuilder, RoleSelectMenuBuilder, UserSelectMenuBuilder,
-    StringSelectMenuBuilder,
     WebhookClient, AttachmentBuilder
 } = require("discord.js");
 
@@ -40,7 +39,7 @@ const DEFAULT_ANTINUKE = {
     whitelist: [], counters: {}, watchlist: {}
 };
 
-// Default extreme-swear list (severe only, not basic swearing)
+// Extreme swear list (severe only, not basic swearing)
 const DEFAULT_EXTREME_SWEARS = [
     "n1gger", "n1gga", "nigger", "nigga", "n1gg3r",
     "f4ggot", "faggot", "f4g", "kys", "kill yourself",
@@ -84,6 +83,9 @@ const DEFAULT_COMMAND_PERMS = {
     suggest: ["everyone"], "staff-feedback": ["everyone"], help: ["everyone"]
 };
 
+// Fixed URL regex — no `\s` inside character classes
+const URL_REGEX = /(https?:\/\/\S+)|(www\.\S+)|(discord\.gg\/\S+)/i;
+
 // ==========================================
 // CLIENT
 // ==========================================
@@ -104,6 +106,21 @@ const client = new Client({
 });
 
 // ==========================================
+// TOP-LEVEL STATE (declared BEFORE client handlers)
+// ==========================================
+
+// Live polls (in-memory only; auto-expire)
+const polls = new Map();          // pollId -> { question, options, votes, messageId, channelId, guildId, ended, endsAt }
+// Recent pinged messages for ghost-ping detection
+const _recentPingedMessages = new Map(); // messageId -> { mentions, channelId, guildId, authorId, content, at }
+// Compiled swear regex per guild
+const _swearRegexCache = new Map(); // guildId -> { listHash, regex }
+// Cached Webhook clients
+const _whClients = new Map();
+// Guild configs
+const guildConfigCache = new Map();
+
+// ==========================================
 // CONFIG
 // ==========================================
 
@@ -118,7 +135,7 @@ function createDefaultGuildConfig() {
         webhookUrl: null,
         staffRoles: [], adminRoles: [], highRankRoles: [], managementRoles: [],
         exemptRoles: [], verifyRoleId: null, acceptRoleIds: [],
-        hrPingRoleId: null,                // NEW — pinged on extreme swear
+        hrPingRoleId: null,
         commandPerms: {},
         dmTemplates: {
             accept: "Congratulations! Your application for **{server}** has been accepted.\n\nPlease review the server for next steps.",
@@ -127,7 +144,7 @@ function createDefaultGuildConfig() {
             infract: "You have received an infraction in **{server}**.\n\n**Type:** {type}\n**Reason:** {reason}"
         },
         antinuke: JSON.parse(JSON.stringify(DEFAULT_ANTINUKE)),
-        automod: {                                          // NEW
+        automod: {
             extremeSweatEnabled: true,
             extremeSweatList: [...DEFAULT_EXTREME_SWEARS],
             ghostPingEnabled: true,
@@ -138,7 +155,7 @@ function createDefaultGuildConfig() {
         verifySessions: {}, verifiedUsers: {}, tickets: {},
         ticketCounter: 0, suggestions: {}, staffFeedback: {}, limits: {},
         afk: {},
-        giveaways: {}                                       // NEW
+        giveaways: {}
     };
 }
 
@@ -177,7 +194,6 @@ function flushSave() {
     saveDirty = false;
 }
 
-const guildConfigCache = new Map();
 function getGuildConfig(guildId) {
     let gc = guildConfigCache.get(guildId);
     if (gc) return gc;
@@ -201,7 +217,7 @@ function getGuildConfig(guildId) {
     if (!gc.antinuke.watchlist) gc.antinuke.watchlist = {};
     if (!gc.afk) gc.afk = {};
     if (!gc.giveaways) gc.giveaways = {};
-    if (!gc.automod) gc.automod = { extremeSweatEnabled: true, extremeSweatList: [...DEFAULT_EXTREME_SWEARS], ghostPingEnabled: true, linkFilterEnabled: true, linkWhitelistChannelIds: [], ignoredChannelIds: [] };
+    if (!gc.automod) gc.automod = createDefaultGuildConfig().automod;
     if (!Array.isArray(gc.automod.extremeSweatList)) gc.automod.extremeSweatList = [...DEFAULT_EXTREME_SWEARS];
     if (!Array.isArray(gc.automod.linkWhitelistChannelIds)) gc.automod.linkWhitelistChannelIds = [];
     if (!Array.isArray(gc.automod.ignoredChannelIds)) gc.automod.ignoredChannelIds = [];
@@ -214,8 +230,6 @@ function getGuildConfig(guildId) {
 // AUTOMOD HELPERS
 // ==========================================
 
-// Cache compiled regex per guild for performance
-const _swearRegexCache = new Map(); // guildId -> { listHash, regex }
 function getSwearRegex(guildId) {
     const gc = getGuildConfig(guildId);
     const list = gc.automod.extremeSweatList || [];
@@ -223,20 +237,23 @@ function getSwearRegex(guildId) {
     const cached = _swearRegexCache.get(guildId);
     if (cached && cached.listHash === hash) return cached.regex;
 
-    // Escape + sort by length desc (longest match first)
     const sorted = [...list].sort((a, b) => b.length - a.length);
     const escaped = sorted.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-    // Build word-boundary-ish regex, tolerate common substitutions
-    const pattern = escaped.length
-        ? new RegExp("(?<![a-z0-9])(" + escaped.join("|") + ")(?![a-z0-9])", "gi")
-        : null;
+    let pattern = null;
+    if (escaped.length) {
+        try {
+            // \b word boundaries — universal support, no lookbehind needed
+            pattern = new RegExp("\\b(" + escaped.join("|") + ")\\b", "gi");
+        } catch (e) {
+            console.error("swear regex build failed:", e);
+            pattern = null;
+        }
+    }
     _swearRegexCache.set(guildId, { listHash: hash, regex: pattern });
     return pattern;
 }
 
 function invalidateSwearRegex(guildId) { _swearRegexCache.delete(guildId); }
-
-const URL_REGEX = /(https?:\/\/[^\s]+)|(www\.[^\s]+)|(discord\.gg\/[^\s]+)/i;
 
 function containsLink(content) {
     if (!content) return false;
@@ -336,10 +353,10 @@ function formatDuration(ms) {
     if (m < 60) return m + "m";
     const h = Math.floor(m / 60);
     const rm = m % 60;
-    if (h < 24) return h + "h " + rm + "m";
+    if (h < 24) return h + "h" + (rm ? " " + rm + "m" : "");
     const d = Math.floor(h / 24);
     const rh = h % 24;
-    return d + "d " + rh + "h";
+    return d + "d" + (rh ? " " + rh + "h" : "");
 }
 
 // ==========================================
@@ -362,7 +379,6 @@ async function sendToChannel(guild, channelId, payload) {
     try { await ch.send(payload); } catch {}
 }
 
-const _whClients = new Map();
 async function sendWebhook(guild, embed) {
     const gc = getGuildConfig(guild.id);
     if (!gc.webhookUrl) return;
@@ -671,7 +687,6 @@ function getSlashCommands() {
             .addStringOption(o => o.setName("reason").setDescription("Reason").setRequired(true))
             .addStringOption(o => o.setName("notes").setDescription("Additional notes (optional)").setRequired(false)),
 
-        // NEW — Poll
         new SlashCommandBuilder().setName("poll").setDescription("Create a poll (up to 10 options)")
             .addStringOption(o => o.setName("question").setDescription("Poll question").setRequired(true).setMaxLength(250))
             .addStringOption(o => o.setName("option1").setDescription("Option 1").setRequired(true).setMaxLength(80))
@@ -686,7 +701,6 @@ function getSlashCommands() {
             .addStringOption(o => o.setName("option10").setDescription("Option 10").setRequired(false).setMaxLength(80))
             .addIntegerOption(o => o.setName("duration").setDescription("Minutes until auto-close (optional)").setRequired(false).setMinValue(1).setMaxValue(1440)),
 
-        // NEW — Giveaway
         new SlashCommandBuilder().setName("giveaway").setDescription("Start a giveaway")
             .addStringOption(o => o.setName("prize").setDescription("Prize").setRequired(true).setMaxLength(200))
             .addIntegerOption(o => o.setName("duration").setDescription("Duration in minutes").setRequired(true).setMinValue(1).setMaxValue(10080))
@@ -694,7 +708,6 @@ function getSlashCommands() {
             .addRoleOption(o => o.setName("required_role").setDescription("Role required to join (optional)").setRequired(false))
             .addChannelOption(o => o.setName("channel").setDescription("Channel to post in (default this channel)").setRequired(false)),
 
-        // ===== UTILITY =====
         new SlashCommandBuilder().setName("roles").setDescription("List all server roles (staff-only)"),
         new SlashCommandBuilder().setName("serverinfo").setDescription("Show information about this server"),
         new SlashCommandBuilder().setName("afk").setDescription("Set yourself as AFK")
@@ -746,25 +759,46 @@ client.once("ready", async () => {
     }
     await Promise.all(jobs);
 
-    client.user.setActivity("Eagle County Roleplay | V.1.9");
+    client.user.setActivity("Eagle County Roleplay | V.1.9.1");
 
+    // Prune expired data + reschedule unfinished giveaways
     for (const guild of client.guilds.cache.values()) {
         const gc = getGuildConfig(guild.id);
         const now = Date.now();
         let changed = false;
+
         for (const [uid, e] of Object.entries(gc.antinuke.watchlist)) {
             if (now > e) { delete gc.antinuke.watchlist[uid]; changed = true; }
         }
-        // Clean up expired giveaways
         for (const [gid, g] of Object.entries(gc.giveaways || {})) {
-            if (g.ended) { delete gc.giveaways[gid]; changed = true; }
+            if (g.ended) { delete gc.giveaways[gid]; changed = true; continue; }
+            // Reschedule if still running
+            const remaining = g.endsAt - now;
+            if (remaining > 0) {
+                setTimeout(() => endGiveaway(gid), remaining).unref?.();
+            } else {
+                setTimeout(() => endGiveaway(gid), 1000).unref?.();
+            }
         }
         if (changed) saveConfig();
     }
+
+    // Periodic pruning every 10 minutes
+    setInterval(() => {
+        const now = Date.now();
+        for (const [k, v] of _recentPingedMessages) {
+            if (now - v.at > 10 * 60 * 1000) _recentPingedMessages.delete(k);
+        }
+        for (const [id, p] of polls) {
+            if (p.ended) polls.delete(id);
+        }
+    }, 10 * 60 * 1000).unref?.();
 });
 
 client.on("guildCreate", async guild => {
     getGuildConfig(guild.id);
+    // Reset slash cache so the new guild registers with current commands
+    _slashCache = null;
     await registerCommands(guild);
 });
 
@@ -791,7 +825,7 @@ async function tryDM(user, embed) {
 }
 
 // ==========================================
-// SETUP MENU — REDUCED CLUTTER
+// SETUP MENU
 // ==========================================
 
 function fmtCh(gc, k)   { return gc[k] ? "<#" + gc[k] + ">" : "❌ Not set"; }
@@ -807,11 +841,8 @@ function buildSetupEmbed(guild) {
     const activeGiveaways = Object.values(gc.giveaways || {}).filter(g => !g.ended).length;
 
     return new EmbedBuilder()
-        .setTitle("⚙️ " + guild.name + " — Setup Menu (V.1.9)")
-        .setDescription(
-            "**Quick Overview**\n" +
-            "Use the buttons below to configure each section."
-        )
+        .setTitle("⚙️ " + guild.name + " — Setup Menu (V.1.9.1)")
+        .setDescription("**Quick Overview** — use the buttons below to configure each section.")
         .setColor(WEBHOOK_COLOR)
         .setThumbnail(guild.iconURL({ size: 256 }))
         .addFields(
@@ -848,7 +879,7 @@ function buildSetupEmbed(guild) {
                 inline: false
             }
         )
-        .setFooter({ text: "V.1.9 • " + guild.name, iconURL: guild.iconURL() || undefined })
+        .setFooter({ text: "V.1.9.1 • " + guild.name, iconURL: guild.iconURL() || undefined })
         .setTimestamp();
 }
 
@@ -869,11 +900,10 @@ function buildSetupRows() {
             new ButtonBuilder().setCustomId("setup_general").setLabel("General").setEmoji("🔤").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_post_verify").setLabel("Post Verify").setEmoji("🛡️").setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId("setup_post_tickets").setLabel("Post Tickets").setEmoji("🎫").setStyle(ButtonStyle.Success)
-        ]
+        )
     ];
 }
 
-// Combined channels + general in one menu
 function buildChannelsMenuRows() {
     return [
         new ActionRowBuilder().addComponents(
@@ -937,7 +967,6 @@ function buildTicketsMenuRows() {
     ];
 }
 
-// Auto-Mod menu
 function buildAutomodMenuRows() {
     return [
         new ActionRowBuilder().addComponents(
@@ -968,7 +997,6 @@ function buildGeneralMenuRows() {
     ];
 }
 
-// Anti-nuke menu
 function buildAntinukeMenuRows() {
     return [
         new ActionRowBuilder().addComponents(
@@ -988,7 +1016,6 @@ function buildAntinukeMenuRows() {
     ];
 }
 
-// Templates menu
 function buildTemplatesMenuRows() {
     return [
         new ActionRowBuilder().addComponents(
@@ -1003,7 +1030,6 @@ function buildTemplatesMenuRows() {
     ];
 }
 
-// Permissions menus
 const PERM_GROUPS = {
     setup: { name: "⚙️ Setup & Config", commands: ["setup", "setprefix", "setupverify", "setuptickets", "set-webhook", "remove-webhook", "antinuke"] },
     hr:    { name: "👑 HR / Applications", commands: ["acceptsetup", "accept", "promote", "demote", "infract"] },
@@ -1162,7 +1188,8 @@ function buildPollEmbed(question, options, votes, closed, durationMin) {
     const lines = options.map((opt, i) => {
         const count = votes[i]?.length || 0;
         const pct = total ? Math.round((count / total) * 100) : 0;
-        const bar = "█".repeat(Math.round(pct / 10)) + "░".repeat(10 - Math.round(pct / 10));
+        const filled = Math.round(pct / 10);
+        const bar = "█".repeat(filled) + "░".repeat(10 - filled);
         return "**" + (i + 1) + ".** " + opt + "\n`" + bar + "` " + count + " vote" + (count === 1 ? "" : "s") + " (" + pct + "%)";
     }).join("\n\n");
 
@@ -1231,6 +1258,70 @@ function buildGiveawayRows(giveawayId, closed) {
 }
 
 // ==========================================
+// POLL / GIVEAWAY END HELPERS
+// ==========================================
+
+async function endPoll(pollId) {
+    const p = polls.get(pollId);
+    if (!p || p.ended) return;
+    p.ended = true;
+    try {
+        const channel = await client.channels.fetch(p.channelId).catch(() => null);
+        if (!channel) { polls.delete(pollId); return; }
+        const msg = await channel.messages.fetch(p.messageId).catch(() => null);
+        if (!msg) { polls.delete(pollId); return; }
+        const embed = buildPollEmbed(p.question, p.options, p.votes, true, null);
+        const rows = buildPollRows(p.options, pollId, true);
+        await msg.edit({ embeds: [embed], components: rows }).catch(() => {});
+    } catch (e) { console.error("endPoll:", e); }
+    polls.delete(pollId);
+}
+
+async function endGiveaway(giveawayId) {
+    for (const gc of guildConfigCache.values()) {
+        if (gc.giveaways && gc.giveaways[giveawayId]) {
+            const g = gc.giveaways[giveawayId];
+            if (g.ended) return;
+            g.ended = true;
+
+            const winners = [];
+            const pool = [...g.entries];
+            while (winners.length < g.winners && pool.length) {
+                const idx = Math.floor(Math.random() * pool.length);
+                winners.push(pool.splice(idx, 1)[0]);
+            }
+            g.winnerIds = winners;
+            saveConfig();
+
+            try {
+                const channel = await client.channels.fetch(g.channelId).catch(() => null);
+                if (channel) {
+                    const msg = await channel.messages.fetch(g.messageId).catch(() => null);
+                    if (msg) {
+                        const embed = buildGiveawayEmbed(g, true, winners);
+                        const rows = buildGiveawayRows(giveawayId, true);
+                        await msg.edit({ embeds: [embed], components: rows }).catch(() => {});
+                    }
+                    if (winners.length) {
+                        channel.send({ content: "🎉 Congratulations " + winners.map(id => "<@" + id + ">").join(", ") + "! You won **" + g.prize + "**!" }).catch(() => {});
+                        // DM each winner
+                        for (const wid of winners) {
+                            try {
+                                const u = await client.users.fetch(wid).catch(() => null);
+                                if (u) u.send({ embeds: [new EmbedBuilder().setTitle("🎉 You won a giveaway!").setDescription("You won **" + g.prize + "** in **" + (channel.guild?.name || "the server") + "**!").setColor(0x57F287).setTimestamp()] }).catch(() => {});
+                            } catch {}
+                        }
+                    } else {
+                        channel.send({ content: "No valid entries for **" + g.prize + "** — no winner selected." }).catch(() => {});
+                    }
+                }
+            } catch (e) { console.error("endGiveaway:", e); }
+            return;
+        }
+    }
+}
+
+// ==========================================
 // INTERACTION HANDLER
 // ==========================================
 
@@ -1252,10 +1343,8 @@ client.on("interactionCreate", async interaction => {
             return interaction.reply({ embeds: [errorEmbed("You don't have permission to use this command.\n**Required:** " + fmtTiers(required))], ephemeral: true });
         }
 
-        // ---------- /setup ----------
         if (command === "setup") return interaction.reply({ embeds: [buildSetupEmbed(guild)], components: buildSetupRows(), ephemeral: true });
 
-        // ---------- /setprefix ----------
         if (command === "setprefix") {
             const prefix = interaction.options.getString("prefix");
             if (/\s/.test(prefix)) return interaction.reply({ embeds: [errorEmbed("No spaces.")], ephemeral: true });
@@ -1263,20 +1352,17 @@ client.on("interactionCreate", async interaction => {
             return interaction.reply({ embeds: [successEmbed("Prefix: `" + prefix + "`.")] });
         }
 
-        // ---------- /setupverify ----------
         if (command === "setupverify") {
             gc.verifyChannelId = interaction.channel.id; saveConfig();
             await interaction.channel.send({ embeds: [buildVerifyEmbed(guild)], components: buildVerifyRows() });
             return interaction.reply({ embeds: [successEmbed("Verification panel posted.")], ephemeral: true });
         }
 
-        // ---------- /setuptickets ----------
         if (command === "setuptickets") {
             await interaction.channel.send({ embeds: [buildTicketPanelEmbed(guild)], components: buildTicketPanelRows() });
             return interaction.reply({ embeds: [successEmbed("Ticket panel posted.")], ephemeral: true });
         }
 
-        // ---------- Webhook ----------
         if (command === "set-webhook") {
             const url = interaction.options.getString("url");
             if (!/^https:\/\/discord(app)?\.com\/api\/webhooks\//.test(url)) return interaction.reply({ embeds: [errorEmbed("Invalid URL.")], ephemeral: true });
@@ -1285,7 +1371,6 @@ client.on("interactionCreate", async interaction => {
         }
         if (command === "remove-webhook") { gc.webhookUrl = null; saveConfig(); return interaction.reply({ embeds: [successEmbed("Removed.")] }); }
 
-        // ---------- /acceptsetup ----------
         if (command === "acceptsetup") {
             const sub = interaction.options.getSubcommand();
             if (sub === "add")    { const r = interaction.options.getRole("role"); if (!gc.acceptRoleIds.includes(r.id)) gc.acceptRoleIds.push(r.id); saveConfig(); return interaction.reply({ embeds: [successEmbed(r + " added.")] }); }
@@ -1294,7 +1379,6 @@ client.on("interactionCreate", async interaction => {
             if (sub === "clear")  { gc.acceptRoleIds = []; saveConfig(); return interaction.reply({ embeds: [successEmbed("Cleared.")] }); }
         }
 
-        // ---------- /antinuke ----------
         if (command === "antinuke") {
             const sub = interaction.options.getSubcommand();
             const an = gc.antinuke;
@@ -1325,7 +1409,6 @@ client.on("interactionCreate", async interaction => {
             if (sub === "reset")   { an.counters = {}; saveConfig(); return interaction.reply({ embeds: [successEmbed("Reset.")] }); }
         }
 
-        // ---------- HR ----------
         if (command === "accept") {
             const targetUser = interaction.options.getUser("user");
             const notes = interaction.options.getString("notes") || null;
@@ -1376,7 +1459,6 @@ client.on("interactionCreate", async interaction => {
             return interaction.editReply({ embeds: [successEmbed(targetUser.tag + " " + tplKey + "d.")] });
         }
 
-        // ---------- Moderation ----------
         if (command === "mute") {
             const target = await guild.members.fetch(interaction.options.getUser("user").id).catch(() => null);
             if (!target) return interaction.reply({ embeds: [errorEmbed("Not found.")], ephemeral: true });
@@ -1461,7 +1543,6 @@ client.on("interactionCreate", async interaction => {
             } catch { return interaction.editReply({ embeds: [errorEmbed("Failed.")] }); }
         }
 
-        // ---------- /loguser ----------
         if (command === "loguser") {
             const username = interaction.options.getString("username");
             const punishment = interaction.options.getString("punishment");
@@ -1495,7 +1576,6 @@ client.on("interactionCreate", async interaction => {
             return interaction.editReply({ embeds: [successEmbed("**" + meta.label + "** logged for **" + (robloxData?.username || username) + "**.")] });
         }
 
-        // ---------- /poll ----------
         if (command === "poll") {
             const question = interaction.options.getString("question");
             const options = [];
@@ -1514,16 +1594,14 @@ client.on("interactionCreate", async interaction => {
             await interaction.reply({ embeds: [embed], components: rows });
             const msg = await interaction.fetchReply();
 
-            // Save for vote tracking (in-memory map + config)
-            polls.set(pollId, { question, options, votes, messageId: msg.id, channelId: interaction.channel.id, guildId: guild.id, ended: false });
+            polls.set(pollId, { question, options, votes, messageId: msg.id, channelId: interaction.channel.id, guildId: guild.id, ended: false, endsAt: duration ? Date.now() + duration * 60000 : null });
 
             if (duration) {
-                setTimeout(() => endPoll(pollId), duration * 60 * 1000);
+                setTimeout(() => endPoll(pollId), duration * 60 * 1000).unref?.();
             }
             return;
         }
 
-        // ---------- /giveaway ----------
         if (command === "giveaway") {
             const prize = interaction.options.getString("prize");
             const duration = interaction.options.getInteger("duration");
@@ -1531,8 +1609,13 @@ client.on("interactionCreate", async interaction => {
             const requiredRole = interaction.options.getRole("required_role");
             const targetChannel = interaction.options.getChannel("channel") || interaction.channel;
 
-            if (!targetChannel.isTextBased() || !targetChannel.isSendable?.()) {
-                return interaction.reply({ embeds: [errorEmbed("Invalid channel.")], ephemeral: true });
+            // Safe text-channel check
+            const isTextLike = targetChannel && (
+                targetChannel.type === ChannelType.GuildText ||
+                targetChannel.type === ChannelType.GuildAnnouncement
+            );
+            if (!isTextLike) {
+                return interaction.reply({ embeds: [errorEmbed("Channel must be a text or announcement channel.")], ephemeral: true });
             }
 
             const endsAt = Date.now() + duration * 60 * 1000;
@@ -1553,17 +1636,15 @@ client.on("interactionCreate", async interaction => {
 
             await interaction.reply({ embeds: [successEmbed("Giveaway started in " + targetChannel + "!")], ephemeral: true });
 
-            setTimeout(() => endGiveaway(giveawayId), duration * 60 * 1000);
+            setTimeout(() => endGiveaway(giveawayId), duration * 60 * 1000).unref?.();
             return;
         }
 
-        // ---------- NEW UTILITY ----------
         if (command === "roles")     return cmdRoles(interaction, true);
         if (command === "serverinfo") return cmdServerInfo(interaction, true);
         if (command === "afk")       return cmdAfk(interaction, true, interaction.options.getString("reason"));
         if (command === "av")        return cmdAv(interaction, true, interaction.options.getUser("user"));
 
-        // ---------- Public ----------
         if (command === "suggest") {
             if (!gc.suggestionChannelId) return interaction.reply({ embeds: [errorEmbed("Suggestions channel not set.")], ephemeral: true });
             const suggestion = interaction.options.getString("suggestion");
@@ -1592,7 +1673,7 @@ client.on("interactionCreate", async interaction => {
 
         if (command === "help") {
             const prefix = getPrefix(guild.id);
-            const embed = new EmbedBuilder().setTitle(guild.name + " — Bot Commands V.1.9")
+            const embed = new EmbedBuilder().setTitle(guild.name + " — Bot Commands V.1.9.1")
                 .setColor(WEBHOOK_COLOR).setThumbnail(guild.iconURL())
                 .addFields(
                     { name: "Setup (Management)", value: "`/setup` `/setupverify` `/setuptickets`", inline: false },
@@ -1618,67 +1699,6 @@ client.on("interactionCreate", async interaction => {
 });
 
 // ==========================================
-// POLL STATE (in-memory, syncs votes into config)
-// ==========================================
-
-const polls = new Map(); // pollId -> { question, options, votes, messageId, channelId, guildId, ended }
-
-async function endPoll(pollId) {
-    const p = polls.get(pollId);
-    if (!p || p.ended) return;
-    p.ended = true;
-    try {
-        const channel = await client.channels.fetch(p.channelId).catch(() => null);
-        if (!channel) return;
-        const msg = await channel.messages.fetch(p.messageId).catch(() => null);
-        if (!msg) return;
-        const embed = buildPollEmbed(p.question, p.options, p.votes, true, null);
-        const rows = buildPollRows(p.options, pollId, true);
-        await msg.edit({ embeds: [embed], components: rows });
-    } catch (e) { console.error("endPoll:", e); }
-    polls.delete(pollId);
-}
-
-async function endGiveaway(giveawayId) {
-    const gc_entries = [...guildConfigCache.values()]; // not needed, just for clarity
-    // find which guild owns this giveaway
-    for (const gc of guildConfigCache.values()) {
-        if (gc.giveaways && gc.giveaways[giveawayId]) {
-            const g = gc.giveaways[giveawayId];
-            if (g.ended) return;
-            g.ended = true;
-
-            const winners = [];
-            const pool = [...g.entries];
-            while (winners.length < g.winners && pool.length) {
-                const idx = Math.floor(Math.random() * pool.length);
-                winners.push(pool.splice(idx, 1)[0]);
-            }
-            g.winnerIds = winners;
-            saveConfig();
-
-            try {
-                const channel = await client.channels.fetch(g.channelId).catch(() => null);
-                if (channel) {
-                    const msg = await channel.messages.fetch(g.messageId).catch(() => null);
-                    if (msg) {
-                        const embed = buildGiveawayEmbed(g, true, winners);
-                        const rows = buildGiveawayRows(giveawayId, true);
-                        await msg.edit({ embeds: [embed], components: rows });
-                    }
-                    if (winners.length) {
-                        channel.send({ content: "🎉 Congratulations " + winners.map(id => "<@" + id + ">").join(", ") + "! You won **" + g.prize + "**!" }).catch(() => {});
-                    } else {
-                        channel.send({ content: "No valid entries for **" + g.prize + "** — no winner selected." }).catch(() => {});
-                    }
-                }
-            } catch (e) { console.error("endGiveaway:", e); }
-            return;
-        }
-    }
-}
-
-// ==========================================
 // BUTTON HANDLER
 // ==========================================
 
@@ -1695,14 +1715,13 @@ async function handleButton(interaction) {
         const p = polls.get(pollId);
         if (!p || p.ended) return interaction.reply({ embeds: [errorEmbed("This poll has ended.")], ephemeral: true });
 
-        // Remove previous vote
         for (const key in p.votes) p.votes[key] = p.votes[key].filter(uid => uid !== interaction.user.id);
         if (!p.votes[optIdx]) p.votes[optIdx] = [];
         p.votes[optIdx].push(interaction.user.id);
 
         const embed = buildPollEmbed(p.question, p.options, p.votes, false, null);
         const rows = buildPollRows(p.options, pollId, false);
-        await interaction.update({ embeds: [embed], components: rows });
+        await interaction.update({ embeds: [embed], components: rows }).catch(() => {});
         return;
     }
 
@@ -1717,7 +1736,6 @@ async function handleButton(interaction) {
         }
 
         if (g.entries.includes(interaction.user.id)) {
-            // Leave
             g.entries = g.entries.filter(uid => uid !== interaction.user.id);
             saveConfig();
             await interaction.reply({ embeds: [infoEmbed("You left the giveaway.")], ephemeral: true });
@@ -1726,14 +1744,13 @@ async function handleButton(interaction) {
             saveConfig();
             await interaction.reply({ embeds: [successEmbed("You've entered the giveaway! 🎉")], ephemeral: true });
         }
-        // Update message
         try {
             const channel = await client.channels.fetch(g.channelId).catch(() => null);
             if (channel) {
                 const msg = await channel.messages.fetch(g.messageId).catch(() => null);
                 if (msg) {
                     const embed = buildGiveawayEmbed(g, false, []);
-                    await msg.edit({ embeds: [embed], components: buildGiveawayRows(giveawayId, false) });
+                    await msg.edit({ embeds: [embed], components: buildGiveawayRows(giveawayId, false) }).catch(() => {});
                 }
             }
         } catch {}
@@ -2437,9 +2454,6 @@ async function cmdAv(interactionOrMessage, isSlash, targetUser) {
 // MESSAGE HANDLER — AUTOMOD + PREFIX + AFK
 // ==========================================
 
-// Track message pings for ghost-ping detection (messageId -> { mentions, channelId, guildId, content, authorId })
-const _recentPingedMessages = new Map();
-
 client.on("messageCreate", async message => {
     if (message.author.bot) return;
     if (!message.guild) return;
@@ -2449,16 +2463,15 @@ client.on("messageCreate", async message => {
     const member = message.member;
 
     // ----- 1) AUTOMOD: extreme swear -----
-    if (gc.automod.extremeSweatEnabled && !isExempt(member) && !canRunCommand(member, "setup")) {
+    if (gc.automod.extremeSweatEnabled && member && !isExempt(member) && !canRunCommand(member, "setup")) {
         const regex = getSwearRegex(guild.id);
         if (regex && regex.test(message.content)) {
-            // Delete
+            regex.lastIndex = 0; // reset for reuse
             message.delete().catch(() => {});
-            // Mute 60m
             let muted = false;
             try {
-                if (message.member?.moderatable) {
-                    await message.member.timeout(SWEAR_MUTE_MS, "Auto-Mod: extreme language");
+                if (member.moderatable) {
+                    await member.timeout(SWEAR_MUTE_MS, "Auto-Mod: extreme language");
                     muted = true;
                 }
             } catch (e) { console.error("swear mute:", e); }
@@ -2476,10 +2489,8 @@ client.on("messageCreate", async message => {
                 .setThumbnail(message.author.displayAvatarURL())
                 .setTimestamp();
 
-            // Ping HR + log
             await broadcast(guild, embed, ["log", "staff", "webhook"]);
 
-            // Explicitly ping HR role in log channel
             if (hrPing && gc.logChannelId) {
                 const lc = guild.channels.cache.get(gc.logChannelId);
                 if (lc) lc.send({ content: "🚨 " + hrPing + " — Extreme language detected", allowedMentions: { roles: [gc.hrPingRoleId] } }).catch(() => {});
@@ -2489,35 +2500,35 @@ client.on("messageCreate", async message => {
     }
 
     // ----- 2) AUTOMOD: link filter -----
-    if (gc.automod.linkFilterEnabled && !isExempt(member) && !canRunCommand(member, "setup")) {
+    if (gc.automod.linkFilterEnabled && member && !isExempt(member) && !canRunCommand(member, "setup")) {
         if (containsLink(message.content) && !gc.automod.linkWhitelistChannelIds.includes(message.channel.id)) {
             message.delete().catch(() => {});
-            const warn = await message.channel.send({ content: message.author.toString() + " — links are not allowed in this channel." }).catch(() => null);
-            if (warn) setTimeout(() => warn.delete().catch(() => {}), 5000);
+            message.channel.send({ content: message.author.toString() + " — links are not allowed in this channel." })
+                .then(m => setTimeout(() => m.delete().catch(() => {}), 5000))
+                .catch(() => {});
 
             const embed = new EmbedBuilder().setTitle("🔗 Link Blocked").setColor(0xFEE75C)
                 .setDescription("**User:** " + message.author + " (" + message.author.tag + ")\n**Channel:** " + message.channel + "\n**Content:** ||" + message.content.slice(0, 1000) + "||")
                 .setThumbnail(message.author.displayAvatarURL())
                 .setTimestamp();
-            await broadcast(guild, embed, ["log", "webhook"]);
+            broadcast(guild, embed, ["log", "webhook"]).catch(() => {});
             return;
         }
     }
 
     // ----- 3) GHOST PING TRACKING -----
-    if (gc.automod.ghostPingEnabled && message.mentions.members?.size && !isExempt(member)) {
-        _recentPingedMessages.set(message.id, {
-            mentions: [...message.mentions.members.keys()],
-            channelId: message.channel.id,
-            guildId: guild.id,
-            authorId: message.author.id,
-            content: message.content.slice(0, 200),
-            at: Date.now()
-        });
-        // prune old
-        if (_recentPingedMessages.size > 500) {
-            const now = Date.now();
-            for (const [k, v] of _recentPingedMessages) if (now - v.at > 10 * 60 * 1000) _recentPingedMessages.delete(k);
+    if (gc.automod.ghostPingEnabled && message.mentions.members?.size && member && !isExempt(member)) {
+        // Guard: skip if user mentions only themselves
+        const others = [...message.mentions.members.keys()].filter(id => id !== message.author.id);
+        if (others.length) {
+            _recentPingedMessages.set(message.id, {
+                mentions: others,
+                channelId: message.channel.id,
+                guildId: guild.id,
+                authorId: message.author.id,
+                content: message.content.slice(0, 200),
+                at: Date.now()
+            });
         }
     }
 
@@ -2587,7 +2598,7 @@ client.on("messageCreate", async message => {
 });
 
 // ==========================================
-// GHOST PING DETECTION (messageDelete)
+// GHOST PING DETECTION
 // ==========================================
 
 client.on("messageDelete", async message => {
@@ -2595,22 +2606,18 @@ client.on("messageDelete", async message => {
         if (!message.guild) return;
         const gc = getGuildConfig(message.guild.id);
 
-        // Log deletion (existing behavior)
         if (message.author && !message.author.bot) {
             broadcast(message.guild, logEmbed("Message Deleted",
                 "**Author:** " + (message.author?.tag || "Unknown") + "\n**Channel:** " + message.channel + "\n**Content:** " + (message.content || "*None*").slice(0, 1500), 0xED4245), ["log"]).catch(() => {});
         }
 
-        // Ghost-ping detection
         if (!gc.automod.ghostPingEnabled) return;
         const tracked = _recentPingedMessages.get(message.id);
         if (!tracked) return;
         _recentPingedMessages.delete(message.id);
 
-        // Ghost ping = pinged, then deleted within 60s
         if (Date.now() - tracked.at > 60_000) return;
 
-        // Warn the ghost pinger
         const author = await message.guild.members.fetch(tracked.authorId).catch(() => null);
         if (!author || isExempt(author)) return;
 
@@ -2627,7 +2634,6 @@ client.on("messageDelete", async message => {
             .setTimestamp();
 
         await broadcast(message.guild, embed, ["log", "staff", "webhook"]);
-        // DM warn
         author.send({ embeds: [new EmbedBuilder().setTitle("⚠️ Ghost Ping Warning")
             .setDescription("You ghost-pinged in **" + message.guild.name + "**. Please don't do that — it's disruptive.")
             .setColor(0xFEE75C).setTimestamp()] }).catch(() => {});
