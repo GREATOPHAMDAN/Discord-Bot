@@ -1,5 +1,5 @@
 // ==========================================
-// EAGLE COUNTY ROLEPLAY BOT - V.1.8
+// EAGLE COUNTY ROLEPLAY BOT - V.1.9
 // ==========================================
 
 const {
@@ -8,6 +8,7 @@ const {
     ActionRowBuilder, ButtonBuilder, ButtonStyle,
     ChannelType, ModalBuilder, TextInputBuilder, TextInputStyle,
     ChannelSelectMenuBuilder, RoleSelectMenuBuilder, UserSelectMenuBuilder,
+    StringSelectMenuBuilder,
     WebhookClient, AttachmentBuilder
 } = require("discord.js");
 
@@ -29,6 +30,7 @@ const DEFAULT_PREFIX = "!";
 const DAILY_LIMIT = 15;
 const WEBHOOK_COLOR = 0x2563EB;
 const EMBED_ACCENT  = 0xFF8C00;
+const SWEAR_MUTE_MS = 60 * 60 * 1000;
 
 const REJOIN_WATCH_MS = 24 * 60 * 60 * 1000;
 const REJOIN_MUTE_MS  = 24 * 60 * 60 * 1000;
@@ -38,6 +40,14 @@ const DEFAULT_ANTINUKE = {
     whitelist: [], counters: {}, watchlist: {}
 };
 
+// Default extreme-swear list (severe only, not basic swearing)
+const DEFAULT_EXTREME_SWEARS = [
+    "n1gger", "n1gga", "nigger", "nigga", "n1gg3r",
+    "f4ggot", "faggot", "f4g", "kys", "kill yourself",
+    "r3tard", "retard", "retarded", "chink", "spic",
+    "k1ll yourself", "tranny", "tr4nny"
+];
+
 const TIER_INCLUDES = {
     staff: ["staff"],
     admin: ["admin", "staff"],
@@ -46,17 +56,14 @@ const TIER_INCLUDES = {
 };
 
 const DEFAULT_COMMAND_PERMS = {
-    // Setup (Management only)
     setup: ["management"], setprefix: ["management"], setupverify: ["management"],
     setuptickets: ["management"], "set-webhook": ["management"],
     "remove-webhook": ["management"], antinuke: ["management"],
 
-    // HR
     acceptsetup: ["highrank", "management"], accept: ["highrank", "management"],
     promote: ["highrank", "management"], demote: ["highrank", "management"],
     infract: ["highrank", "management"],
 
-    // Moderation
     mute: ["staff", "admin", "highrank", "management"],
     unmute: ["staff", "admin", "highrank", "management"],
     warn: ["staff", "admin", "highrank", "management"],
@@ -64,16 +71,16 @@ const DEFAULT_COMMAND_PERMS = {
     ban: ["admin", "highrank", "management"],
     unban: ["admin", "highrank", "management"],
 
-    // Logging
     loguser: ["staff", "admin", "highrank", "management"],
 
-    // NEW — Utility
-    roles: ["staff", "admin", "highrank", "management"], // staff-only utility
+    poll: ["staff", "admin", "highrank", "management"],
+    giveaway: ["highrank", "management"],
+
+    roles: ["staff", "admin", "highrank", "management"],
     serverinfo: ["everyone"],
     afk: ["everyone"],
     av: ["everyone"],
 
-    // Public
     suggest: ["everyone"], "staff-feedback": ["everyone"], help: ["everyone"]
 };
 
@@ -97,7 +104,7 @@ const client = new Client({
 });
 
 // ==========================================
-// CONFIG (cached, debounced saves)
+// CONFIG
 // ==========================================
 
 function createDefaultGuildConfig() {
@@ -111,6 +118,7 @@ function createDefaultGuildConfig() {
         webhookUrl: null,
         staffRoles: [], adminRoles: [], highRankRoles: [], managementRoles: [],
         exemptRoles: [], verifyRoleId: null, acceptRoleIds: [],
+        hrPingRoleId: null,                // NEW — pinged on extreme swear
         commandPerms: {},
         dmTemplates: {
             accept: "Congratulations! Your application for **{server}** has been accepted.\n\nPlease review the server for next steps.",
@@ -119,10 +127,18 @@ function createDefaultGuildConfig() {
             infract: "You have received an infraction in **{server}**.\n\n**Type:** {type}\n**Reason:** {reason}"
         },
         antinuke: JSON.parse(JSON.stringify(DEFAULT_ANTINUKE)),
+        automod: {                                          // NEW
+            extremeSweatEnabled: true,
+            extremeSweatList: [...DEFAULT_EXTREME_SWEARS],
+            ghostPingEnabled: true,
+            linkFilterEnabled: true,
+            linkWhitelistChannelIds: [],
+            ignoredChannelIds: []
+        },
         verifySessions: {}, verifiedUsers: {}, tickets: {},
         ticketCounter: 0, suggestions: {}, staffFeedback: {}, limits: {},
-        // NEW — AFK storage: { userId: { reason, since } }
-        afk: {}
+        afk: {},
+        giveaways: {}                                       // NEW
     };
 }
 
@@ -144,8 +160,7 @@ function loadConfig() {
 
 let config = loadConfig();
 
-let saveTimer = null;
-let saveDirty = false;
+let saveTimer = null, saveDirty = false;
 function saveConfig() {
     saveDirty = true;
     if (saveTimer) return;
@@ -153,9 +168,7 @@ function saveConfig() {
         saveTimer = null;
         if (!saveDirty) return;
         saveDirty = false;
-        fs.writeFile(CONFIG_FILE, JSON.stringify(config, null, 4), e => {
-            if (e) console.error("saveConfig:", e);
-        });
+        fs.writeFile(CONFIG_FILE, JSON.stringify(config, null, 4), e => { if (e) console.error("saveConfig:", e); });
     }, 250);
 }
 function flushSave() {
@@ -165,7 +178,6 @@ function flushSave() {
 }
 
 const guildConfigCache = new Map();
-
 function getGuildConfig(guildId) {
     let gc = guildConfigCache.get(guildId);
     if (gc) return gc;
@@ -187,10 +199,48 @@ function getGuildConfig(guildId) {
     if (!gc.antinuke.counters) gc.antinuke.counters = {};
     if (!Array.isArray(gc.antinuke.whitelist)) gc.antinuke.whitelist = [];
     if (!gc.antinuke.watchlist) gc.antinuke.watchlist = {};
-    if (!gc.afk) gc.afk = {}; // NEW
+    if (!gc.afk) gc.afk = {};
+    if (!gc.giveaways) gc.giveaways = {};
+    if (!gc.automod) gc.automod = { extremeSweatEnabled: true, extremeSweatList: [...DEFAULT_EXTREME_SWEARS], ghostPingEnabled: true, linkFilterEnabled: true, linkWhitelistChannelIds: [], ignoredChannelIds: [] };
+    if (!Array.isArray(gc.automod.extremeSweatList)) gc.automod.extremeSweatList = [...DEFAULT_EXTREME_SWEARS];
+    if (!Array.isArray(gc.automod.linkWhitelistChannelIds)) gc.automod.linkWhitelistChannelIds = [];
+    if (!Array.isArray(gc.automod.ignoredChannelIds)) gc.automod.ignoredChannelIds = [];
 
     guildConfigCache.set(guildId, gc);
     return gc;
+}
+
+// ==========================================
+// AUTOMOD HELPERS
+// ==========================================
+
+// Cache compiled regex per guild for performance
+const _swearRegexCache = new Map(); // guildId -> { listHash, regex }
+function getSwearRegex(guildId) {
+    const gc = getGuildConfig(guildId);
+    const list = gc.automod.extremeSweatList || [];
+    const hash = list.join("|");
+    const cached = _swearRegexCache.get(guildId);
+    if (cached && cached.listHash === hash) return cached.regex;
+
+    // Escape + sort by length desc (longest match first)
+    const sorted = [...list].sort((a, b) => b.length - a.length);
+    const escaped = sorted.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    // Build word-boundary-ish regex, tolerate common substitutions
+    const pattern = escaped.length
+        ? new RegExp("(?<![a-z0-9])(" + escaped.join("|") + ")(?![a-z0-9])", "gi")
+        : null;
+    _swearRegexCache.set(guildId, { listHash: hash, regex: pattern });
+    return pattern;
+}
+
+function invalidateSwearRegex(guildId) { _swearRegexCache.delete(guildId); }
+
+const URL_REGEX = /(https?:\/\/[^\s]+)|(www\.[^\s]+)|(discord\.gg\/[^\s]+)/i;
+
+function containsLink(content) {
+    if (!content) return false;
+    return URL_REGEX.test(content);
 }
 
 // ==========================================
@@ -221,7 +271,6 @@ function canRunCommand(member, commandName) {
     if (!member) return false;
     const required = getRequiredTiers(member.guild.id, commandName);
     if (required.includes("everyone")) return true;
-
     const memberTiers = getMemberTiers(member);
     const expanded = new Set();
     for (const t of memberTiers) for (const x of (TIER_INCLUDES[t] || [t])) expanded.add(x);
@@ -239,10 +288,7 @@ function getLimitData(guildId, userId) {
     const gc = getGuildConfig(guildId);
     const d = today();
     const l = gc.limits[userId];
-    if (!l || l.date !== d) {
-        gc.limits[userId] = { date: d, mutes: 0, kicks: 0 };
-        saveConfig();
-    }
+    if (!l || l.date !== d) { gc.limits[userId] = { date: d, mutes: 0, kicks: 0 }; saveConfig(); }
     return gc.limits[userId];
 }
 
@@ -283,6 +329,19 @@ const generateCode = () => "ECRP-" + crypto.randomBytes(4).toString("hex").toUpp
 const TEMPLATE_RE = /\{(\w+)\}/g;
 const templateReplace = (tpl, vars) => tpl.replace(TEMPLATE_RE, (_, k) => (vars[k] ?? ""));
 
+function formatDuration(ms) {
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return s + "s";
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + "m";
+    const h = Math.floor(m / 60);
+    const rm = m % 60;
+    if (h < 24) return h + "h " + rm + "m";
+    const d = Math.floor(h / 24);
+    const rh = h % 24;
+    return d + "d " + rh + "h";
+}
+
 // ==========================================
 // EMBEDS
 // ==========================================
@@ -296,11 +355,11 @@ const infoEmbed    = d => new EmbedBuilder().setDescription(d).setColor(WEBHOOK_
 // LOGGING
 // ==========================================
 
-async function sendToChannel(guild, channelId, embed) {
+async function sendToChannel(guild, channelId, payload) {
     if (!channelId) return;
     const ch = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
     if (!ch) return;
-    try { await ch.send({ embeds: [embed] }); } catch {}
+    try { await ch.send(payload); } catch {}
 }
 
 const _whClients = new Map();
@@ -321,11 +380,11 @@ function broadcast(guild, embed, targets) {
     const gc = getGuildConfig(guild.id);
     const promises = [];
     for (const t of targets) {
-        if (t === "log")     promises.push(sendToChannel(guild, gc.logChannelId, embed));
-        if (t === "verify")  promises.push(sendToChannel(guild, gc.verificationLogChannelId || gc.logChannelId, embed));
-        if (t === "staff")   promises.push(sendToChannel(guild, gc.staffLogChannelId, embed));
-        if (t === "hr")      promises.push(sendToChannel(guild, gc.hrLogChannelId, embed));
-        if (t === "ticket")  promises.push(sendToChannel(guild, gc.ticketLogChannelId, embed));
+        if (t === "log")     promises.push(sendToChannel(guild, gc.logChannelId, { embeds: [embed] }));
+        if (t === "verify")  promises.push(sendToChannel(guild, gc.verificationLogChannelId || gc.logChannelId, { embeds: [embed] }));
+        if (t === "staff")   promises.push(sendToChannel(guild, gc.staffLogChannelId, { embeds: [embed] }));
+        if (t === "hr")      promises.push(sendToChannel(guild, gc.hrLogChannelId, { embeds: [embed] }));
+        if (t === "ticket")  promises.push(sendToChannel(guild, gc.ticketLogChannelId, { embeds: [embed] }));
         if (t === "webhook") promises.push(sendWebhook(guild, embed));
     }
     return Promise.all(promises);
@@ -410,8 +469,7 @@ async function stripAllRoles(member, reason) {
     let removed = 0, failed = 0;
     for (const role of all.values()) {
         if (role.position >= myPos || role.managed) { failed++; continue; }
-        try { await member.roles.remove(role, reason); removed++; }
-        catch { failed++; }
+        try { await member.roles.remove(role, reason); removed++; } catch { failed++; }
     }
     return { removed, failed };
 }
@@ -489,13 +547,9 @@ async function checkRejoinWatch(member) {
 }
 
 // ==========================================
-// AFK SYSTEM
+// AFK
 // ==========================================
 
-/**
- * Clear AFK on a member if they were AFK and send a "Welcome back" notice.
- * Returns true if AFK was cleared.
- */
 async function clearAfkIfSet(guild, member, sourceChannel) {
     const gc = getGuildConfig(guild.id);
     const data = gc.afk[member.id];
@@ -514,9 +568,6 @@ async function clearAfkIfSet(guild, member, sourceChannel) {
     return true;
 }
 
-/**
- * Notify the sender if any mentioned member is AFK.
- */
 async function notifyAfkMentions(message) {
     if (!message.guild || !message.mentions.members?.size) return;
     const gc = getGuildConfig(message.guild.id);
@@ -531,24 +582,8 @@ async function notifyAfkMentions(message) {
     }
     if (!notices.length) return;
 
-    const embed = new EmbedBuilder()
-        .setDescription(notices.join("\n"))
-        .setColor(0xFEE75C)
-        .setTimestamp();
+    const embed = new EmbedBuilder().setDescription(notices.join("\n")).setColor(0xFEE75C).setTimestamp();
     message.reply({ embeds: [embed], allowedMentions: { repliedUser: false } }).catch(() => {});
-}
-
-function formatDuration(ms) {
-    const s = Math.floor(ms / 1000);
-    if (s < 60) return s + "s";
-    const m = Math.floor(s / 60);
-    if (m < 60) return m + "m";
-    const h = Math.floor(m / 60);
-    const rm = m % 60;
-    if (h < 24) return h + "h " + rm + "m";
-    const d = Math.floor(h / 24);
-    const rh = h % 24;
-    return d + "d " + rh + "h";
 }
 
 // ==========================================
@@ -636,7 +671,30 @@ function getSlashCommands() {
             .addStringOption(o => o.setName("reason").setDescription("Reason").setRequired(true))
             .addStringOption(o => o.setName("notes").setDescription("Additional notes (optional)").setRequired(false)),
 
-        // ===== NEW UTILITY COMMANDS =====
+        // NEW — Poll
+        new SlashCommandBuilder().setName("poll").setDescription("Create a poll (up to 10 options)")
+            .addStringOption(o => o.setName("question").setDescription("Poll question").setRequired(true).setMaxLength(250))
+            .addStringOption(o => o.setName("option1").setDescription("Option 1").setRequired(true).setMaxLength(80))
+            .addStringOption(o => o.setName("option2").setDescription("Option 2").setRequired(true).setMaxLength(80))
+            .addStringOption(o => o.setName("option3").setDescription("Option 3").setRequired(false).setMaxLength(80))
+            .addStringOption(o => o.setName("option4").setDescription("Option 4").setRequired(false).setMaxLength(80))
+            .addStringOption(o => o.setName("option5").setDescription("Option 5").setRequired(false).setMaxLength(80))
+            .addStringOption(o => o.setName("option6").setDescription("Option 6").setRequired(false).setMaxLength(80))
+            .addStringOption(o => o.setName("option7").setDescription("Option 7").setRequired(false).setMaxLength(80))
+            .addStringOption(o => o.setName("option8").setDescription("Option 8").setRequired(false).setMaxLength(80))
+            .addStringOption(o => o.setName("option9").setDescription("Option 9").setRequired(false).setMaxLength(80))
+            .addStringOption(o => o.setName("option10").setDescription("Option 10").setRequired(false).setMaxLength(80))
+            .addIntegerOption(o => o.setName("duration").setDescription("Minutes until auto-close (optional)").setRequired(false).setMinValue(1).setMaxValue(1440)),
+
+        // NEW — Giveaway
+        new SlashCommandBuilder().setName("giveaway").setDescription("Start a giveaway")
+            .addStringOption(o => o.setName("prize").setDescription("Prize").setRequired(true).setMaxLength(200))
+            .addIntegerOption(o => o.setName("duration").setDescription("Duration in minutes").setRequired(true).setMinValue(1).setMaxValue(10080))
+            .addIntegerOption(o => o.setName("winners").setDescription("Number of winners (default 1)").setRequired(false).setMinValue(1).setMaxValue(20))
+            .addRoleOption(o => o.setName("required_role").setDescription("Role required to join (optional)").setRequired(false))
+            .addChannelOption(o => o.setName("channel").setDescription("Channel to post in (default this channel)").setRequired(false)),
+
+        // ===== UTILITY =====
         new SlashCommandBuilder().setName("roles").setDescription("List all server roles (staff-only)"),
         new SlashCommandBuilder().setName("serverinfo").setDescription("Show information about this server"),
         new SlashCommandBuilder().setName("afk").setDescription("Set yourself as AFK")
@@ -664,10 +722,7 @@ function getSlashCommands() {
 }
 
 let _slashCache = null;
-function getSlashCommandsCached() {
-    if (!_slashCache) _slashCache = getSlashCommands();
-    return _slashCache;
-}
+function getSlashCommandsCached() { if (!_slashCache) _slashCache = getSlashCommands(); return _slashCache; }
 
 async function registerCommands(guild) {
     try { await guild.commands.set(getSlashCommandsCached()); }
@@ -691,7 +746,7 @@ client.once("ready", async () => {
     }
     await Promise.all(jobs);
 
-    client.user.setActivity("Eagle County Roleplay | V.1.8");
+    client.user.setActivity("Eagle County Roleplay | V.1.9");
 
     for (const guild of client.guilds.cache.values()) {
         const gc = getGuildConfig(guild.id);
@@ -699,6 +754,10 @@ client.once("ready", async () => {
         let changed = false;
         for (const [uid, e] of Object.entries(gc.antinuke.watchlist)) {
             if (now > e) { delete gc.antinuke.watchlist[uid]; changed = true; }
+        }
+        // Clean up expired giveaways
+        for (const [gid, g] of Object.entries(gc.giveaways || {})) {
+            if (g.ended) { delete gc.giveaways[gid]; changed = true; }
         }
         if (changed) saveConfig();
     }
@@ -732,7 +791,7 @@ async function tryDM(user, embed) {
 }
 
 // ==========================================
-// SETUP MENU
+// SETUP MENU — REDUCED CLUTTER
 // ==========================================
 
 function fmtCh(gc, k)   { return gc[k] ? "<#" + gc[k] + ">" : "❌ Not set"; }
@@ -742,45 +801,54 @@ function fmtRoleList(a) { return (!a || !a.length) ? "❌ None" : a.map(id => "<
 function buildSetupEmbed(guild) {
     const gc = getGuildConfig(guild.id);
     const an = gc.antinuke;
+    const am = gc.automod;
     const watchCount = Object.values(an.watchlist).filter(e => e > Date.now()).length;
     const afkCount = Object.keys(gc.afk).length;
+    const activeGiveaways = Object.values(gc.giveaways || {}).filter(g => !g.ended).length;
+
     return new EmbedBuilder()
-        .setTitle("⚙️ " + guild.name + " — Setup Menu (V.1.8)")
-        .setDescription("**Management-only** setup menu.")
+        .setTitle("⚙️ " + guild.name + " — Setup Menu (V.1.9)")
+        .setDescription(
+            "**Quick Overview**\n" +
+            "Use the buttons below to configure each section."
+        )
         .setColor(WEBHOOK_COLOR)
         .setThumbnail(guild.iconURL({ size: 256 }))
         .addFields(
-            { name: "General", value: "**Prefix:** `" + gc.prefix + "`\n**Webhook:** " + (gc.webhookUrl ? "✅" : "❌") + "\n**Anti-Nuke:** " + (an.enabled ? "✅" : "❌") + "\n**AFK Users:** " + afkCount, inline: false },
-            { name: "📁 Channels", value: [
-                "**Main Log:** " + fmtCh(gc, "logChannelId"),
-                "**Verification Log:** " + fmtCh(gc, "verificationLogChannelId"),
-                "**Transcripts:** " + fmtCh(gc, "transcriptChannelId"),
-                "**Welcome:** " + fmtCh(gc, "welcomeChannelId"),
-                "**Suggestions:** " + fmtCh(gc, "suggestionChannelId"),
-                "**Staff Feedback:** " + fmtCh(gc, "staffFeedbackChannelId"),
-                "**Staff Log:** " + fmtCh(gc, "staffLogChannelId"),
-                "**HR Log:** " + fmtCh(gc, "hrLogChannelId"),
-                "**Verify Panel:** " + fmtCh(gc, "verifyChannelId"),
-                "**Ticket Log:** " + fmtCh(gc, "ticketLogChannelId")
-            ].join("\n"), inline: false },
-            { name: "🎭 Role Tiers", value: [
-                "**Staff:** " + fmtRoleList(gc.staffRoles),
-                "**Admin:** " + fmtRoleList(gc.adminRoles),
-                "**⭐ High Rank:** " + fmtRoleList(gc.highRankRoles),
-                "**Management:** " + fmtRoleList(gc.managementRoles),
-                "**Exempt:** " + fmtRoleList(gc.exemptRoles),
-                "**Verify Role:** " + fmtRole(gc, "verifyRoleId"),
-                "**Accept Roles:** " + fmtRoleList(gc.acceptRoleIds)
-            ].join("\n"), inline: false },
-            { name: "🎫 Tickets", value: [
-                "**Support Category:** " + (gc.ticketSupportCategoryId ? "<#" + gc.ticketSupportCategoryId + ">" : "❌"),
-                "**Support Ping:** " + fmtRole(gc, "ticketSupportPingRoleId"),
-                "**High Rank Category:** " + (gc.ticketHighRankCategoryId ? "<#" + gc.ticketHighRankCategoryId + ">" : "❌"),
-                "**High Rank Ping:** " + fmtRole(gc, "ticketHighRankPingRoleId")
-            ].join("\n"), inline: false },
-            { name: "🛡️ Anti-Nuke", value: "**Threshold:** " + an.threshold + " / " + (an.windowMs / 1000) + "s\n**Whitelisted:** " + an.whitelist.length + "\n**On Watch:** " + watchCount, inline: false }
+            {
+                name: "📌 Status",
+                value:
+                    "**Prefix:** `" + gc.prefix + "` • **Webhook:** " + (gc.webhookUrl ? "✅" : "❌") + "\n" +
+                    "**Anti-Nuke:** " + (an.enabled ? "✅" : "❌") + " • **Auto-Mod:** " + (am.extremeSweatEnabled || am.ghostPingEnabled || am.linkFilterEnabled ? "✅" : "❌") + "\n" +
+                    "**HR Ping:** " + (gc.hrPingRoleId ? "<@&" + gc.hrPingRoleId + ">" : "❌") + " • **AFK:** " + afkCount + " • **Giveaways:** " + activeGiveaways,
+                inline: false
+            },
+            {
+                name: "🎭 Role Tiers",
+                value:
+                    "**Staff:** " + fmtRoleList(gc.staffRoles) + "\n" +
+                    "**Admin:** " + fmtRoleList(gc.adminRoles) + "\n" +
+                    "**⭐ High Rank:** " + fmtRoleList(gc.highRankRoles) + "\n" +
+                    "**Management:** " + fmtRoleList(gc.managementRoles),
+                inline: false
+            },
+            {
+                name: "📁 Key Channels",
+                value:
+                    "**Log:** " + fmtCh(gc, "logChannelId") + " • **Staff Log:** " + fmtCh(gc, "staffLogChannelId") + "\n" +
+                    "**HR Log:** " + fmtCh(gc, "hrLogChannelId") + " • **Welcome:** " + fmtCh(gc, "welcomeChannelId") + "\n" +
+                    "_Set the rest in the **Channels** menu._",
+                inline: false
+            },
+            {
+                name: "🎫 Tickets",
+                value:
+                    "**Support Cat:** " + (gc.ticketSupportCategoryId ? "<#" + gc.ticketSupportCategoryId + ">" : "❌") + " • **Ping:** " + fmtRole(gc, "ticketSupportPingRoleId") + "\n" +
+                    "**High Rank Cat:** " + (gc.ticketHighRankCategoryId ? "<#" + gc.ticketHighRankCategoryId + ">" : "❌") + " • **Ping:** " + fmtRole(gc, "ticketHighRankPingRoleId"),
+                inline: false
+            }
         )
-        .setFooter({ text: "V.1.8 • " + guild.name, iconURL: guild.iconURL() || undefined })
+        .setFooter({ text: "V.1.9 • " + guild.name, iconURL: guild.iconURL() || undefined })
         .setTimestamp();
 }
 
@@ -790,36 +858,37 @@ function buildSetupRows() {
             new ButtonBuilder().setCustomId("setup_channels").setLabel("Channels").setEmoji("📁").setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId("setup_roles").setLabel("Role Tiers").setEmoji("🎭").setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId("setup_tickets").setLabel("Tickets").setEmoji("🎫").setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId("setup_perms").setLabel("Permissions").setEmoji("🔐").setStyle(ButtonStyle.Primary)
+            new ButtonBuilder().setCustomId("setup_automod").setLabel("Auto-Mod").setEmoji("🤖").setStyle(ButtonStyle.Danger)
         ),
         new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("setup_dm_templates").setLabel("DM Templates").setEmoji("✉️").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("setup_perms").setLabel("Permissions").setEmoji("🔐").setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId("setup_antinuke").setLabel("Anti-Nuke").setEmoji("🛡️").setStyle(ButtonStyle.Danger),
-            new ButtonBuilder().setCustomId("setup_prefix").setLabel("Prefix").setEmoji("🔤").setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId("setup_webhook").setLabel("Webhook").setEmoji("🔗").setStyle(ButtonStyle.Secondary)
+            new ButtonBuilder().setCustomId("setup_dm_templates").setLabel("DM Templates").setEmoji("✉️").setStyle(ButtonStyle.Secondary)
         ),
         new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("setup_post_verify").setLabel("Post Verify Panel").setEmoji("🛡️").setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId("setup_post_tickets").setLabel("Post Ticket Panel").setEmoji("🎫").setStyle(ButtonStyle.Success)
-        )
+            new ButtonBuilder().setCustomId("setup_general").setLabel("General").setEmoji("🔤").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("setup_post_verify").setLabel("Post Verify").setEmoji("🛡️").setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId("setup_post_tickets").setLabel("Post Tickets").setEmoji("🎫").setStyle(ButtonStyle.Success)
+        ]
     ];
 }
 
+// Combined channels + general in one menu
 function buildChannelsMenuRows() {
     return [
         new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId("setup_ch_log").setLabel("Main Log").setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId("setup_ch_verifylog").setLabel("Verify Log").setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId("setup_ch_transcript").setLabel("Transcripts").setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId("setup_ch_welcome").setLabel("Welcome").setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId("setup_ch_suggestions").setLabel("Suggestions").setStyle(ButtonStyle.Secondary)
-        ),
-        new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("setup_ch_stafffb").setLabel("Staff FB").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_ch_stafflog").setLabel("Staff Log").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_ch_hrlog").setLabel("HR Log").setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId("setup_ch_verifypanel").setLabel("Verify Ch").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("setup_ch_verifylog").setLabel("Verify Log").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_ch_ticketlog").setLabel("Ticket Log").setStyle(ButtonStyle.Secondary)
+        ),
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("setup_ch_welcome").setLabel("Welcome").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("setup_ch_suggestions").setLabel("Suggestions").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("setup_ch_stafffb").setLabel("Staff FB").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("setup_ch_transcript").setLabel("Transcripts").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("setup_ch_verifypanel").setLabel("Verify Ch").setStyle(ButtonStyle.Secondary)
         ),
         new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId("setup_back").setLabel("Back").setEmoji("◀️").setStyle(ButtonStyle.Danger)
@@ -833,12 +902,13 @@ function buildRolesMenuRows() {
             new ButtonBuilder().setCustomId("setup_role_staff").setLabel("Staff").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_role_admin").setLabel("Admin").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_role_highrank").setLabel("⭐ High Rank").setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId("setup_role_management").setLabel("Management").setStyle(ButtonStyle.Primary)
+            new ButtonBuilder().setCustomId("setup_role_management").setLabel("Management").setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId("setup_role_exempt").setLabel("Exempt").setStyle(ButtonStyle.Secondary)
         ),
         new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("setup_role_exempt").setLabel("Exempt").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_role_verify").setLabel("Verify Role").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_role_accept").setLabel("Accept").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("setup_role_hrping").setLabel("HR Ping Role").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_clear_staff").setLabel("Clear Staff").setStyle(ButtonStyle.Danger),
             new ButtonBuilder().setCustomId("setup_clear_admin").setLabel("Clear Admin").setStyle(ButtonStyle.Danger)
         ),
@@ -855,27 +925,30 @@ function buildRolesMenuRows() {
 function buildTicketsMenuRows() {
     return [
         new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("setup_ticket_support_cat").setLabel("Support Category").setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId("setup_ticket_support_ping").setLabel("Support Ping").setStyle(ButtonStyle.Secondary)
+            new ButtonBuilder().setCustomId("setup_ticket_support_cat").setLabel("Support Cat").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("setup_ticket_support_ping").setLabel("Support Ping").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("setup_ticket_high_cat").setLabel("HighRank Cat").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("setup_ticket_high_ping").setLabel("HighRank Ping").setStyle(ButtonStyle.Secondary)
         ),
         new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("setup_ticket_high_cat").setLabel("High Rank Category").setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId("setup_ticket_high_ping").setLabel("High Rank Ping").setStyle(ButtonStyle.Secondary)
-        ),
-        new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("setup_ticket_ping_management").setLabel("Auto-Ping Management").setEmoji("🛠️").setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId("setup_ticket_ping_management").setLabel("Auto-Ping Mgmt").setEmoji("🛠️").setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId("setup_back").setLabel("Back").setEmoji("◀️").setStyle(ButtonStyle.Danger)
         )
     ];
 }
 
-function buildTemplatesMenuRows() {
+// Auto-Mod menu
+function buildAutomodMenuRows() {
     return [
         new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("setup_tpl_accept").setLabel("Accept DM").setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId("setup_tpl_promote").setLabel("Promote DM").setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId("setup_tpl_demote").setLabel("Demote DM").setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId("setup_tpl_infract").setLabel("Infract DM").setStyle(ButtonStyle.Secondary)
+            new ButtonBuilder().setCustomId("setup_am_swear_toggle").setLabel("Swear Filter").setEmoji("🤬").setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId("setup_am_swear_edit").setLabel("Edit Swear List").setEmoji("✏️").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("setup_am_ghost_toggle").setLabel("Ghost Ping").setEmoji("👻").setStyle(ButtonStyle.Primary)
+        ),
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("setup_am_link_toggle").setLabel("Link Filter").setEmoji("🔗").setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId("setup_am_link_wl").setLabel("Link Whitelist").setEmoji("✅").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("setup_am_link_viewwl").setLabel("View Whitelist").setEmoji("📋").setStyle(ButtonStyle.Secondary)
         ),
         new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId("setup_back").setLabel("Back").setEmoji("◀️").setStyle(ButtonStyle.Danger)
@@ -883,6 +956,19 @@ function buildTemplatesMenuRows() {
     ];
 }
 
+function buildGeneralMenuRows() {
+    return [
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("setup_prefix").setLabel("Prefix").setEmoji("🔤").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("setup_webhook").setLabel("Webhook").setEmoji("🔗").setStyle(ButtonStyle.Secondary)
+        ),
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("setup_back").setLabel("Back").setEmoji("◀️").setStyle(ButtonStyle.Danger)
+        )
+    ];
+}
+
+// Anti-nuke menu
 function buildAntinukeMenuRows() {
     return [
         new ActionRowBuilder().addComponents(
@@ -902,11 +988,28 @@ function buildAntinukeMenuRows() {
     ];
 }
 
+// Templates menu
+function buildTemplatesMenuRows() {
+    return [
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("setup_tpl_accept").setLabel("Accept DM").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("setup_tpl_promote").setLabel("Promote DM").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("setup_tpl_demote").setLabel("Demote DM").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("setup_tpl_infract").setLabel("Infract DM").setStyle(ButtonStyle.Secondary)
+        ),
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("setup_back").setLabel("Back").setEmoji("◀️").setStyle(ButtonStyle.Danger)
+        )
+    ];
+}
+
+// Permissions menus
 const PERM_GROUPS = {
     setup: { name: "⚙️ Setup & Config", commands: ["setup", "setprefix", "setupverify", "setuptickets", "set-webhook", "remove-webhook", "antinuke"] },
     hr:    { name: "👑 HR / Applications", commands: ["acceptsetup", "accept", "promote", "demote", "infract"] },
     mod:   { name: "🔨 Moderation & Utility", commands: ["mute", "unmute", "warn", "kick", "ban", "unban", "roles"] },
     logs:  { name: "📝 Logging", commands: ["loguser"] },
+    events:{ name: "🎉 Events", commands: ["poll", "giveaway"] },
     public:{ name: "🌐 Public & Fun", commands: ["suggest", "staff-feedback", "help", "serverinfo", "afk", "av"] }
 };
 
@@ -919,10 +1022,11 @@ function buildPermsMenuRows() {
         ),
         new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId("setup_perms_group_logs").setLabel("Logging").setEmoji("📝").setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId("setup_perms_group_public").setLabel("Public").setEmoji("🌐").setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId("setup_perms_reset").setLabel("Reset All").setEmoji("♻️").setStyle(ButtonStyle.Danger)
+            new ButtonBuilder().setCustomId("setup_perms_group_events").setLabel("Events").setEmoji("🎉").setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId("setup_perms_group_public").setLabel("Public").setEmoji("🌐").setStyle(ButtonStyle.Primary)
         ),
         new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("setup_perms_reset").setLabel("Reset All").setEmoji("♻️").setStyle(ButtonStyle.Danger),
             new ButtonBuilder().setCustomId("setup_back").setLabel("Back").setEmoji("◀️").setStyle(ButtonStyle.Danger)
         )
     ];
@@ -946,10 +1050,7 @@ function buildPermsGroupRows(groupKey) {
     return rows;
 }
 
-const TIER_LABEL = {
-    staff: "🎭 Staff", admin: "🔨 Admin", highrank: "⭐ High Rank",
-    management: "🛡️ Management", everyone: "🌐 Everyone"
-};
+const TIER_LABEL = { staff: "🎭 Staff", admin: "🔨 Admin", highrank: "⭐ High Rank", management: "🛡️ Management", everyone: "🌐 Everyone" };
 const fmtTiers = tiers => tiers.map(t => TIER_LABEL[t] || t).join(", ");
 
 function permToggleRows(cmd, currentTiers) {
@@ -998,7 +1099,7 @@ async function updateSetupMessage(interaction, view) {
     }
     else if (view === "roles") {
         embed = new EmbedBuilder().setTitle("🎭 Role Tiers")
-            .setDescription("Hierarchy: 🛡️ Management → ⭐ High Rank → 🔨 Admin → 🎭 Staff\n\nSet the roles for each tier.")
+            .setDescription("Hierarchy: 🛡️ Management → ⭐ High Rank → 🔨 Admin → 🎭 Staff\n\nSet the roles for each tier.\n**HR Ping Role** gets pinged when the extreme swear filter triggers.")
             .setColor(WEBHOOK_COLOR).setThumbnail(guild.iconURL()).setTimestamp();
         rows = buildRolesMenuRows();
     }
@@ -1029,121 +1130,104 @@ async function updateSetupMessage(interaction, view) {
             .setColor(0xED4245).setThumbnail(guild.iconURL()).setTimestamp();
         rows = buildAntinukeMenuRows();
     }
+    else if (view === "automod") {
+        const am = gc.automod;
+        embed = new EmbedBuilder().setTitle("🤖 Auto-Mod Settings")
+            .setDescription(
+                "**Extreme Swear Filter:** " + (am.extremeSweatEnabled ? "✅" : "❌") + " — " + am.extremeSweatList.length + " words\n" +
+                "**Ghost Ping Warn:** " + (am.ghostPingEnabled ? "✅" : "❌") + "\n" +
+                "**Link Filter:** " + (am.linkFilterEnabled ? "✅" : "❌") + " — " + am.linkWhitelistChannelIds.length + " whitelisted channels\n\n" +
+                "**On extreme swear:** instant 60min mute + HR ping\n" +
+                "**On ghost ping:** auto-warn\n" +
+                "**On link outside whitelist:** blocked + logged"
+            )
+            .setColor(0xED4245).setThumbnail(guild.iconURL()).setTimestamp();
+        rows = buildAutomodMenuRows();
+    }
+    else if (view === "general") {
+        embed = new EmbedBuilder().setTitle("🔤 General Settings")
+            .setDescription("**Prefix:** `" + gc.prefix + "`\n**Webhook:** " + (gc.webhookUrl ? "✅ Configured" : "❌ Not set"))
+            .setColor(WEBHOOK_COLOR).setTimestamp();
+        rows = buildGeneralMenuRows();
+    }
     await interaction.update({ embeds: [embed], components: rows });
 }
 
 // ==========================================
-// NEW COMMAND IMPLEMENTATIONS
+// POLL / GIVEAWAY BUILDERS
 // ==========================================
 
-async function cmdRoles(interactionOrMessage, isSlash) {
-    const guild = interactionOrMessage.guild;
-    const roles = [...guild.roles.cache.values()].filter(r => r.id !== guild.id).sort((a, b) => b.position - a.position);
+function buildPollEmbed(question, options, votes, closed, durationMin) {
+    const total = Object.values(votes).reduce((a, b) => a + b.length, 0);
+    const lines = options.map((opt, i) => {
+        const count = votes[i]?.length || 0;
+        const pct = total ? Math.round((count / total) * 100) : 0;
+        const bar = "█".repeat(Math.round(pct / 10)) + "░".repeat(10 - Math.round(pct / 10));
+        return "**" + (i + 1) + ".** " + opt + "\n`" + bar + "` " + count + " vote" + (count === 1 ? "" : "s") + " (" + pct + "%)";
+    }).join("\n\n");
 
-    const lines = roles.map(r => {
-        const count = guild.members.cache.filter(m => m.roles.cache.has(r.id)).size;
-        return r.toString() + " — `" + r.members.size + " members` — position " + r.position;
-    });
+    const embed = new EmbedBuilder()
+        .setTitle("📊 " + question)
+        .setDescription(lines || "No options")
+        .setColor(closed ? 0xED4245 : 0x5865F2)
+        .setFooter({ text: total + " total vote" + (total === 1 ? "" : "s") + (closed ? " • CLOSED" : (durationMin ? " • closes in " + durationMin + "m" : "")) })
+        .setTimestamp();
+    return embed;
+}
 
-    // Split into chunks if long
-    const chunks = [];
-    let current = "";
-    for (const l of lines) {
-        if ((current + "\n" + l).length > 3800) { chunks.push(current); current = l; }
-        else current += (current ? "\n" : "") + l;
+function buildPollRows(options, pollId, closed) {
+    const rows = [];
+    let row = new ActionRowBuilder(), n = 0;
+    for (let i = 0; i < options.length; i++) {
+        row.addComponents(
+            new ButtonBuilder()
+                .setCustomId("poll_vote_" + pollId + "_" + i)
+                .setLabel(String(i + 1))
+                .setStyle(ButtonStyle.Primary)
+                .setDisabled(closed)
+        );
+        if (++n === 5) { rows.push(row); row = new ActionRowBuilder(); n = 0; }
     }
-    if (current) chunks.push(current);
-
-    const embed = new EmbedBuilder()
-        .setTitle("📋 Server Roles — " + roles.length + " total")
-        .setColor(WEBHOOK_COLOR)
-        .setFooter({ text: guild.name, iconURL: guild.iconURL() || undefined })
-        .setTimestamp();
-
-    const totalMembers = guild.memberCount;
-    embed.setDescription("**Total members:** " + totalMembers + "\n\n" + (chunks[0] || "None"));
-
-    if (isSlash) await interactionOrMessage.reply({ embeds: [embed] });
-    else await interactionOrMessage.reply({ embeds: [embed] });
+    if (n > 0) rows.push(row);
+    return rows;
 }
 
-async function cmdServerInfo(interactionOrMessage, isSlash) {
-    const guild = interactionOrMessage.guild;
-    await guild.members.fetch().catch(() => {});
-    const owner = await guild.fetchOwner().catch(() => null);
-
-    const textChannels = guild.channels.cache.filter(c => c.type === ChannelType.GuildText).size;
-    const voiceChannels = guild.channels.cache.filter(c => c.type === ChannelType.GuildVoice).size;
-    const categories = guild.channels.cache.filter(c => c.type === ChannelType.GuildCategory).size;
-
-    const online = guild.members.cache.filter(m => m.presence?.status && m.presence.status !== "offline").size;
-    const humans = guild.members.cache.filter(m => !m.user.bot).size;
-    const bots = guild.members.cache.filter(m => m.user.bot).size;
+function buildGiveawayEmbed(giveaway, closed, winners) {
+    const entries = giveaway.entries.length;
+    const endsAt = giveaway.endsAt;
 
     const embed = new EmbedBuilder()
-        .setTitle("ℹ️ " + guild.name)
-        .setThumbnail(guild.iconURL({ size: 256 }) || null)
-        .setColor(WEBHOOK_COLOR)
-        .addFields(
-            { name: "Owner", value: owner ? owner.toString() : "Unknown", inline: true },
-            { name: "Server ID", value: guild.id, inline: true },
-            { name: "Created", value: "<t:" + ((guild.createdTimestamp / 1000) | 0) + ":F>\n(<t:" + ((guild.createdTimestamp / 1000) | 0) + ":R>)", inline: true },
-            { name: "Members", value: String(guild.memberCount), inline: true },
-            { name: "Humans / Bots", value: humans + " / " + bots, inline: true },
-            { name: "Online", value: String(online), inline: true },
-            { name: "Roles", value: String(guild.roles.cache.size - 1), inline: true },
-            { name: "Channels", value: textChannels + " text • " + voiceChannels + " voice • " + categories + " categories", inline: true },
-            { name: "Boost Tier", value: "Tier " + guild.premiumTier, inline: true },
-            { name: "Boosts", value: String(guild.premiumSubscriptionCount || 0), inline: true },
-            { name: "Emojis", value: String(guild.emojis.cache.size), inline: true },
-            { name: "Verification Level", value: String(guild.verificationLevel), inline: true }
+        .setTitle(closed ? "🎁 GIVEAWAY ENDED" : "🎁 GIVEAWAY")
+        .setDescription(
+            "**Prize:** " + giveaway.prize + "\n\n" +
+            (closed
+                ? (winners.length ? "**Winner" + (winners.length === 1 ? "" : "s") + ":** " + winners.map(id => "<@" + id + ">").join(", ") : "No valid entries.")
+                : "Click **Join** to enter!\n**Ends:** <t:" + ((endsAt / 1000) | 0) + ":R>")
         )
-        .setFooter({ text: guild.name, iconURL: guild.iconURL() || undefined })
-        .setTimestamp();
-
-    if (guild.bannerURL()) embed.setImage(guild.bannerURL({ size: 1024 }));
-
-    if (isSlash) await interactionOrMessage.reply({ embeds: [embed] });
-    else await interactionOrMessage.reply({ embeds: [embed] });
-}
-
-async function cmdAfk(interactionOrMessage, isSlash, reason) {
-    const guild = interactionOrMessage.guild;
-    const user = isSlash ? interactionOrMessage.user : interactionOrMessage.author;
-    const member = isSlash ? interactionOrMessage.member : interactionOrMessage.member;
-    const gc = getGuildConfig(guild.id);
-
-    const trimmed = (reason || "AFK").slice(0, 200);
-    const already = gc.afk[user.id];
-
-    gc.afk[user.id] = { reason: trimmed, since: already ? already.since : Date.now() };
-    saveConfig();
-
-    const embed = new EmbedBuilder()
-        .setDescription("💤 **" + member.displayName + "** is now AFK: **" + trimmed + "**\n\n_I'll notify anyone who pings you. Send any message to clear._")
-        .setColor(0xFEE75C)
-        .setTimestamp();
-
-    if (isSlash) await interactionOrMessage.reply({ embeds: [embed] });
-    else await interactionOrMessage.reply({ embeds: [embed] });
-}
-
-async function cmdAv(interactionOrMessage, isSlash, targetUser) {
-    const user = targetUser || (isSlash ? interactionOrMessage.user : interactionOrMessage.author);
-
-    const embed = new EmbedBuilder()
-        .setTitle(user.username + "'s Avatar")
-        .setColor(WEBHOOK_COLOR)
-        .setImage(user.displayAvatarURL({ size: 1024, extension: "png" }))
+        .setColor(closed ? 0x57F287 : 0xFEE75C)
         .addFields(
-            { name: "Username", value: user.tag, inline: true },
-            { name: "ID", value: user.id, inline: true }
+            { name: "Hosted By", value: "<@" + giveaway.hostId + ">", inline: true },
+            { name: "Entries", value: String(entries), inline: true },
+            { name: "Winners", value: String(giveaway.winners), inline: true }
         )
-        .setFooter({ text: "Requested by " + (isSlash ? interactionOrMessage.user.tag : interactionOrMessage.author.tag) })
-        .setTimestamp();
+        .setFooter({ text: closed ? "Ended" : "Ends" })
+        .setTimestamp(closed ? Date.now() : endsAt);
 
-    if (isSlash) await interactionOrMessage.reply({ embeds: [embed] });
-    else await interactionOrMessage.reply({ embeds: [embed] });
+    if (giveaway.requiredRoleId) {
+        embed.addFields({ name: "Required Role", value: "<@&" + giveaway.requiredRoleId + ">", inline: false });
+    }
+    return embed;
+}
+
+function buildGiveawayRows(giveawayId, closed) {
+    return [new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId("giveaway_join_" + giveawayId)
+            .setLabel(closed ? "Ended" : "Join Giveaway")
+            .setEmoji("🎉")
+            .setStyle(closed ? ButtonStyle.Secondary : ButtonStyle.Success)
+            .setDisabled(closed)
+    )];
 }
 
 // ==========================================
@@ -1386,16 +1470,13 @@ client.on("interactionCreate", async interaction => {
 
             await interaction.deferReply();
             const robloxData = await lookupRobloxUser(username);
-
             const meta = {
                 warn: { label: "Warn", emoji: "⚠️", color: 0xFEE75C },
                 kick: { label: "Kick", emoji: "👢", color: 0xE67E22 },
                 ban:  { label: "Ban",  emoji: "🔨", color: 0xED4245 }
             }[punishment];
 
-            const embed = new EmbedBuilder()
-                .setTitle(meta.emoji + " " + meta.label + " Logged")
-                .setColor(meta.color)
+            const embed = new EmbedBuilder().setTitle(meta.emoji + " " + meta.label + " Logged").setColor(meta.color)
                 .addFields(
                     { name: "Roblox Username", value: robloxData ? robloxData.username : username, inline: true },
                     { name: "Roblox ID", value: robloxData ? String(robloxData.id) : "Not found", inline: true },
@@ -1412,6 +1493,68 @@ client.on("interactionCreate", async interaction => {
 
             await broadcast(guild, embed, ["staff", "log", "webhook"]);
             return interaction.editReply({ embeds: [successEmbed("**" + meta.label + "** logged for **" + (robloxData?.username || username) + "**.")] });
+        }
+
+        // ---------- /poll ----------
+        if (command === "poll") {
+            const question = interaction.options.getString("question");
+            const options = [];
+            for (let i = 1; i <= 10; i++) {
+                const v = interaction.options.getString("option" + i);
+                if (v) options.push(v);
+            }
+            const duration = interaction.options.getInteger("duration") || null;
+            const pollId = crypto.randomBytes(6).toString("hex");
+            const votes = {};
+            options.forEach((_, i) => votes[i] = []);
+
+            const embed = buildPollEmbed(question, options, votes, false, duration);
+            const rows = buildPollRows(options, pollId, false);
+
+            await interaction.reply({ embeds: [embed], components: rows });
+            const msg = await interaction.fetchReply();
+
+            // Save for vote tracking (in-memory map + config)
+            polls.set(pollId, { question, options, votes, messageId: msg.id, channelId: interaction.channel.id, guildId: guild.id, ended: false });
+
+            if (duration) {
+                setTimeout(() => endPoll(pollId), duration * 60 * 1000);
+            }
+            return;
+        }
+
+        // ---------- /giveaway ----------
+        if (command === "giveaway") {
+            const prize = interaction.options.getString("prize");
+            const duration = interaction.options.getInteger("duration");
+            const winners = interaction.options.getInteger("winners") || 1;
+            const requiredRole = interaction.options.getRole("required_role");
+            const targetChannel = interaction.options.getChannel("channel") || interaction.channel;
+
+            if (!targetChannel.isTextBased() || !targetChannel.isSendable?.()) {
+                return interaction.reply({ embeds: [errorEmbed("Invalid channel.")], ephemeral: true });
+            }
+
+            const endsAt = Date.now() + duration * 60 * 1000;
+            const giveawayId = crypto.randomBytes(6).toString("hex");
+            const giveaway = {
+                prize, winners, requiredRoleId: requiredRole?.id || null,
+                hostId: interaction.user.id, endsAt,
+                entries: [], ended: false, channelId: targetChannel.id, messageId: null
+            };
+
+            const embed = buildGiveawayEmbed(giveaway, false, []);
+            const rows = buildGiveawayRows(giveawayId, false);
+            const msg = await targetChannel.send({ embeds: [embed], components: rows });
+
+            giveaway.messageId = msg.id;
+            gc.giveaways[giveawayId] = giveaway;
+            saveConfig();
+
+            await interaction.reply({ embeds: [successEmbed("Giveaway started in " + targetChannel + "!")], ephemeral: true });
+
+            setTimeout(() => endGiveaway(giveawayId), duration * 60 * 1000);
+            return;
         }
 
         // ---------- NEW UTILITY ----------
@@ -1449,17 +1592,18 @@ client.on("interactionCreate", async interaction => {
 
         if (command === "help") {
             const prefix = getPrefix(guild.id);
-            const embed = new EmbedBuilder().setTitle(guild.name + " — Bot Commands V.1.8")
+            const embed = new EmbedBuilder().setTitle(guild.name + " — Bot Commands V.1.9")
                 .setColor(WEBHOOK_COLOR).setThumbnail(guild.iconURL())
                 .addFields(
                     { name: "Setup (Management)", value: "`/setup` `/setupverify` `/setuptickets`", inline: false },
-                    { name: "Anti-Nuke (Management)", value: "`/antinuke status|enable|disable`\n`/antinuke threshold <n>`\n`/antinuke whitelist-add|remove|list`\n`/antinuke watchlist`", inline: false },
+                    { name: "Anti-Nuke", value: "`/antinuke status|enable|disable`\n`/antinuke threshold <n>` `/antinuke whitelist-*` `/antinuke watchlist`", inline: false },
                     { name: "HR", value: "`/accept` `/promote` `/demote` `/infract`", inline: false },
                     { name: "Moderation", value: "`/mute` `/unmute` `/warn` `/kick` `/ban` `/unban`", inline: false },
-                    { name: "Logging", value: "`/loguser <user> <Warn|Kick|Ban> <reason>`\n`" + prefix + "loguser`", inline: false },
-                    { name: "Utility", value: "`/roles` (staff) `/serverinfo` `/av [user]` `/afk [reason]`", inline: false },
+                    { name: "Logging", value: "`/loguser <user> <Warn|Kick|Ban> <reason>`", inline: false },
+                    { name: "Events", value: "`/poll` — multi-option poll\n`/giveaway` — role-locked giveaways", inline: false },
+                    { name: "Utility", value: "`/roles` `/serverinfo` `/av` `/afk`", inline: false },
                     { name: "Public", value: "`/suggest` `/staff-feedback`", inline: false },
-                    { name: "Prefix", value: "`" + prefix + "roles` `/serverinfo` `/av` `/afk` — plus `" + prefix + "loguser`, `" + prefix + "help`", inline: false }
+                    { name: "Prefix", value: "`" + prefix + "help` `" + prefix + "roles` `" + prefix + "serverinfo` `" + prefix + "afk` `" + prefix + "av` `" + prefix + "loguser`", inline: false }
                 );
             return interaction.reply({ embeds: [embed] });
         }
@@ -1474,6 +1618,67 @@ client.on("interactionCreate", async interaction => {
 });
 
 // ==========================================
+// POLL STATE (in-memory, syncs votes into config)
+// ==========================================
+
+const polls = new Map(); // pollId -> { question, options, votes, messageId, channelId, guildId, ended }
+
+async function endPoll(pollId) {
+    const p = polls.get(pollId);
+    if (!p || p.ended) return;
+    p.ended = true;
+    try {
+        const channel = await client.channels.fetch(p.channelId).catch(() => null);
+        if (!channel) return;
+        const msg = await channel.messages.fetch(p.messageId).catch(() => null);
+        if (!msg) return;
+        const embed = buildPollEmbed(p.question, p.options, p.votes, true, null);
+        const rows = buildPollRows(p.options, pollId, true);
+        await msg.edit({ embeds: [embed], components: rows });
+    } catch (e) { console.error("endPoll:", e); }
+    polls.delete(pollId);
+}
+
+async function endGiveaway(giveawayId) {
+    const gc_entries = [...guildConfigCache.values()]; // not needed, just for clarity
+    // find which guild owns this giveaway
+    for (const gc of guildConfigCache.values()) {
+        if (gc.giveaways && gc.giveaways[giveawayId]) {
+            const g = gc.giveaways[giveawayId];
+            if (g.ended) return;
+            g.ended = true;
+
+            const winners = [];
+            const pool = [...g.entries];
+            while (winners.length < g.winners && pool.length) {
+                const idx = Math.floor(Math.random() * pool.length);
+                winners.push(pool.splice(idx, 1)[0]);
+            }
+            g.winnerIds = winners;
+            saveConfig();
+
+            try {
+                const channel = await client.channels.fetch(g.channelId).catch(() => null);
+                if (channel) {
+                    const msg = await channel.messages.fetch(g.messageId).catch(() => null);
+                    if (msg) {
+                        const embed = buildGiveawayEmbed(g, true, winners);
+                        const rows = buildGiveawayRows(giveawayId, true);
+                        await msg.edit({ embeds: [embed], components: rows });
+                    }
+                    if (winners.length) {
+                        channel.send({ content: "🎉 Congratulations " + winners.map(id => "<@" + id + ">").join(", ") + "! You won **" + g.prize + "**!" }).catch(() => {});
+                    } else {
+                        channel.send({ content: "No valid entries for **" + g.prize + "** — no winner selected." }).catch(() => {});
+                    }
+                }
+            } catch (e) { console.error("endGiveaway:", e); }
+            return;
+        }
+    }
+}
+
+// ==========================================
 // BUTTON HANDLER
 // ==========================================
 
@@ -1482,14 +1687,118 @@ async function handleButton(interaction) {
     const guild = interaction.guild;
     const gc = getGuildConfig(guild.id);
 
-    if (id === "setup_back")          return updateSetupMessage(interaction, "main");
-    if (id === "setup_channels")      return updateSetupMessage(interaction, "channels");
-    if (id === "setup_roles")         return updateSetupMessage(interaction, "roles");
-    if (id === "setup_tickets")       return updateSetupMessage(interaction, "tickets");
-    if (id === "setup_dm_templates")  return updateSetupMessage(interaction, "templates");
-    if (id === "setup_antinuke")      return updateSetupMessage(interaction, "antinuke");
-    if (id === "setup_perms")         return showPermsOverview(interaction);
+    // ---- POLL VOTE ----
+    if (id.startsWith("poll_vote_")) {
+        const parts = id.split("_"); // poll_vote_<pollId>_<idx>
+        const pollId = parts[2];
+        const optIdx = parseInt(parts[3], 10);
+        const p = polls.get(pollId);
+        if (!p || p.ended) return interaction.reply({ embeds: [errorEmbed("This poll has ended.")], ephemeral: true });
 
+        // Remove previous vote
+        for (const key in p.votes) p.votes[key] = p.votes[key].filter(uid => uid !== interaction.user.id);
+        if (!p.votes[optIdx]) p.votes[optIdx] = [];
+        p.votes[optIdx].push(interaction.user.id);
+
+        const embed = buildPollEmbed(p.question, p.options, p.votes, false, null);
+        const rows = buildPollRows(p.options, pollId, false);
+        await interaction.update({ embeds: [embed], components: rows });
+        return;
+    }
+
+    // ---- GIVEAWAY JOIN ----
+    if (id.startsWith("giveaway_join_")) {
+        const giveawayId = id.slice("giveaway_join_".length);
+        const g = gc.giveaways[giveawayId];
+        if (!g || g.ended) return interaction.reply({ embeds: [errorEmbed("This giveaway has ended.")], ephemeral: true });
+
+        if (g.requiredRoleId && !interaction.member.roles.cache.has(g.requiredRoleId)) {
+            return interaction.reply({ embeds: [errorEmbed("You need the <@&" + g.requiredRoleId + "> role to enter.")], ephemeral: true });
+        }
+
+        if (g.entries.includes(interaction.user.id)) {
+            // Leave
+            g.entries = g.entries.filter(uid => uid !== interaction.user.id);
+            saveConfig();
+            await interaction.reply({ embeds: [infoEmbed("You left the giveaway.")], ephemeral: true });
+        } else {
+            g.entries.push(interaction.user.id);
+            saveConfig();
+            await interaction.reply({ embeds: [successEmbed("You've entered the giveaway! 🎉")], ephemeral: true });
+        }
+        // Update message
+        try {
+            const channel = await client.channels.fetch(g.channelId).catch(() => null);
+            if (channel) {
+                const msg = await channel.messages.fetch(g.messageId).catch(() => null);
+                if (msg) {
+                    const embed = buildGiveawayEmbed(g, false, []);
+                    await msg.edit({ embeds: [embed], components: buildGiveawayRows(giveawayId, false) });
+                }
+            }
+        } catch {}
+        return;
+    }
+
+    // ---- SETUP NAV ----
+    if (id === "setup_back")         return updateSetupMessage(interaction, "main");
+    if (id === "setup_channels")     return updateSetupMessage(interaction, "channels");
+    if (id === "setup_roles")        return updateSetupMessage(interaction, "roles");
+    if (id === "setup_tickets")      return updateSetupMessage(interaction, "tickets");
+    if (id === "setup_dm_templates") return updateSetupMessage(interaction, "templates");
+    if (id === "setup_antinuke")     return updateSetupMessage(interaction, "antinuke");
+    if (id === "setup_automod")      return updateSetupMessage(interaction, "automod");
+    if (id === "setup_general")      return updateSetupMessage(interaction, "general");
+    if (id === "setup_perms")        return showPermsOverview(interaction);
+
+    // ---- AUTOMOD ----
+    if (id === "setup_am_swear_toggle") {
+        gc.automod.extremeSweatEnabled = !gc.automod.extremeSweatEnabled;
+        saveConfig();
+        return updateSetupMessage(interaction, "automod");
+    }
+    if (id === "setup_am_swear_edit") {
+        const modal = new ModalBuilder().setCustomId("modal_am_swear_list").setTitle("Extreme Swear List");
+        const input = new TextInputBuilder()
+            .setCustomId("list")
+            .setLabel("Comma-separated list")
+            .setStyle(TextInputStyle.Paragraph)
+            .setRequired(true)
+            .setMaxLength(2000);
+        input.setValue(gc.automod.extremeSweatList.join(", ").slice(0, 2000));
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        return interaction.showModal(modal);
+    }
+    if (id === "setup_am_ghost_toggle") {
+        gc.automod.ghostPingEnabled = !gc.automod.ghostPingEnabled;
+        saveConfig();
+        return updateSetupMessage(interaction, "automod");
+    }
+    if (id === "setup_am_link_toggle") {
+        gc.automod.linkFilterEnabled = !gc.automod.linkFilterEnabled;
+        saveConfig();
+        return updateSetupMessage(interaction, "automod");
+    }
+    if (id === "setup_am_link_wl") {
+        return interaction.update({
+            embeds: [infoEmbed("Choose channels to **whitelist** (links allowed):")],
+            components: [new ActionRowBuilder().addComponents(
+                new ChannelSelectMenuBuilder()
+                    .setCustomId("select_am_link_wl")
+                    .setPlaceholder("Pick channels")
+                    .setMaxValues(10)
+                    .setChannelTypes([ChannelType.GuildText, ChannelType.GuildAnnouncement])
+            )]
+        });
+    }
+    if (id === "setup_am_link_viewwl") {
+        const list = gc.automod.linkWhitelistChannelIds.length
+            ? gc.automod.linkWhitelistChannelIds.map(c => "<#" + c + ">").join(", ")
+            : "None";
+        return interaction.reply({ embeds: [infoEmbed("**Link Whitelist:** " + list)], ephemeral: true });
+    }
+
+    // ---- PERMISSIONS ----
     if (id.startsWith("setup_perms_group_")) {
         const groupKey = id.slice(18);
         const group = PERM_GROUPS[groupKey];
@@ -1500,7 +1809,6 @@ async function handleButton(interaction) {
             .setColor(WEBHOOK_COLOR).setTimestamp();
         return interaction.update({ embeds: [embed], components: buildPermsGroupRows(groupKey) });
     }
-
     if (id.startsWith("setup_perm_edit_")) {
         const cmd = id.slice(17);
         const tiers = getRequiredTiers(guild.id, cmd);
@@ -1509,7 +1817,6 @@ async function handleButton(interaction) {
             .setColor(WEBHOOK_COLOR).setTimestamp();
         return interaction.update({ embeds: [embed], components: permToggleRows(cmd, tiers) });
     }
-
     if (id.startsWith("setup_perm_toggle_")) {
         const rest = id.slice(19);
         const idx = rest.lastIndexOf("_");
@@ -1525,7 +1832,6 @@ async function handleButton(interaction) {
             .setColor(WEBHOOK_COLOR).setTimestamp();
         return interaction.update({ embeds: [embed], components: permToggleRows(cmd, newTiers) });
     }
-
     if (id.startsWith("setup_perm_reset_")) {
         const cmd = id.slice(18);
         delete gc.commandPerms[cmd];
@@ -1536,9 +1842,9 @@ async function handleButton(interaction) {
             .setColor(WEBHOOK_COLOR).setTimestamp();
         return interaction.update({ embeds: [embed], components: permToggleRows(cmd, tiers) });
     }
-
     if (id === "setup_perms_reset") { gc.commandPerms = {}; saveConfig(); return showPermsOverview(interaction); }
 
+    // ---- GENERAL ----
     if (id === "setup_prefix") {
         const modal = new ModalBuilder().setCustomId("modal_prefix").setTitle("Set Prefix");
         modal.addComponents(new ActionRowBuilder().addComponents(
@@ -1554,17 +1860,18 @@ async function handleButton(interaction) {
         return interaction.showModal(modal);
     }
 
+    // ---- CHANNELS ----
     const channelMap = {
         setup_ch_log: { key: "logChannelId", name: "Main Log" },
+        setup_ch_stafflog: { key: "staffLogChannelId", name: "Staff Log" },
+        setup_ch_hrlog: { key: "hrLogChannelId", name: "HR Log" },
         setup_ch_verifylog: { key: "verificationLogChannelId", name: "Verification Log" },
-        setup_ch_transcript: { key: "transcriptChannelId", name: "Ticket Transcripts" },
+        setup_ch_ticketlog: { key: "ticketLogChannelId", name: "Ticket Log" },
         setup_ch_welcome: { key: "welcomeChannelId", name: "Welcome" },
         setup_ch_suggestions: { key: "suggestionChannelId", name: "Suggestions" },
         setup_ch_stafffb: { key: "staffFeedbackChannelId", name: "Staff Feedback" },
-        setup_ch_stafflog: { key: "staffLogChannelId", name: "Staff Log" },
-        setup_ch_hrlog: { key: "hrLogChannelId", name: "HR Log" },
-        setup_ch_verifypanel: { key: "verifyChannelId", name: "Verify Panel Channel" },
-        setup_ch_ticketlog: { key: "ticketLogChannelId", name: "Ticket Log" }
+        setup_ch_transcript: { key: "transcriptChannelId", name: "Transcripts" },
+        setup_ch_verifypanel: { key: "verifyChannelId", name: "Verify Panel Channel" }
     };
     if (channelMap[id]) {
         const cfg = channelMap[id];
@@ -1576,6 +1883,7 @@ async function handleButton(interaction) {
         });
     }
 
+    // ---- ROLES ----
     const roleMap = {
         setup_role_staff: { key: "staffRoles", name: "Staff", single: false },
         setup_role_admin: { key: "adminRoles", name: "Admin", single: false },
@@ -1583,7 +1891,8 @@ async function handleButton(interaction) {
         setup_role_management: { key: "managementRoles", name: "Management", single: false },
         setup_role_exempt: { key: "exemptRoles", name: "Exempt", single: false },
         setup_role_verify: { key: "verifyRoleId", name: "Verify Role", single: true },
-        setup_role_accept: { key: "acceptRoleIds", name: "Accept", single: false }
+        setup_role_accept: { key: "acceptRoleIds", name: "Accept", single: false },
+        setup_role_hrping: { key: "hrPingRoleId", name: "HR Ping Role", single: true }
     };
     if (roleMap[id]) {
         const cfg = roleMap[id];
@@ -1602,6 +1911,7 @@ async function handleButton(interaction) {
     if (id === "setup_clear_exempt")     { gc.exemptRoles = [];     saveConfig(); return updateSetupMessage(interaction, "roles"); }
     if (id === "setup_clear_accept")     { gc.acceptRoleIds = [];   saveConfig(); return updateSetupMessage(interaction, "roles"); }
 
+    // ---- TICKETS ----
     if (id === "setup_ticket_support_cat")  return interaction.update({ embeds: [infoEmbed("Choose the **Support Tickets Category**:")],  components: [new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("select_ticketcat_support").setPlaceholder("Pick a category").setChannelTypes([ChannelType.GuildCategory]))] });
     if (id === "setup_ticket_high_cat")     return interaction.update({ embeds: [infoEmbed("Choose the **High Rank Tickets Category**:")], components: [new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("select_ticketcat_highrank").setPlaceholder("Pick a category").setChannelTypes([ChannelType.GuildCategory]))] });
     if (id === "setup_ticket_support_ping") return interaction.update({ embeds: [infoEmbed("Choose the **Support Ping Role**:")],  components: [new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId("select_ticketping_support").setPlaceholder("Pick a role").setMaxValues(1))] });
@@ -1612,6 +1922,7 @@ async function handleButton(interaction) {
         return updateSetupMessage(interaction, "tickets");
     }
 
+    // ---- ANTI-NUKE ----
     if (id === "setup_an_toggle")    { gc.antinuke.enabled = !gc.antinuke.enabled; saveConfig(); return updateSetupMessage(interaction, "antinuke"); }
     if (id === "setup_an_threshold") {
         const modal = new ModalBuilder().setCustomId("modal_an_threshold").setTitle("Set Anti-Nuke Threshold");
@@ -1637,6 +1948,7 @@ async function handleButton(interaction) {
     if (id === "setup_post_verify")  { await interaction.channel.send({ embeds: [buildVerifyEmbed(guild)], components: buildVerifyRows() }); return interaction.reply({ embeds: [successEmbed("Verification panel posted.")], ephemeral: true }); }
     if (id === "setup_post_tickets") { await interaction.channel.send({ embeds: [buildTicketPanelEmbed(guild)], components: buildTicketPanelRows() }); return interaction.reply({ embeds: [successEmbed("Ticket panel posted.")], ephemeral: true }); }
 
+    // ---- TEMPLATES ----
     const tplMap = {
         setup_tpl_accept:  { key: "accept",  name: "Accept DM",  label: "Vars: {server} {notes}" },
         setup_tpl_promote: { key: "promote", name: "Promote DM", label: "Vars: {server} {rank} {notes}" },
@@ -1676,7 +1988,7 @@ async function handleSelect(interaction) {
     if (id.startsWith("select_role_")) {
         const key = id.slice(12);
         const values = interaction.values;
-        if (key === "verifyRoleId") gc.verifyRoleId = values[0];
+        if (key === "verifyRoleId" || key === "hrPingRoleId") gc[key] = values[0];
         else for (const rid of values) if (!gc[key].includes(rid)) gc[key].push(rid);
         saveConfig();
         return updateSetupMessage(interaction, "roles");
@@ -1687,6 +1999,11 @@ async function handleSelect(interaction) {
     if (id === "select_ticketping_highrank") { gc.ticketHighRankPingRoleId = interaction.values[0]; saveConfig(); return updateSetupMessage(interaction, "tickets"); }
     if (id === "select_an_whitelist_add")    { const uid = interaction.values[0]; if (!gc.antinuke.whitelist.includes(uid)) gc.antinuke.whitelist.push(uid); saveConfig(); return updateSetupMessage(interaction, "antinuke"); }
     if (id === "select_an_whitelist_remove") { const uid = interaction.values[0]; gc.antinuke.whitelist = gc.antinuke.whitelist.filter(x => x !== uid); saveConfig(); return updateSetupMessage(interaction, "antinuke"); }
+    if (id === "select_am_link_wl") {
+        gc.automod.linkWhitelistChannelIds = [...new Set([...gc.automod.linkWhitelistChannelIds, ...interaction.values])];
+        saveConfig();
+        return updateSetupMessage(interaction, "automod");
+    }
 }
 
 // ==========================================
@@ -1709,6 +2026,14 @@ async function handleModal(interaction) {
         if (!/^https:\/\/discord(app)?\.com\/api\/webhooks\//.test(url)) return interaction.reply({ embeds: [errorEmbed("Invalid URL.")], ephemeral: true });
         gc.webhookUrl = url; saveConfig();
         return interaction.reply({ embeds: [successEmbed("Webhook saved.")], ephemeral: true });
+    }
+    if (id === "modal_am_swear_list") {
+        const raw = interaction.fields.getTextInputValue("list");
+        const list = raw.split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+        gc.automod.extremeSweatList = list;
+        invalidateSwearRegex(guild.id);
+        saveConfig();
+        return interaction.reply({ embeds: [successEmbed("Swear list updated: **" + list.length + "** words.")], ephemeral: true });
     }
     if (id.startsWith("modal_tpl_")) {
         const key = id.slice(10);
@@ -1902,7 +2227,7 @@ async function handleTicketClose(interaction) {
 }
 
 // ==========================================
-// VOTES / EMBEDS
+// SUGGESTIONS / FEEDBACK VOTES
 // ==========================================
 
 async function handleVoteButton(interaction) {
@@ -2007,8 +2332,113 @@ function buildTicketRulesEmbed(guild) {
 }
 
 // ==========================================
-// MESSAGE HANDLER (prefix + AFK tracking + AFK mention notify)
+// UTILITY COMMANDS
 // ==========================================
+
+async function cmdRoles(interactionOrMessage, isSlash) {
+    const guild = interactionOrMessage.guild;
+    const roles = [...guild.roles.cache.values()].filter(r => r.id !== guild.id).sort((a, b) => b.position - a.position);
+    const lines = roles.map(r => r.toString() + " — `" + r.members.size + " members` — position " + r.position);
+
+    const chunks = [];
+    let current = "";
+    for (const l of lines) {
+        if ((current + "\n" + l).length > 3800) { chunks.push(current); current = l; }
+        else current += (current ? "\n" : "") + l;
+    }
+    if (current) chunks.push(current);
+
+    const embed = new EmbedBuilder()
+        .setTitle("📋 Server Roles — " + roles.length + " total")
+        .setColor(WEBHOOK_COLOR)
+        .setFooter({ text: guild.name, iconURL: guild.iconURL() || undefined })
+        .setDescription("**Total members:** " + guild.memberCount + "\n\n" + (chunks[0] || "None"))
+        .setTimestamp();
+
+    if (isSlash) await interactionOrMessage.reply({ embeds: [embed] });
+    else await interactionOrMessage.reply({ embeds: [embed] });
+}
+
+async function cmdServerInfo(interactionOrMessage, isSlash) {
+    const guild = interactionOrMessage.guild;
+    await guild.members.fetch().catch(() => {});
+    const owner = await guild.fetchOwner().catch(() => null);
+
+    const textChannels = guild.channels.cache.filter(c => c.type === ChannelType.GuildText).size;
+    const voiceChannels = guild.channels.cache.filter(c => c.type === ChannelType.GuildVoice).size;
+    const categories = guild.channels.cache.filter(c => c.type === ChannelType.GuildCategory).size;
+    const humans = guild.members.cache.filter(m => !m.user.bot).size;
+    const bots = guild.members.cache.filter(m => m.user.bot).size;
+
+    const embed = new EmbedBuilder()
+        .setTitle("ℹ️ " + guild.name)
+        .setThumbnail(guild.iconURL({ size: 256 }) || null)
+        .setColor(WEBHOOK_COLOR)
+        .addFields(
+            { name: "Owner", value: owner ? owner.toString() : "Unknown", inline: true },
+            { name: "Server ID", value: guild.id, inline: true },
+            { name: "Created", value: "<t:" + ((guild.createdTimestamp / 1000) | 0) + ":F>\n(<t:" + ((guild.createdTimestamp / 1000) | 0) + ":R>)", inline: true },
+            { name: "Members", value: String(guild.memberCount), inline: true },
+            { name: "Humans / Bots", value: humans + " / " + bots, inline: true },
+            { name: "Roles", value: String(guild.roles.cache.size - 1), inline: true },
+            { name: "Channels", value: textChannels + " text • " + voiceChannels + " voice • " + categories + " cat", inline: true },
+            { name: "Boost Tier", value: "Tier " + guild.premiumTier, inline: true },
+            { name: "Boosts", value: String(guild.premiumSubscriptionCount || 0), inline: true },
+            { name: "Emojis", value: String(guild.emojis.cache.size), inline: true },
+            { name: "Verification", value: String(guild.verificationLevel), inline: true }
+        )
+        .setFooter({ text: guild.name, iconURL: guild.iconURL() || undefined })
+        .setTimestamp();
+
+    if (guild.bannerURL()) embed.setImage(guild.bannerURL({ size: 1024 }));
+
+    if (isSlash) await interactionOrMessage.reply({ embeds: [embed] });
+    else await interactionOrMessage.reply({ embeds: [embed] });
+}
+
+async function cmdAfk(interactionOrMessage, isSlash, reason) {
+    const guild = interactionOrMessage.guild;
+    const user = isSlash ? interactionOrMessage.user : interactionOrMessage.author;
+    const member = isSlash ? interactionOrMessage.member : interactionOrMessage.member;
+    const gc = getGuildConfig(guild.id);
+
+    const trimmed = (reason || "AFK").slice(0, 200);
+    const already = gc.afk[user.id];
+
+    gc.afk[user.id] = { reason: trimmed, since: already ? already.since : Date.now() };
+    saveConfig();
+
+    const embed = new EmbedBuilder()
+        .setDescription("💤 **" + member.displayName + "** is now AFK: **" + trimmed + "**\n\n_I'll notify anyone who pings you. Send any message to clear._")
+        .setColor(0xFEE75C)
+        .setTimestamp();
+
+    if (isSlash) await interactionOrMessage.reply({ embeds: [embed] });
+    else await interactionOrMessage.reply({ embeds: [embed] });
+}
+
+async function cmdAv(interactionOrMessage, isSlash, targetUser) {
+    const user = targetUser || (isSlash ? interactionOrMessage.user : interactionOrMessage.author);
+    const embed = new EmbedBuilder()
+        .setTitle(user.username + "'s Avatar")
+        .setColor(WEBHOOK_COLOR)
+        .setImage(user.displayAvatarURL({ size: 1024, extension: "png" }))
+        .addFields(
+            { name: "Username", value: user.tag, inline: true },
+            { name: "ID", value: user.id, inline: true }
+        )
+        .setFooter({ text: "Requested by " + (isSlash ? interactionOrMessage.user.tag : interactionOrMessage.author.tag) })
+        .setTimestamp();
+    if (isSlash) await interactionOrMessage.reply({ embeds: [embed] });
+    else await interactionOrMessage.reply({ embeds: [embed] });
+}
+
+// ==========================================
+// MESSAGE HANDLER — AUTOMOD + PREFIX + AFK
+// ==========================================
+
+// Track message pings for ghost-ping detection (messageId -> { mentions, channelId, guildId, content, authorId })
+const _recentPingedMessages = new Map();
 
 client.on("messageCreate", async message => {
     if (message.author.bot) return;
@@ -2016,16 +2446,86 @@ client.on("messageCreate", async message => {
 
     const guild = message.guild;
     const gc = getGuildConfig(guild.id);
+    const member = message.member;
 
-    // ----- 1) CLEAR AFK if the author was AFK -----
-    if (gc.afk[message.author.id]) {
-        clearAfkIfSet(guild, message.member, message.channel).catch(() => {});
+    // ----- 1) AUTOMOD: extreme swear -----
+    if (gc.automod.extremeSweatEnabled && !isExempt(member) && !canRunCommand(member, "setup")) {
+        const regex = getSwearRegex(guild.id);
+        if (regex && regex.test(message.content)) {
+            // Delete
+            message.delete().catch(() => {});
+            // Mute 60m
+            let muted = false;
+            try {
+                if (message.member?.moderatable) {
+                    await message.member.timeout(SWEAR_MUTE_MS, "Auto-Mod: extreme language");
+                    muted = true;
+                }
+            } catch (e) { console.error("swear mute:", e); }
+
+            const hrPing = gc.hrPingRoleId ? "<@&" + gc.hrPingRoleId + ">" : "";
+            const embed = new EmbedBuilder()
+                .setTitle("🤬 Extreme Language Detected")
+                .setColor(0xED4245)
+                .setDescription(
+                    "**User:** " + message.author + " (" + message.author.tag + ")\n" +
+                    "**Channel:** " + message.channel + "\n" +
+                    "**Action:** " + (muted ? "Muted 60 minutes" : "Mute failed (permissions?)") + "\n" +
+                    "**Content:** ||" + message.content.slice(0, 1000) + "||"
+                )
+                .setThumbnail(message.author.displayAvatarURL())
+                .setTimestamp();
+
+            // Ping HR + log
+            await broadcast(guild, embed, ["log", "staff", "webhook"]);
+
+            // Explicitly ping HR role in log channel
+            if (hrPing && gc.logChannelId) {
+                const lc = guild.channels.cache.get(gc.logChannelId);
+                if (lc) lc.send({ content: "🚨 " + hrPing + " — Extreme language detected", allowedMentions: { roles: [gc.hrPingRoleId] } }).catch(() => {});
+            }
+            return;
+        }
     }
 
-    // ----- 2) NOTIFY AFK MENTIONS -----
+    // ----- 2) AUTOMOD: link filter -----
+    if (gc.automod.linkFilterEnabled && !isExempt(member) && !canRunCommand(member, "setup")) {
+        if (containsLink(message.content) && !gc.automod.linkWhitelistChannelIds.includes(message.channel.id)) {
+            message.delete().catch(() => {});
+            const warn = await message.channel.send({ content: message.author.toString() + " — links are not allowed in this channel." }).catch(() => null);
+            if (warn) setTimeout(() => warn.delete().catch(() => {}), 5000);
+
+            const embed = new EmbedBuilder().setTitle("🔗 Link Blocked").setColor(0xFEE75C)
+                .setDescription("**User:** " + message.author + " (" + message.author.tag + ")\n**Channel:** " + message.channel + "\n**Content:** ||" + message.content.slice(0, 1000) + "||")
+                .setThumbnail(message.author.displayAvatarURL())
+                .setTimestamp();
+            await broadcast(guild, embed, ["log", "webhook"]);
+            return;
+        }
+    }
+
+    // ----- 3) GHOST PING TRACKING -----
+    if (gc.automod.ghostPingEnabled && message.mentions.members?.size && !isExempt(member)) {
+        _recentPingedMessages.set(message.id, {
+            mentions: [...message.mentions.members.keys()],
+            channelId: message.channel.id,
+            guildId: guild.id,
+            authorId: message.author.id,
+            content: message.content.slice(0, 200),
+            at: Date.now()
+        });
+        // prune old
+        if (_recentPingedMessages.size > 500) {
+            const now = Date.now();
+            for (const [k, v] of _recentPingedMessages) if (now - v.at > 10 * 60 * 1000) _recentPingedMessages.delete(k);
+        }
+    }
+
+    // ----- 4) AFK -----
+    if (gc.afk[message.author.id]) clearAfkIfSet(guild, member, message.channel).catch(() => {});
     notifyAfkMentions(message).catch(() => {});
 
-    // ----- 3) PREFIX COMMANDS -----
+    // ----- 5) PREFIX COMMANDS -----
     const prefix = getPrefix(guild.id);
     if (!message.content.startsWith(prefix)) return;
     const args = message.content.slice(prefix.length).trim().split(/\s+/);
@@ -2037,36 +2537,34 @@ client.on("messageCreate", async message => {
             const embed = new EmbedBuilder().setTitle(guild.name + " — Prefix Commands").setColor(WEBHOOK_COLOR)
                 .addFields({ name: "Prefix Commands", value: [
                     "`" + prefix + "help`",
-                    "`" + prefix + "roles` — list all roles (staff)",
-                    "`" + prefix + "serverinfo` — server info",
-                    "`" + prefix + "afk [reason]` — set AFK",
-                    "`" + prefix + "av [@user]` — avatar",
+                    "`" + prefix + "roles` (staff)",
+                    "`" + prefix + "serverinfo`",
+                    "`" + prefix + "afk [reason]`",
+                    "`" + prefix + "av [@user]`",
                     "`" + prefix + "loguser <username> <Warn|Kick|Ban> <reason>`"
                 ].join("\n") });
             return message.reply({ embeds: [embed] });
         }
-
         if (command === "roles") {
-            if (!canRunCommand(message.member, "roles")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            if (!canRunCommand(member, "roles")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
             return cmdRoles(message, false);
         }
         if (command === "serverinfo") {
-            if (!canRunCommand(message.member, "serverinfo")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            if (!canRunCommand(member, "serverinfo")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
             return cmdServerInfo(message, false);
         }
         if (command === "afk") {
-            if (!canRunCommand(message.member, "afk")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            if (!canRunCommand(member, "afk")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
             const reason = args.join(" ").slice(0, 200) || "AFK";
             return cmdAfk(message, false, reason);
         }
         if (command === "av" || command === "avatar") {
-            if (!canRunCommand(message.member, "av")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            if (!canRunCommand(member, "av")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
             const target = message.mentions.users.first() || null;
             return cmdAv(message, false, target);
         }
-
         if (command === "loguser") {
-            if (!canRunCommand(message.member, "loguser")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            if (!canRunCommand(member, "loguser")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
             const username = args[0], raw = (args[1] || "").toLowerCase(), reason = args.slice(2).join(" ");
             const valid = ["warn", "kick", "ban"];
             if (!username || !valid.includes(raw) || !reason) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "loguser <username> <Warn|Kick|Ban> <reason>`")] });
@@ -2086,6 +2584,62 @@ client.on("messageCreate", async message => {
             return message.reply({ embeds: [successEmbed("Recorded.")] });
         }
     } catch (e) { console.error(e); try { await message.reply({ embeds: [errorEmbed("Error.")] }); } catch {} }
+});
+
+// ==========================================
+// GHOST PING DETECTION (messageDelete)
+// ==========================================
+
+client.on("messageDelete", async message => {
+    try {
+        if (!message.guild) return;
+        const gc = getGuildConfig(message.guild.id);
+
+        // Log deletion (existing behavior)
+        if (message.author && !message.author.bot) {
+            broadcast(message.guild, logEmbed("Message Deleted",
+                "**Author:** " + (message.author?.tag || "Unknown") + "\n**Channel:** " + message.channel + "\n**Content:** " + (message.content || "*None*").slice(0, 1500), 0xED4245), ["log"]).catch(() => {});
+        }
+
+        // Ghost-ping detection
+        if (!gc.automod.ghostPingEnabled) return;
+        const tracked = _recentPingedMessages.get(message.id);
+        if (!tracked) return;
+        _recentPingedMessages.delete(message.id);
+
+        // Ghost ping = pinged, then deleted within 60s
+        if (Date.now() - tracked.at > 60_000) return;
+
+        // Warn the ghost pinger
+        const author = await message.guild.members.fetch(tracked.authorId).catch(() => null);
+        if (!author || isExempt(author)) return;
+
+        const embed = new EmbedBuilder().setTitle("👻 Ghost Ping Detected")
+            .setColor(0xFEE75C)
+            .setDescription(
+                "**User:** " + author.user.tag + " (" + author.id + ")\n" +
+                "**Channel:** <#" + tracked.channelId + ">\n" +
+                "**Pinged:** " + tracked.mentions.map(id => "<@" + id + ">").join(", ") + "\n" +
+                "**Content:** " + (tracked.content || "*empty*") + "\n\n" +
+                "⚠️ Auto-warned for ghost-pinging."
+            )
+            .setThumbnail(author.user.displayAvatarURL())
+            .setTimestamp();
+
+        await broadcast(message.guild, embed, ["log", "staff", "webhook"]);
+        // DM warn
+        author.send({ embeds: [new EmbedBuilder().setTitle("⚠️ Ghost Ping Warning")
+            .setDescription("You ghost-pinged in **" + message.guild.name + "**. Please don't do that — it's disruptive.")
+            .setColor(0xFEE75C).setTimestamp()] }).catch(() => {});
+    } catch (e) { console.error("messageDelete:", e); }
+});
+
+client.on("messageUpdate", async (o, n) => {
+    try {
+        if (!o.guild || o.author?.bot || o.content === n.content) return;
+        broadcast(o.guild, logEmbed("Message Edited",
+            "**Author:** " + (o.author?.tag || "Unknown") + "\n**Channel:** " + o.channel + "\n**Before:** " + (o.content || "*None*").slice(0, 800) + "\n**After:** " + (n.content || "*None*").slice(0, 800), 0xFEE75C), ["log"]).catch(() => {});
+    } catch {}
 });
 
 // ==========================================
@@ -2115,7 +2669,6 @@ client.on("guildMemberAdd", async member => {
 
 client.on("guildMemberRemove", async member => {
     try {
-        // Clear AFK on leave
         const gc = getGuildConfig(member.guild.id);
         if (gc.afk[member.id]) { delete gc.afk[member.id]; saveConfig(); }
 
@@ -2163,22 +2716,6 @@ client.on("guildBanAdd", async ban => {
 // ==========================================
 // OTHER LOGS
 // ==========================================
-
-client.on("messageDelete", async message => {
-    try {
-        if (!message.guild || message.author?.bot) return;
-        broadcast(message.guild, logEmbed("Message Deleted",
-            "**Author:** " + (message.author?.tag || "Unknown") + "\n**Channel:** " + message.channel + "\n**Content:** " + (message.content || "*None*").slice(0, 1500), 0xED4245), ["log"]).catch(() => {});
-    } catch {}
-});
-
-client.on("messageUpdate", async (o, n) => {
-    try {
-        if (!o.guild || o.author?.bot || o.content === n.content) return;
-        broadcast(o.guild, logEmbed("Message Edited",
-            "**Author:** " + (o.author?.tag || "Unknown") + "\n**Channel:** " + o.channel + "\n**Before:** " + (o.content || "*None*").slice(0, 800) + "\n**After:** " + (n.content || "*None*").slice(0, 800), 0xFEE75C), ["log"]).catch(() => {});
-    } catch {}
-});
 
 client.on("roleCreate",  async r => { try { broadcast(r.guild, logEmbed("Role Created", "**Role:** " + r + "\n**ID:** " + r.id, 0x57F287), ["log"]).catch(() => {}); } catch {} });
 client.on("channelCreate", async c => { try { if (!c.guild) return; broadcast(c.guild, logEmbed("Channel Created", "**Channel:** " + c + "\n**Name:** " + c.name, 0x57F287), ["log"]).catch(() => {}); } catch {} });
