@@ -1,5 +1,5 @@
 // ==========================================
-// EAGLE COUNTY ROLEPLAY BOT - V.1.2
+// EAGLE COUNTY ROLEPLAY BOT - V.1.2.1
 // ==========================================
 
 const {
@@ -16,6 +16,8 @@ const {
     ModalBuilder,
     TextInputBuilder,
     TextInputStyle,
+    ChannelSelectMenuBuilder,
+    RoleSelectMenuBuilder,
     WebhookClient
 } = require("discord.js");
 
@@ -36,6 +38,7 @@ const CONFIG_FILE = path.join(__dirname, "config.json");
 const DEFAULT_PREFIX = "!";
 const DAILY_LIMIT = 15;
 const WEBHOOK_COLOR = 0x2563EB; // Blue
+const EMBED_ACCENT = 0xFF8C00;  // Orange (matches LA RP panels)
 
 // ==========================================
 // CLIENT
@@ -79,6 +82,7 @@ function createDefaultGuildConfig() {
         verifyChannelId: null,
         verifyRoleId: null,
         ticketCategoryId: null,
+        ticketCategoryHighRankId: null,
         ticketLogChannelId: null,
         webhookUrl: null,
         acceptRoleIds: [],
@@ -134,9 +138,11 @@ function getGuildConfig(guildId) {
     for (const key of Object.keys(defaults)) {
         if (gc[key] === undefined) gc[key] = defaults[key];
     }
-    // Backward compat: acceptRoleId -> acceptRoleIds
     if (gc.acceptRoleId && (!gc.acceptRoleIds || gc.acceptRoleIds.length === 0)) {
         gc.acceptRoleIds = [gc.acceptRoleId];
+    }
+    if (gc.ticketCategoryId && !gc.ticketCategoryHighRankId) {
+        gc.ticketCategoryHighRankId = gc.ticketCategoryId;
     }
     return gc;
 }
@@ -280,12 +286,9 @@ async function sendWebhook(guild, embed) {
     try {
         const gc = getGuildConfig(guild.id);
         if (!gc.webhookUrl) return;
-
-        // Force blue colour and add server identity
         const finalEmbed = EmbedBuilder.from(embed).setColor(WEBHOOK_COLOR);
         if (guild.iconURL()) finalEmbed.setThumbnail(guild.iconURL({ dynamic: true, size: 256 }));
         finalEmbed.setFooter({ text: guild.name, iconURL: guild.iconURL({ dynamic: true }) || undefined });
-
         const wh = new WebhookClient({ url: gc.webhookUrl });
         await wh.send({
             username: guild.name,
@@ -344,7 +347,7 @@ async function lookupRobloxUser(username) {
 }
 
 // ==========================================
-// BUILDERS
+// VERIFY EMBED
 // ==========================================
 
 function buildVerifyEmbed(guild) {
@@ -352,41 +355,48 @@ function buildVerifyEmbed(guild) {
         .setTitle("Verification Required")
         .setDescription(
             "**Welcome to " + guild.name + ".**\n\n" +
-            "Please complete Roblox verification to access all channels.\n\n" +
+            "Please complete Roblox verification to unlock access to all channels.\n\n" +
             "**How to verify:**\n" +
-            "> Click the **Verify** button below. You will receive a code to place in your Roblox profile \"About\" section. Once set, return and click **Check Verification**.\n\n" +
+            "> 1. Click the **Verify** button below.\n" +
+            "> 2. Enter your Roblox username when prompted.\n" +
+            "> 3. Paste the code you receive into your Roblox profile's **About** section.\n" +
+            "> 4. Return here and click **Check Verification**.\n\n" +
             "**Need help?**\n" +
-            "> If you're unable to verify, click **I Can't Verify** to open a support ticket."
+            "> Click **I Can't Verify** to open a support ticket and a staff member will assist you."
         )
-        .setColor(0xFF8C00)
+        .setColor(EMBED_ACCENT)
         .setThumbnail(guild.iconURL({ dynamic: true, size: 256 }))
-        .setFooter({ text: guild.name, iconURL: guild.iconURL({ dynamic: true }) || undefined })
+        .setFooter({ text: guild.name + " • Verification System", iconURL: guild.iconURL({ dynamic: true }) || undefined })
         .setTimestamp();
 }
 
 function buildVerifyRows() {
     return [
         new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("verify_start").setLabel("Verify").setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId("verify_check").setLabel("Check Verification").setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId("verify_help").setLabel("I Can't Verify").setStyle(ButtonStyle.Secondary)
+            new ButtonBuilder().setCustomId("verify_start").setLabel("Verify").setEmoji("✅").setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId("verify_check").setLabel("Check Verification").setEmoji("🔄").setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId("verify_help").setLabel("I Can't Verify").setEmoji("❓").setStyle(ButtonStyle.Secondary)
         )
     ];
 }
 
+// ==========================================
+// TICKET EMBEDS
+// ==========================================
+
 function buildTicketPanelEmbed(guild) {
     return new EmbedBuilder()
-        .setTitle("Need Assistance?")
+        .setTitle("🎫 Need Assistance?")
         .setDescription(
-            "**" + guild.name + " Assistant**\n\n" +
+            "**" + guild.name + " | Support Assistant**\n\n" +
             "⚙️ **Need Assistance?**\n" +
             "> Click the **Open a Ticket** button below to get started and open a support ticket.\n\n" +
             "ℹ️ **Server Rules**\n" +
-            "> Please review the server rules before proceeding to ensure your request is handled properly."
+            "> Please review the Ticket Rules before proceeding to ensure your request is handled properly."
         )
-        .setColor(0xFF8C00)
+        .setColor(EMBED_ACCENT)
         .setThumbnail(guild.iconURL({ dynamic: true, size: 256 }))
-        .setFooter({ text: guild.name, iconURL: guild.iconURL({ dynamic: true }) || undefined })
+        .setFooter({ text: guild.name + " • Support System", iconURL: guild.iconURL({ dynamic: true }) || undefined })
         .setTimestamp();
 }
 
@@ -408,27 +418,29 @@ function buildTicketTypeRows() {
     ];
 }
 
-function buildTicketRulesEmbed() {
+function buildTicketRulesEmbed(guild) {
     return new EmbedBuilder()
-        .setTitle("Ticket Rules")
+        .setTitle("📋 Ticket Rules")
         .setDescription(
-            "• Remain patient and avoid pinging support roles — someone will assist you as soon as possible.\n" +
-            "• Be respectful toward the person helping you.\n" +
-            "• Respect the authority and guidance of high-ranking members.\n" +
-            "• Do not create tickets for jokes, trolling, or unnecessary reasons.\n" +
-            "• Do not open multiple tickets for the same issue.\n" +
-            "• Keep all messages relevant to your support request.\n" +
-            "• Providing false information may result in punishment or denial of support.\n" +
-            "• Do not spam, argue, or cause disruptions inside tickets.\n" +
-            "• Follow all server rules while using the support system.\n" +
-            "• Staff may close tickets that are inactive, resolved, or deemed unnecessary.\n" +
-            "• Attempting to waste staff time intentionally may lead to moderation actions.\n" +
-            "• Do not misuse pings, attachments, or embeds inside tickets.\n" +
-            "• Any form of harassment, discrimination, or threats toward staff or members will not be tolerated.\n" +
-            "• If instructed by staff, cooperate fully to help resolve your issue faster.\n" +
-            "• Screenshots, proof, or additional details may be required depending on the report or request."
+            "**Please follow these rules while using the support system:**\n\n" +
+            "**1.** Remain patient and do not ping support roles — someone will assist you as soon as possible.\n" +
+            "**2.** Be respectful toward the person helping you.\n" +
+            "**3.** Respect the authority and guidance of high-ranking members.\n" +
+            "**4.** Do not open tickets for jokes, trolling, or unnecessary reasons.\n" +
+            "**5.** Do not open multiple tickets for the same issue.\n" +
+            "**6.** Keep all messages relevant to your support request.\n" +
+            "**7.** Providing false information may result in punishment or denial of support.\n" +
+            "**8.** Do not spam, argue, or cause disruptions inside tickets.\n" +
+            "**9.** Follow all server rules while using the support system.\n" +
+            "**10.** Staff may close tickets that are inactive, resolved, or deemed unnecessary.\n" +
+            "**11.** Attempting to waste staff time intentionally may lead to moderation actions.\n" +
+            "**12.** Do not misuse pings, attachments, or embeds inside tickets.\n" +
+            "**13.** Any form of harassment, discrimination, or threats toward staff or members will not be tolerated.\n" +
+            "**14.** If instructed by staff, cooperate fully to help resolve your issue faster.\n" +
+            "**15.** Screenshots, proof, or additional details may be required depending on the report or request."
         )
-        .setColor(0xFF8C00)
+        .setColor(EMBED_ACCENT)
+        .setFooter({ text: guild.name + " • Ticket Rules", iconURL: guild.iconURL({ dynamic: true }) || undefined })
         .setTimestamp();
 }
 
@@ -444,16 +456,13 @@ function getSlashCommands() {
         new SlashCommandBuilder().setName("setprefix").setDescription("Set the server prefix")
             .addStringOption(o => o.setName("prefix").setDescription("New prefix").setRequired(true).setMaxLength(5)),
 
-        // ----- SETUP POSTS -----
         new SlashCommandBuilder().setName("setupverify").setDescription("Post the Roblox verification panel in this channel"),
         new SlashCommandBuilder().setName("setuptickets").setDescription("Post the ticket panel in this channel"),
 
-        // ----- WEBHOOK -----
         new SlashCommandBuilder().setName("set-webhook").setDescription("Set the log webhook URL")
             .addStringOption(o => o.setName("url").setDescription("Discord webhook URL").setRequired(true)),
         new SlashCommandBuilder().setName("remove-webhook").setDescription("Remove the log webhook"),
 
-        // ----- ACCEPT ROLES -----
         new SlashCommandBuilder().setName("acceptsetup").setDescription("Manage accept roles")
             .addSubcommand(s => s.setName("add").setDescription("Add an accept role")
                 .addRoleOption(o => o.setName("role").setDescription("Role").setRequired(true)))
@@ -462,7 +471,6 @@ function getSlashCommands() {
             .addSubcommand(s => s.setName("list").setDescription("List accept roles"))
             .addSubcommand(s => s.setName("clear").setDescription("Clear all accept roles")),
 
-        // ----- HR -----
         new SlashCommandBuilder().setName("accept").setDescription("Accept a user's application (DMs them)")
             .addUserOption(o => o.setName("user").setDescription("User").setRequired(true))
             .addStringOption(o => o.setName("notes").setDescription("Notes").setRequired(false)),
@@ -489,7 +497,6 @@ function getSlashCommands() {
             .addStringOption(o => o.setName("reason").setDescription("Reason").setRequired(true))
             .addStringOption(o => o.setName("notes").setDescription("Notes").setRequired(false)),
 
-        // ----- SUGGESTIONS / FEEDBACK -----
         new SlashCommandBuilder().setName("suggest").setDescription("Submit a suggestion")
             .addStringOption(o => o.setName("suggestion").setDescription("Suggestion").setRequired(true)),
 
@@ -497,7 +504,6 @@ function getSlashCommands() {
             .addUserOption(o => o.setName("staff").setDescription("Staff member").setRequired(true))
             .addStringOption(o => o.setName("feedback").setDescription("Feedback").setRequired(true)),
 
-        // ----- MODERATION -----
         new SlashCommandBuilder().setName("mute").setDescription("Timeout a member")
             .addUserOption(o => o.setName("user").setDescription("Member").setRequired(true))
             .addStringOption(o => o.setName("duration").setDescription("Example: 10m, 1h, 1d").setRequired(true))
@@ -551,7 +557,7 @@ client.once("ready", async () => {
         getGuildConfig(guild.id);
         await registerCommands(guild);
     }
-    client.user.setActivity("Eagle County Roleplay | V.1.2");
+    client.user.setActivity("Eagle County Roleplay | V.1.2.1");
 });
 
 client.on("guildCreate", async guild => {
@@ -602,7 +608,11 @@ function buildSetupEmbed(guild) {
 
     return new EmbedBuilder()
         .setTitle("⚙️ " + guild.name + " — Setup Menu")
-        .setDescription("Click a button below to configure the bot.\nUse the buttons to set channels, roles, and DM templates.")
+        .setDescription(
+            "Use the buttons below to configure the bot.\n" +
+            "Set channels, roles, and DM templates from here.\n\n" +
+            "**Tickets:** Set both **Support Cat** and **HighRank Cat** to enable separate ticket categories."
+        )
         .setColor(WEBHOOK_COLOR)
         .setThumbnail(guild.iconURL({ dynamic: true, size: 256 }))
         .addFields(
@@ -618,7 +628,8 @@ function buildSetupEmbed(guild) {
                     "**HR Logs:** " + ch(gc.hrLogChannelId),
                     "**Verify:** " + ch(gc.verifyChannelId),
                     "**Ticket Log:** " + ch(gc.ticketLogChannelId),
-                    "**Ticket Category:** " + (gc.ticketCategoryId ? "<#" + gc.ticketCategoryId + ">" : "Not set")
+                    "**Support Category:** " + ch(gc.ticketCategoryId),
+                    "**HighRank Category:** " + ch(gc.ticketCategoryHighRankId)
                 ].join("\n"),
                 inline: false
             },
@@ -633,13 +644,9 @@ function buildSetupEmbed(guild) {
                 ].join("\n"),
                 inline: false
             },
-            {
-                name: "Webhook",
-                value: gc.webhookUrl ? "✅ Configured" : "❌ Not set",
-                inline: true
-            }
+            { name: "Webhook", value: gc.webhookUrl ? "✅ Configured" : "❌ Not set", inline: true }
         )
-        .setFooter({ text: "V.1.2 • " + guild.name, iconURL: guild.iconURL({ dynamic: true }) || undefined })
+        .setFooter({ text: "V.1.2.1 • " + guild.name, iconURL: guild.iconURL({ dynamic: true }) || undefined })
         .setTimestamp();
 }
 
@@ -672,7 +679,10 @@ function buildChannelsMenuRows() {
             new ButtonBuilder().setCustomId("setup_ch_hrlogs").setLabel("HR Logs").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_ch_verify").setLabel("Verify Ch").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_ch_ticketlog").setLabel("Ticket Log").setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId("setup_ch_ticketcat").setLabel("Ticket Cat").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("setup_ch_ticketcat").setLabel("Support Cat").setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId("setup_ch_ticketcathr").setLabel("HighRank Cat").setStyle(ButtonStyle.Primary)
+        ),
+        new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId("setup_back").setLabel("Back").setStyle(ButtonStyle.Danger)
         )
     ];
@@ -711,7 +721,7 @@ function buildTemplatesMenuRows() {
 }
 
 // ==========================================
-// SETUP MENU INTERACTIONS
+// SETUP NAV
 // ==========================================
 
 async function updateSetupMessage(interaction, view) {
@@ -758,13 +768,8 @@ async function updateSetupMessage(interaction, view) {
 
 client.on("interactionCreate", async interaction => {
     try {
-        // ---------- BUTTONS ----------
         if (interaction.isButton()) return handleButton(interaction);
-
-        // ---------- MODALS ----------
         if (interaction.isModalSubmit()) return handleModal(interaction);
-
-        // ---------- SELECT MENUS ----------
         if (interaction.isStringSelectMenu() || interaction.isChannelSelectMenu() || interaction.isRoleSelectMenu()) {
             return handleSelect(interaction);
         }
@@ -809,12 +814,12 @@ client.on("interactionCreate", async interaction => {
             return interaction.reply({ embeds: [createSuccessEmbed("Ticket panel posted.")], ephemeral: true });
         }
 
-        // ---------- /set-webhook / /remove-webhook ----------
+        // ---------- WEBHOOK ----------
         if (command === "set-webhook") {
             if (!isAdmin(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Admin only.")], ephemeral: true });
             const url = interaction.options.getString("url");
             if (!/^https:\/\/discord(app)?\.com\/api\/webhooks\//.test(url)) {
-                return interaction.reply({ embeds: [createErrorEmbed("That doesn't look like a valid Discord webhook URL.")], ephemeral: true });
+                return interaction.reply({ embeds: [createErrorEmbed("Not a valid Discord webhook URL.")], ephemeral: true });
             }
             gc.webhookUrl = url; saveConfig();
             return interaction.reply({ embeds: [createSuccessEmbed("Webhook set.")], ephemeral: true });
@@ -887,7 +892,7 @@ client.on("interactionCreate", async interaction => {
             await sendLog(guild, logEmbed);
             await sendWebhook(guild, logEmbed);
 
-            return interaction.editReply({ embeds: [createSuccessEmbed("**" + targetUser.tag + "** accepted. DM sent: " + dmSent + ". Roles given: " + roleGiven + ".")] });
+            return interaction.editReply({ embeds: [createSuccessEmbed("**" + targetUser.tag + "** accepted. DM: " + dmSent + ". Roles: " + roleGiven + ".")] });
         }
 
         // ---------- /promote ----------
@@ -916,7 +921,7 @@ client.on("interactionCreate", async interaction => {
             await sendLog(guild, logEmbed);
             await sendWebhook(guild, logEmbed);
 
-            return interaction.editReply({ embeds: [createSuccessEmbed("**" + targetUser.tag + "** promoted to **" + rank + "**. DM sent: " + dmSent + ".")] });
+            return interaction.editReply({ embeds: [createSuccessEmbed("**" + targetUser.tag + "** promoted to **" + rank + "**. DM: " + dmSent + ".")] });
         }
 
         // ---------- /demote ----------
@@ -945,7 +950,7 @@ client.on("interactionCreate", async interaction => {
             await sendLog(guild, logEmbed);
             await sendWebhook(guild, logEmbed);
 
-            return interaction.editReply({ embeds: [createSuccessEmbed("**" + targetUser.tag + "** demoted to **" + rank + "**. DM sent: " + dmSent + ".")] });
+            return interaction.editReply({ embeds: [createSuccessEmbed("**" + targetUser.tag + "** demoted to **" + rank + "**. DM: " + dmSent + ".")] });
         }
 
         // ---------- /infract ----------
@@ -977,7 +982,7 @@ client.on("interactionCreate", async interaction => {
             await sendLog(guild, logEmbed);
             await sendWebhook(guild, logEmbed);
 
-            return interaction.editReply({ embeds: [createSuccessEmbed("**" + targetUser.tag + "** infracted: **" + type + "**. DM sent: " + dmSent + ".")] });
+            return interaction.editReply({ embeds: [createSuccessEmbed("**" + targetUser.tag + "** infracted: **" + type + "**. DM: " + dmSent + ".")] });
         }
 
         // ---------- /suggest ----------
@@ -1033,7 +1038,7 @@ client.on("interactionCreate", async interaction => {
             if (!duration) return interaction.reply({ embeds: [createErrorEmbed("Invalid duration. Ex: 10m, 1h, 1d.")], ephemeral: true });
 
             const limit = getLimitData(guild.id, interaction.user.id);
-            if (limit.mutes >= DAILY_LIMIT) return interaction.reply({ embeds: [createErrorEmbed("Daily mute limit reached (" + DAILY_LIMIT + ").")], ephemeral: true });
+            if (limit.mutes >= DAILY_LIMIT) return interaction.reply({ embeds: [createErrorEmbed("Daily mute limit reached.")], ephemeral: true });
 
             const reason = interaction.options.getString("reason") || "No reason provided";
             try {
@@ -1179,7 +1184,7 @@ client.on("interactionCreate", async interaction => {
         if (command === "help") {
             const prefix = getPrefix(guild.id);
             const embed = new EmbedBuilder()
-                .setTitle(guild.name + " — Bot Commands V.1.2")
+                .setTitle(guild.name + " — Bot Commands V.1.2.1")
                 .setColor(WEBHOOK_COLOR)
                 .setThumbnail(guild.iconURL({ dynamic: true }))
                 .addFields(
@@ -1226,13 +1231,12 @@ async function handleButton(interaction) {
     const guild = interaction.guild;
     const gc = getGuildConfig(guild.id);
 
-    // ---- SETUP MENU NAV ----
+    // ---- SETUP NAV ----
     if (id === "setup_back") return updateSetupMessage(interaction, "main");
     if (id === "setup_channels") return updateSetupMessage(interaction, "channels");
     if (id === "setup_roles") return updateSetupMessage(interaction, "roles");
     if (id === "setup_dm_templates") return updateSetupMessage(interaction, "templates");
 
-    // ---- SETUP: PREFIX ----
     if (id === "setup_prefix") {
         const modal = new ModalBuilder().setCustomId("modal_prefix").setTitle("Set Prefix");
         const input = new TextInputBuilder().setCustomId("prefix").setLabel("New prefix (max 5 chars)").setStyle(TextInputStyle.Short).setMaxLength(5).setRequired(true);
@@ -1240,7 +1244,6 @@ async function handleButton(interaction) {
         return interaction.showModal(modal);
     }
 
-    // ---- SETUP: WEBHOOK ----
     if (id === "setup_webhook") {
         const modal = new ModalBuilder().setCustomId("modal_webhook").setTitle("Set Webhook URL");
         const input = new TextInputBuilder().setCustomId("url").setLabel("Discord webhook URL").setStyle(TextInputStyle.Short).setRequired(true);
@@ -1248,7 +1251,7 @@ async function handleButton(interaction) {
         return interaction.showModal(modal);
     }
 
-    // ---- SETUP: CHANNEL BUTTONS (show channel select) ----
+    // ---- SETUP: CHANNELS ----
     const channelMap = {
         setup_ch_logs: { key: "logChannelId", name: "Logging" },
         setup_ch_welcome: { key: "welcomeChannelId", name: "Welcome" },
@@ -1258,11 +1261,12 @@ async function handleButton(interaction) {
         setup_ch_hrlogs: { key: "hrLogChannelId", name: "HR Logs" },
         setup_ch_verify: { key: "verifyChannelId", name: "Verify" },
         setup_ch_ticketlog: { key: "ticketLogChannelId", name: "Ticket Log" },
-        setup_ch_ticketcat: { key: "ticketCategoryId", name: "Ticket Category", isCategory: true }
+        setup_ch_ticketcat: { key: "ticketCategoryId", name: "General Support Category", isCategory: true },
+        setup_ch_ticketcathr: { key: "ticketCategoryHighRankId", name: "High Rank Category", isCategory: true }
     };
     if (channelMap[id]) {
         const cfg = channelMap[id];
-        const select = new (require("discord.js").ChannelSelectMenuBuilder)()
+        const select = new ChannelSelectMenuBuilder()
             .setCustomId("select_channel_" + cfg.key)
             .setPlaceholder("Pick a channel for " + cfg.name)
             .setChannelTypes(cfg.isCategory ? [ChannelType.GuildCategory] : [ChannelType.GuildText, ChannelType.GuildAnnouncement]);
@@ -1272,7 +1276,7 @@ async function handleButton(interaction) {
         });
     }
 
-    // ---- SETUP: ROLE BUTTONS ----
+    // ---- SETUP: ROLES ----
     const roleMap = {
         setup_role_staff: { key: "staffRoles", name: "Staff" },
         setup_role_admin: { key: "adminRoles", name: "Admin" },
@@ -1282,7 +1286,7 @@ async function handleButton(interaction) {
     };
     if (roleMap[id]) {
         const cfg = roleMap[id];
-        const select = new (require("discord.js").RoleSelectMenuBuilder)()
+        const select = new RoleSelectMenuBuilder()
             .setCustomId("select_role_" + cfg.key)
             .setPlaceholder("Pick a role for " + cfg.name)
             .setMaxValues(cfg.single ? 1 : 10);
@@ -1292,7 +1296,7 @@ async function handleButton(interaction) {
         });
     }
 
-    // ---- SETUP: CLEAR BUTTONS ----
+    // ---- SETUP: CLEAR ----
     if (id === "setup_clear_staff") { gc.staffRoles = []; saveConfig(); return updateSetupMessage(interaction, "roles"); }
     if (id === "setup_clear_admin") { gc.adminRoles = []; saveConfig(); return updateSetupMessage(interaction, "roles"); }
     if (id === "setup_clear_accept") { gc.acceptRoleIds = []; saveConfig(); return updateSetupMessage(interaction, "roles"); }
@@ -1334,7 +1338,12 @@ async function handleButton(interaction) {
     if (id === "verify_start") return handleVerifyStart(interaction);
     if (id === "verify_check") return handleVerifyCheck(interaction);
     if (id === "verify_help") {
-        return interaction.reply({ embeds: [createInfoEmbed("Use `/setuptickets` in a channel to open support tickets if you cannot verify.")], ephemeral: true });
+        // Auto-open a General Support ticket
+        return handleTicketCreate(
+            interaction,
+            "support",
+            "User clicked **I Can't Verify** on the verification panel."
+        );
     }
 
     // ---- TICKETS ----
@@ -1346,7 +1355,7 @@ async function handleButton(interaction) {
         });
     }
     if (id === "ticket_rules") {
-        return interaction.reply({ embeds: [buildTicketRulesEmbed()], ephemeral: true });
+        return interaction.reply({ embeds: [buildTicketRulesEmbed(guild)], ephemeral: true });
     }
     if (id === "ticket_type_support") return handleTicketCreate(interaction, "support");
     if (id === "ticket_type_highrank") return handleTicketCreate(interaction, "highrank");
@@ -1354,18 +1363,16 @@ async function handleButton(interaction) {
 }
 
 // ==========================================
-// SELECT MENU HANDLER
+// SELECT HANDLER
 // ==========================================
 
 async function handleSelect(interaction) {
     const id = interaction.customId;
-    const guild = interaction.guild;
-    const gc = getGuildConfig(guild.id);
+    const gc = getGuildConfig(interaction.guild.id);
 
     if (id.startsWith("select_channel_")) {
         const key = id.slice("select_channel_".length);
-        const channelId = interaction.values[0];
-        gc[key] = channelId;
+        gc[key] = interaction.values[0];
         saveConfig();
         return updateSetupMessage(interaction, "channels");
     }
@@ -1415,8 +1422,7 @@ async function handleModal(interaction) {
 
     if (id.startsWith("modal_tpl_")) {
         const key = id.slice("modal_tpl_".length);
-        const template = interaction.fields.getTextInputValue("template");
-        gc.dmTemplates[key] = template;
+        gc.dmTemplates[key] = interaction.fields.getTextInputValue("template");
         saveConfig();
         return interaction.reply({ embeds: [createSuccessEmbed("Template **" + key + "** updated.")], ephemeral: true });
     }
@@ -1475,7 +1481,7 @@ async function handleVerifyCheck(interaction) {
     const session = gc.verifySessions[interaction.user.id];
 
     if (!session) {
-        return interaction.reply({ embeds: [createErrorEmbed("You don't have an active verification session. Click **Verify** first.")], ephemeral: true });
+        return interaction.reply({ embeds: [createErrorEmbed("No active verification session. Click **Verify** first.")], ephemeral: true });
     }
 
     await interaction.deferReply({ ephemeral: true });
@@ -1486,10 +1492,9 @@ async function handleVerifyCheck(interaction) {
     }
 
     if (!robloxData.description.includes(session.code)) {
-        return interaction.editReply({ embeds: [createErrorEmbed("Code not found in your Roblox About section. Make sure you saved it and try again.")] });
+        return interaction.editReply({ embeds: [createErrorEmbed("Code not found in your Roblox About section. Save it and try again.")] });
     }
 
-    // Mark verified
     gc.verifiedUsers[interaction.user.id] = {
         robloxId: robloxData.id,
         robloxUsername: robloxData.username,
@@ -1498,7 +1503,6 @@ async function handleVerifyCheck(interaction) {
     delete gc.verifySessions[interaction.user.id];
     saveConfig();
 
-    // Give role
     let roleGiven = false;
     if (gc.verifyRoleId) {
         try {
@@ -1507,7 +1511,7 @@ async function handleVerifyCheck(interaction) {
         } catch (e) { console.error("verify role:", e); }
     }
 
-    const embed = new EmbedBuilder()
+    const successEmbed = new EmbedBuilder()
         .setTitle("✅ Verification Successful")
         .setDescription("Welcome, **" + robloxData.username + "**! You have been verified on **" + guild.name + "**.")
         .setColor(0x57F287)
@@ -1528,108 +1532,179 @@ async function handleVerifyCheck(interaction) {
     await sendLog(guild, logEmbed);
     await sendWebhook(guild, logEmbed);
 
-    return interaction.editReply({ embeds: [embed] });
+    return interaction.editReply({ embeds: [successEmbed] });
 }
 
 // ==========================================
 // TICKETS
 // ==========================================
 
-async function handleTicketCreate(interaction, type) {
+const TICKET_TYPES = {
+    support: {
+        label: "General Support",
+        slug: "general-support",
+        emoji: "⚙️",
+        categoryKey: "ticketCategoryId",
+        pingRolesKey: "staffRoles"
+    },
+    highrank: {
+        label: "High Rank",
+        slug: "high-rank",
+        emoji: "🛡️",
+        categoryKey: "ticketCategoryHighRankId",
+        pingRolesKey: "adminRoles"
+    }
+};
+
+async function handleTicketCreate(interaction, type, prefillReason) {
     const guild = interaction.guild;
     const gc = getGuildConfig(guild.id);
+    const cfg = TICKET_TYPES[type];
 
-    // Check if user already has a ticket
-    const existing = Object.values(gc.tickets).find(t => t.userId === interaction.user.id && t.open);
+    if (!cfg) {
+        return interaction.reply({ embeds: [createErrorEmbed("Unknown ticket type.")], ephemeral: true });
+    }
+
+    // ---- Already open? ----
+    const existing = Object.entries(gc.tickets).find(
+        ([, t]) => t.userId === interaction.user.id && t.open
+    );
     if (existing) {
-        const existingChannel = guild.channels.cache.get(existing.channelId);
-        if (existingChannel) {
-            return interaction.reply({
-                embeds: [createErrorEmbed("You already have an open ticket: " + existingChannel)],
-                ephemeral: true
-            });
-        }
+        const existingChannel = guild.channels.cache.get(existing[0]);
+        const msg = existingChannel
+            ? "You already have an open ticket: " + existingChannel
+            : "You already have an open ticket. If the channel was deleted, ask an admin to clean up `config.json`.";
+        return interaction.reply({ embeds: [createErrorEmbed(msg)], ephemeral: true });
     }
 
-    if (!gc.ticketCategoryId) {
-        return interaction.reply({ embeds: [createErrorEmbed("Ticket category not set. Ask an admin.")], ephemeral: true });
+    // ---- Category check ----
+    const categoryId = gc[cfg.categoryKey];
+    if (!categoryId) {
+        return interaction.reply({
+            embeds: [createErrorEmbed("The **" + cfg.label + "** category is not set. Ask an admin to configure it in `/setup → Channels`.")],
+            ephemeral: true
+        });
+    }
+    const category = guild.channels.cache.get(categoryId);
+    if (!category || category.type !== ChannelType.GuildCategory) {
+        return interaction.reply({
+            embeds: [createErrorEmbed("The configured category no longer exists. Ask an admin to re-set it.")],
+            ephemeral: true
+        });
     }
 
-    await interaction.deferReply({ ephemeral: true });
+    if (!interaction.deferred && !interaction.replied) {
+        await interaction.deferReply({ ephemeral: true });
+    }
 
+    // ---- Ticket number ----
     const ticketNumber = (gc.ticketCounter || 0) + 1;
     gc.ticketCounter = ticketNumber;
 
-    const channelName = (type === "support" ? "support" : "highrank") + "-" + ticketNumber + "-" + interaction.user.username.toLowerCase().slice(0, 15);
+    // ---- Channel name: <number>-<slug>-<username> ----
+    const cleanUser = interaction.user.username
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, "")
+        .slice(0, 15) || "user";
 
+    const channelName = ticketNumber + "-" + cfg.slug + "-" + cleanUser;
+
+    // ---- Permissions ----
     const permissionOverwrites = [
         { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
         {
             id: interaction.user.id,
-            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory]
+            allow: [
+                PermissionFlagsBits.ViewChannel,
+                PermissionFlagsBits.SendMessages,
+                PermissionFlagsBits.ReadMessageHistory,
+                PermissionFlagsBits.AttachFiles,
+                PermissionFlagsBits.EmbedLinks
+            ]
         },
         {
             id: client.user.id,
-            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ReadMessageHistory]
+            allow: [
+                PermissionFlagsBits.ViewChannel,
+                PermissionFlagsBits.SendMessages,
+                PermissionFlagsBits.ManageChannels,
+                PermissionFlagsBits.ReadMessageHistory
+            ]
         }
     ];
 
-    for (const rid of [...gc.staffRoles, ...gc.adminRoles]) {
-        permissionOverwrites.push({
-            id: rid,
-            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory]
-        });
+    const pingRoleIds = gc[cfg.pingRolesKey] || [];
+    for (const rid of [...pingRoleIds, ...gc.adminRoles, ...gc.staffRoles]) {
+        if (!permissionOverwrites.find(p => p.id === rid)) {
+            permissionOverwrites.push({
+                id: rid,
+                allow: [
+                    PermissionFlagsBits.ViewChannel,
+                    PermissionFlagsBits.SendMessages,
+                    PermissionFlagsBits.ReadMessageHistory
+                ]
+            });
+        }
     }
 
+    // ---- Create ----
     let channel;
     try {
         channel = await guild.channels.create({
             name: channelName,
             type: ChannelType.GuildText,
-            parent: gc.ticketCategoryId,
+            parent: categoryId,
             permissionOverwrites,
-            topic: "Ticket by " + interaction.user.tag + " | Type: " + type
+            topic: "Ticket #" + ticketNumber + " • " + cfg.label + " • " + interaction.user.tag
         });
     } catch (e) {
         console.error("ticket create:", e);
-        return interaction.editReply({ embeds: [createErrorEmbed("Could not create ticket channel.")] });
+        return interaction.editReply({ embeds: [createErrorEmbed("Could not create ticket. Check my permissions.")] });
     }
 
     gc.tickets[channel.id] = {
         userId: interaction.user.id,
         type,
         number: ticketNumber,
+        name: cfg.slug,
         open: true,
         createdAt: Date.now()
     };
     saveConfig();
 
-    const embed = new EmbedBuilder()
-        .setTitle((type === "support" ? "General Support" : "High Rank Ticket") + " — #" + ticketNumber)
+    // ---- Welcome embed ----
+    const welcomeEmbed = new EmbedBuilder()
+        .setTitle(cfg.emoji + " " + cfg.label + " — Ticket #" + ticketNumber)
         .setDescription(
             "**" + interaction.user + "**, thank you for opening a ticket.\n\n" +
-            "A staff member will assist you shortly.\n" +
-            "While you wait, please describe your issue in detail."
+            (prefillReason ? "**Reason:** " + prefillReason + "\n\n" : "") +
+            "A staff member will assist you shortly. Please describe your issue in detail below."
         )
         .setColor(WEBHOOK_COLOR)
+        .setThumbnail(guild.iconURL({ dynamic: true, size: 256 }))
+        .setFooter({ text: guild.name, iconURL: guild.iconURL({ dynamic: true }) || undefined })
         .setTimestamp();
 
     const closeRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId("ticket_close").setLabel("Close Ticket").setEmoji("🔒").setStyle(ButtonStyle.Danger)
     );
 
-    const pingRoles = type === "highrank" ? gc.adminRoles : gc.staffRoles;
-    const pingStr = pingRoles.map(id => "<@&" + id + ">").join(" ");
+    const pingStr = pingRoleIds.map(id => "<@&" + id + ">").join(" ");
+    await channel.send({
+        content: interaction.user + (pingStr ? " " + pingStr : ""),
+        embeds: [welcomeEmbed],
+        components: [closeRow]
+    }).catch(e => console.error("welcome msg:", e));
 
-    await channel.send({ content: interaction.user + " " + pingStr, embeds: [embed], components: [closeRow] });
-
+    // ---- Log ----
     const logEmbed = new EmbedBuilder()
         .setTitle("Ticket Opened")
         .setColor(WEBHOOK_COLOR)
         .addFields(
+            { name: "Ticket #", value: String(ticketNumber), inline: true },
+            { name: "Type", value: cfg.label, inline: true },
             { name: "User", value: interaction.user.tag + " (" + interaction.user.id + ")", inline: true },
-            { name: "Type", value: type, inline: true },
-            { name: "Channel", value: channel.toString(), inline: true }
+            { name: "Channel", value: channel.toString(), inline: false }
         )
         .setTimestamp();
 
@@ -1639,7 +1714,9 @@ async function handleTicketCreate(interaction, type) {
     }
     await sendWebhook(guild, logEmbed);
 
-    return interaction.editReply({ embeds: [createSuccessEmbed("Ticket created: " + channel)] });
+    return interaction.editReply({
+        embeds: [createSuccessEmbed("Your **" + cfg.label + "** ticket has been created: " + channel)]
+    });
 }
 
 async function handleTicketClose(interaction) {
@@ -1651,13 +1728,12 @@ async function handleTicketClose(interaction) {
         return interaction.reply({ embeds: [createErrorEmbed("This channel is not a ticket.")], ephemeral: true });
     }
 
-    const isTicketOwner = interaction.user.id === ticket.userId;
-    const member = interaction.member;
-    if (!isTicketOwner && !isStaff(member)) {
+    const isOwner = interaction.user.id === ticket.userId;
+    if (!isOwner && !isStaff(interaction.member)) {
         return interaction.reply({ embeds: [createErrorEmbed("Only the ticket owner or staff can close.")], ephemeral: true });
     }
 
-    await interaction.reply({ embeds: [createInfoEmbed("Closing ticket in 5 seconds...")] });
+    await interaction.reply({ embeds: [createInfoEmbed("🔒 Closing ticket in 5 seconds...")] });
 
     ticket.open = false;
     ticket.closedAt = Date.now();
@@ -1669,8 +1745,8 @@ async function handleTicketClose(interaction) {
         .setColor(0xED4245)
         .addFields(
             { name: "Ticket #", value: String(ticket.number), inline: true },
-            { name: "Closed By", value: interaction.user.tag, inline: true },
-            { name: "Type", value: ticket.type, inline: true }
+            { name: "Type", value: ticket.type, inline: true },
+            { name: "Closed By", value: interaction.user.tag, inline: true }
         )
         .setTimestamp();
 
@@ -1687,7 +1763,7 @@ async function handleTicketClose(interaction) {
 }
 
 // ==========================================
-// VOTE BUTTON
+// VOTES
 // ==========================================
 
 async function handleVoteButton(interaction) {
@@ -1736,10 +1812,6 @@ async function handleVoteButton(interaction) {
     }
 }
 
-// ==========================================
-// SUGGESTION / FEEDBACK EMBEDS
-// ==========================================
-
 function buildSuggestionEmbed(suggestion, author, upvotes, downvotes) {
     return new EmbedBuilder()
         .setTitle("New Suggestion")
@@ -1776,7 +1848,7 @@ function buildVoteRow(id, type) {
 }
 
 // ==========================================
-// PREFIX COMMAND HANDLER
+// PREFIX COMMANDS
 // ==========================================
 
 client.on("messageCreate", async message => {
@@ -1857,7 +1929,7 @@ client.on("messageCreate", async message => {
 });
 
 // ==========================================
-// WELCOME + MEMBER LOGGING
+// WELCOME + LOGGING
 // ==========================================
 
 client.on("guildMemberAdd", async member => {
@@ -1929,10 +2001,6 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
         await sendWebhook(newMember.guild, embed);
     } catch (error) { console.error("guildMemberUpdate error:", error); }
 });
-
-// ==========================================
-// OTHER LOG EVENTS
-// ==========================================
 
 client.on("guildBanAdd", async ban => {
     try {
