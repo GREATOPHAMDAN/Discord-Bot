@@ -1,5 +1,5 @@
 // ==========================================
-// EAGLE COUNTY ROLEPLAY BOT - V.1.4
+// EAGLE COUNTY ROLEPLAY BOT - V.1.4.1
 // ==========================================
 
 const {
@@ -42,14 +42,17 @@ const DAILY_LIMIT = 15;
 const WEBHOOK_COLOR = 0x2563EB;
 const EMBED_ACCENT = 0xFF8C00;
 
-// Anti-nuke defaults
+// Anti-nuke
+const REJOIN_WATCH_MS = 24 * 60 * 60 * 1000;   // 24 hours
+const REJOIN_MUTE_MS = 24 * 60 * 60 * 1000;    // 24 hour timeout
+
 const DEFAULT_ANTINUKE = {
     enabled: true,
     threshold: 5,
     windowMs: 60000,
     whitelist: [],
-    // rolling per-user event timestamps
-    counters: {}
+    counters: {},
+    watchlist: {} // userId -> expiry timestamp
 };
 
 // ==========================================
@@ -85,7 +88,6 @@ const client = new Client({
 function createDefaultGuildConfig() {
     return {
         prefix: DEFAULT_PREFIX,
-
         logChannelId: null,
         verificationLogChannelId: null,
         transcriptChannelId: null,
@@ -163,14 +165,13 @@ function getGuildConfig(guildId) {
     for (const key of Object.keys(defaults)) {
         if (gc[key] === undefined) gc[key] = defaults[key];
     }
-    // Migrations
     if (gc.acceptRoleId && (!gc.acceptRoleIds || gc.acceptRoleIds.length === 0)) gc.acceptRoleIds = [gc.acceptRoleId];
     if (gc.ticketCategoryId && !gc.ticketSupportCategoryId) gc.ticketSupportCategoryId = gc.ticketCategoryId;
     if (gc.ticketCategoryHighRankId && !gc.ticketHighRankCategoryId) gc.ticketHighRankCategoryId = gc.ticketCategoryHighRankId;
-    // Ensure antinuke structure
     if (!gc.antinuke) gc.antinuke = JSON.parse(JSON.stringify(DEFAULT_ANTINUKE));
     if (!gc.antinuke.counters) gc.antinuke.counters = {};
     if (!Array.isArray(gc.antinuke.whitelist)) gc.antinuke.whitelist = [];
+    if (!gc.antinuke.watchlist) gc.antinuke.watchlist = {};
     return gc;
 }
 
@@ -206,9 +207,7 @@ function isStaff(member) {
     if (!member) return false;
     if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
     const gc = getGuildConfig(member.guild.id);
-    return hasRole(member, gc.adminRoles) ||
-           hasRole(member, gc.staffRoles) ||
-           hasRole(member, gc.managementRoles);
+    return hasRole(member, gc.adminRoles) || hasRole(member, gc.staffRoles) || hasRole(member, gc.managementRoles);
 }
 
 function isAdmin(member) {
@@ -325,41 +324,33 @@ async function sendWebhook(guild, embed) {
 
 async function lookupRobloxUser(username) {
     try {
-        const userResponse = await fetch("https://users.roblox.com/v1/usernames/users", {
+        const r = await fetch("https://users.roblox.com/v1/usernames/users", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ usernames: [username], excludeBannedUsers: false })
         });
-        if (!userResponse.ok) return null;
-        const userData = await userResponse.json();
-        if (!userData.data || userData.data.length === 0) return null;
-        const user = userData.data[0];
-        const userId = user.id;
-        const detailResponse = await fetch("https://users.roblox.com/v1/users/" + userId);
-        if (!detailResponse.ok) return null;
-        const details = await detailResponse.json();
+        if (!r.ok) return null;
+        const d = await r.json();
+        if (!d.data?.length) return null;
+        const userId = d.data[0].id;
+        const dr = await fetch("https://users.roblox.com/v1/users/" + userId);
+        if (!dr.ok) return null;
+        const details = await dr.json();
         let avatarUrl = null;
         try {
             const ar = await fetch("https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=" + userId + "&size=420x420&format=Png&isCircular=false");
             if (ar.ok) { const ad = await ar.json(); if (ad.data?.length) avatarUrl = ad.data[0].imageUrl; }
         } catch (e) {}
         return {
-            id: userId,
-            username: details.name,
-            displayName: details.displayName,
-            description: details.description || "",
-            created: details.created,
-            avatarUrl,
-            profileUrl: "https://www.roblox.com/users/" + userId + "/profile"
+            id: userId, username: details.name, displayName: details.displayName,
+            description: details.description || "", created: details.created,
+            avatarUrl, profileUrl: "https://www.roblox.com/users/" + userId + "/profile"
         };
-    } catch (error) {
-        console.error("Roblox lookup error:", error);
-        return null;
-    }
+    } catch (e) { console.error("Roblox:", e); return null; }
 }
 
 // ==========================================
-// ANTI-NUKE SYSTEM
+// ANTI-NUKE CORE
 // ==========================================
 
 async function fetchAuditExecutor(guild, eventType, targetId, withinMs = 15000) {
@@ -371,43 +362,94 @@ async function fetchAuditExecutor(guild, eventType, targetId, withinMs = 15000) 
             (!targetId || (e.target && e.target.id === targetId))
         );
         return entry?.executor || null;
-    } catch (e) {
-        return null;
-    }
+    } catch (e) { return null; }
 }
 
 function recordAntinukeEvent(guildId, userId) {
     const gc = getGuildConfig(guildId);
-    const counters = gc.antinuke.counters;
     const now = Date.now();
     const windowMs = gc.antinuke.windowMs || 60000;
-
-    if (!counters[userId]) counters[userId] = [];
-    counters[userId] = counters[userId].filter(t => now - t < windowMs);
-    counters[userId].push(now);
+    if (!gc.antinuke.counters[userId]) gc.antinuke.counters[userId] = [];
+    gc.antinuke.counters[userId] = gc.antinuke.counters[userId].filter(t => now - t < windowMs);
+    gc.antinuke.counters[userId].push(now);
     saveConfig();
-    return counters[userId].length;
+    return gc.antinuke.counters[userId].length;
+}
+
+/**
+ * Removes every role from a member (except @everyone).
+ * Also handles hierarchy: if a role is not manageable by the bot,
+ * it skips only THAT role but continues with the rest.
+ */
+async function stripAllRoles(member, reason) {
+    if (!member) return { removed: 0, failed: 0 };
+    const me = member.guild.members.me;
+
+    // Every role except @everyone
+    const allRoles = member.roles.cache.filter(r => r.id !== member.guild.id);
+
+    let removed = 0;
+    let failed = 0;
+
+    for (const role of allRoles.values()) {
+        const manageable = role.position < me.roles.highest.position && !role.managed;
+        if (!manageable) { failed++; continue; }
+        try {
+            await member.roles.remove(role, reason);
+            removed++;
+        } catch (e) {
+            failed++;
+            console.error("stripAllRoles remove fail:", role.name, e.message);
+        }
+    }
+
+    // Small delay to let Discord process
+    await new Promise(r => setTimeout(r, 500));
+
+    // Re-fetch to verify
+    try {
+        const fresh = await member.guild.members.fetch({ user: member.id, force: true });
+        const stillHas = fresh.roles.cache.filter(r => r.id !== member.guild.id);
+        if (stillHas.size > 0) {
+            console.warn("stripAllRoles: still has " + stillHas.size + " roles after strip:", stillHas.map(r => r.name).join(", "));
+        }
+    } catch (e) { /* ignore */ }
+
+    return { removed, failed };
 }
 
 async function triggerAntinuke(guild, member, trigger, count) {
     const gc = getGuildConfig(guild.id);
 
-    // Remove all punishable roles
-    const roles = member.roles.cache.filter(r => r.id !== guild.id && r.editable && r.position < guild.members.me.roles.highest.position);
-    let removed = 0;
-    for (const role of roles.values()) {
-        try { await member.roles.remove(role, "Anti-Nuke triggered"); removed++; }
-        catch (e) { console.error("anti-nuke role remove:", e); }
+    // 1) STRIP ALL ROLES
+    const { removed, failed } = await stripAllRoles(member, "Anti-Nuke: " + trigger);
+
+    // 2) KICK THE USER
+    let kicked = false;
+    try {
+        await member.kick("Anti-Nuke triggered: " + trigger);
+        kicked = true;
+    } catch (e) {
+        console.error("anti-nuke kick failed:", e.message);
     }
 
-    // Log to main channel + webhook
+    // 3) ADD TO 24h REJOIN WATCHLIST
+    const expiry = Date.now() + REJOIN_WATCH_MS;
+    gc.antinuke.watchlist[member.id] = expiry;
+    // Reset counter
+    gc.antinuke.counters[member.id] = [];
+    saveConfig();
+
+    // 4) LOG
     const logEmbed = new EmbedBuilder()
         .setTitle("🚨 ANTI-NUKE TRIGGERED")
         .setDescription(
             "**User:** " + member.user.tag + " (" + member.id + ")\n" +
             "**Trigger:** " + trigger + "\n" +
             "**Count in window:** " + count + "\n" +
-            "**Roles Removed:** " + removed
+            "**Roles Removed:** " + removed + (failed ? " (failed: " + failed + " — above my role)" : "") + "\n" +
+            "**Kicked:** " + (kicked ? "Yes" : "No (missing Kick Members?)") + "\n" +
+            "**Watchlist Expires:** <t:" + Math.floor(expiry / 1000) + ":R>"
         )
         .setColor(0xED4245)
         .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
@@ -416,7 +458,7 @@ async function triggerAntinuke(guild, member, trigger, count) {
     await sendLog(guild, logEmbed);
     await sendWebhook(guild, logEmbed);
 
-    // DM the offender
+    // 5) DM the offender
     try {
         await member.send({
             embeds: [
@@ -425,17 +467,17 @@ async function triggerAntinuke(guild, member, trigger, count) {
                     .setDescription(
                         "You triggered the anti-nuke protection in **" + guild.name + "**.\n\n" +
                         "**Trigger:** " + trigger + "\n" +
-                        "**Count:** " + count + "\n" +
-                        "**All of your roles have been removed.**\n\n" +
-                        "Contact the server owner if you believe this was a mistake."
+                        "**Count:** " + count + "\n\n" +
+                        "All of your roles were removed and you were kicked.\n" +
+                        "**If you rejoin within 24 hours, you will be instantly muted for 24 hours.**"
                     )
                     .setColor(0xED4245)
                     .setTimestamp()
             ]
-        });
+        }).catch(() => {});
     } catch (e) { /* DMs closed */ }
 
-    // DM the server owner
+    // 6) DM the owner
     try {
         const owner = await guild.fetchOwner();
         await owner.send({
@@ -446,19 +488,16 @@ async function triggerAntinuke(guild, member, trigger, count) {
                         "**User:** " + member.user.tag + " (" + member.id + ")\n" +
                         "**Trigger:** " + trigger + "\n" +
                         "**Count in window:** " + count + "\n" +
-                        "**Roles Removed:** " + removed + "\n\n" +
-                        "Review the situation and take further action if needed."
+                        "**Roles Removed:** " + removed + "\n" +
+                        "**Kicked:** " + (kicked ? "Yes" : "No") + "\n\n" +
+                        "The user is now on a **24-hour rejoin watch**. If they rejoin, they will be auto-muted for 24h."
                     )
                     .setColor(0xED4245)
                     .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
                     .setTimestamp()
             ]
-        });
+        }).catch(() => {});
     } catch (e) { /* owner DMs closed */ }
-
-    // Reset counter
-    gc.antinuke.counters[member.id] = [];
-    saveConfig();
 }
 
 async function handleAntinukeEvent(guild, userId, trigger) {
@@ -466,9 +505,8 @@ async function handleAntinukeEvent(guild, userId, trigger) {
         const gc = getGuildConfig(guild.id);
         if (!gc.antinuke.enabled) return;
         if (gc.antinuke.whitelist.includes(userId)) return;
-
-        // Always exempt the guild owner
         if (userId === guild.ownerId) return;
+        if (userId === client.user.id) return;
 
         const count = recordAntinukeEvent(guild.id, userId);
         if (count >= gc.antinuke.threshold) {
@@ -477,6 +515,97 @@ async function handleAntinukeEvent(guild, userId, trigger) {
             await triggerAntinuke(guild, member, trigger, count);
         }
     } catch (e) { console.error("handleAntinukeEvent:", e); }
+}
+
+// ==========================================
+// REJOIN WATCH CHECK
+// ==========================================
+
+async function checkRejoinWatch(member) {
+    try {
+        const gc = getGuildConfig(member.guild.id);
+        const expiry = gc.antinuke.watchlist[member.id];
+        if (!expiry) return false;
+
+        // Expired?
+        if (Date.now() > expiry) {
+            delete gc.antinuke.watchlist[member.id];
+            saveConfig();
+            return false;
+        }
+
+        // 1) Strip all roles again
+        const { removed } = await stripAllRoles(member, "Anti-Nuke rejoin watch");
+
+        // 2) Apply 24h timeout
+        let muted = false;
+        try {
+            await member.timeout(REJOIN_MUTE_MS, "Anti-Nuke: rejoined within 24h watch window");
+            muted = true;
+        } catch (e) {
+            console.error("rejoin mute failed:", e.message);
+        }
+
+        // 3) Log
+        const logEmbed = new EmbedBuilder()
+            .setTitle("🚨 Anti-Nuke Rejoin — Auto-Muted")
+            .setDescription(
+                "**User:** " + member.user.tag + " (" + member.id + ")\n" +
+                "**Action:** Roles stripped + 24h timeout applied\n" +
+                "**Roles Removed:** " + removed + "\n" +
+                "**Muted:** " + (muted ? "Yes" : "No (missing Moderate Members permission?)") + "\n" +
+                "**Watch Expires:** <t:" + Math.floor(expiry / 1000) + ":R>"
+            )
+            .setColor(0xED4245)
+            .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
+            .setTimestamp();
+
+        await sendLog(member.guild, logEmbed);
+        await sendWebhook(member.guild, logEmbed);
+
+        // 4) DM the offender
+        try {
+            await member.send({
+                embeds: [
+                    new EmbedBuilder()
+                        .setTitle("🔇 Auto-Muted (Anti-Nuke)")
+                        .setDescription(
+                            "You rejoined **" + member.guild.name + "** while on anti-nuke watch.\n\n" +
+                            "You have been **muted for 24 hours** and all roles have been removed.\n" +
+                            "Contact the server owner if you believe this is a mistake."
+                        )
+                        .setColor(0xED4245)
+                        .setTimestamp()
+                ]
+            }).catch(() => {});
+        } catch (e) { /* ignore */ }
+
+        // 5) DM owner
+        try {
+            const owner = await member.guild.fetchOwner();
+            await owner.send({
+                embeds: [
+                    new EmbedBuilder()
+                        .setTitle("⚠️ Anti-Nuke Watch Triggered")
+                        .setDescription(
+                            "**" + member.user.tag + "** rejoined within the 24h anti-nuke watch window.\n\n" +
+                            "**Action taken:**\n" +
+                            "• Roles stripped (" + removed + " removed)\n" +
+                            "• 24-hour timeout applied\n" +
+                            "• Watch still active until <t:" + Math.floor(expiry / 1000) + ":R>"
+                        )
+                        .setColor(0xED4245)
+                        .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
+                        .setTimestamp()
+                ]
+            }).catch(() => {});
+        } catch (e) { /* ignore */ }
+
+        return true;
+    } catch (e) {
+        console.error("checkRejoinWatch:", e);
+        return false;
+    }
 }
 
 // ==========================================
@@ -489,9 +618,8 @@ function getSlashCommands() {
         new SlashCommandBuilder().setName("help").setDescription("Show bot commands"),
         new SlashCommandBuilder().setName("setprefix").setDescription("Set the server prefix")
             .addStringOption(o => o.setName("prefix").setDescription("New prefix").setRequired(true).setMaxLength(5)),
-
-        new SlashCommandBuilder().setName("setupverify").setDescription("Post the Roblox verification panel in this channel"),
-        new SlashCommandBuilder().setName("setuptickets").setDescription("Post the ticket panel in this channel"),
+        new SlashCommandBuilder().setName("setupverify").setDescription("Post the Roblox verification panel"),
+        new SlashCommandBuilder().setName("setuptickets").setDescription("Post the ticket panel"),
 
         new SlashCommandBuilder().setName("set-webhook").setDescription("Set the log webhook URL")
             .addStringOption(o => o.setName("url").setDescription("Discord webhook URL").setRequired(true)),
@@ -556,18 +684,20 @@ function getSlashCommands() {
             .addStringOption(o => o.setName("punishment").setDescription("Punishment type").setRequired(true))
             .addStringOption(o => o.setName("reason").setDescription("Reason").setRequired(true)),
 
-        // ---- Anti-Nuke admin commands ----
         new SlashCommandBuilder().setName("antinuke").setDescription("Anti-Nuke settings")
             .addSubcommand(s => s.setName("status").setDescription("Show anti-nuke status"))
             .addSubcommand(s => s.setName("enable").setDescription("Enable anti-nuke"))
             .addSubcommand(s => s.setName("disable").setDescription("Disable anti-nuke"))
             .addSubcommand(s => s.setName("threshold").setDescription("Set trigger threshold")
-                .addIntegerOption(o => o.setName("count").setDescription("Trigger after this many events (default 5)").setRequired(true).setMinValue(2).setMaxValue(20)))
+                .addIntegerOption(o => o.setName("count").setDescription("Trigger after this many events (2-20)").setRequired(true).setMinValue(2).setMaxValue(20)))
             .addSubcommand(s => s.setName("whitelist-add").setDescription("Add user to anti-nuke whitelist")
                 .addUserOption(o => o.setName("user").setDescription("User").setRequired(true)))
             .addSubcommand(s => s.setName("whitelist-remove").setDescription("Remove user from whitelist")
                 .addUserOption(o => o.setName("user").setDescription("User").setRequired(true)))
             .addSubcommand(s => s.setName("whitelist-list").setDescription("List whitelisted users"))
+            .addSubcommand(s => s.setName("watchlist").setDescription("Show users on 24h rejoin watch"))
+            .addSubcommand(s => s.setName("unwatch").setDescription("Remove a user from the rejoin watch")
+                .addUserOption(o => o.setName("user").setDescription("User").setRequired(true)))
             .addSubcommand(s => s.setName("reset").setDescription("Reset all counters"))
     ];
     return commands.map(c => c.toJSON());
@@ -595,7 +725,18 @@ client.once("ready", async () => {
         getGuildConfig(guild.id);
         await registerCommands(guild);
     }
-    client.user.setActivity("Eagle County Roleplay | V.1.4");
+    client.user.setActivity("Eagle County Roleplay | V.1.4.1");
+
+    // Cleanup expired watchlist entries
+    for (const guild of client.guilds.cache.values()) {
+        const gc = getGuildConfig(guild.id);
+        const now = Date.now();
+        let changed = false;
+        for (const [uid, expiry] of Object.entries(gc.antinuke.watchlist)) {
+            if (now > expiry) { delete gc.antinuke.watchlist[uid]; changed = true; }
+        }
+        if (changed) saveConfig();
+    }
 });
 
 client.on("guildCreate", async guild => {
@@ -632,7 +773,7 @@ async function tryDM(user, embed) {
 }
 
 // ==========================================
-// SETUP MENU  (V.1.4)
+// SETUP MENU
 // ==========================================
 
 function fmtCh(gc, key) { const id = gc[key]; return id ? "<#" + id + ">" : "❌ Not set"; }
@@ -642,19 +783,10 @@ function fmtRoleList(arr) { return (!arr || !arr.length) ? "❌ None" : arr.map(
 function buildSetupEmbed(guild) {
     const gc = getGuildConfig(guild.id);
     const an = gc.antinuke;
+    const watchCount = Object.keys(an.watchlist).filter(uid => an.watchlist[uid] > Date.now()).length;
     return new EmbedBuilder()
-        .setTitle("⚙️ " + guild.name + " — Setup Menu (V.1.4)")
-        .setDescription(
-            "Use the buttons below to configure the bot.\n\n" +
-            "**Sections:**\n" +
-            "📁 **Channels** — logs, welcome, tickets\n" +
-            "🎭 **Role Tiers** — Staff / Admin / Management / Exempt\n" +
-            "🎫 **Tickets** — categories + ping roles\n" +
-            "✉️ **DM Templates** — messages on accept/promote/demote/infract\n" +
-            "🛡️ **Anti-Nuke** — protect the server from nukers\n" +
-            "🔤 **Prefix** & 🔗 **Webhook** — general settings\n" +
-            "📌 **Post Panels** — post verify/ticket panels"
-        )
+        .setTitle("⚙️ " + guild.name + " — Setup Menu (V.1.4.1)")
+        .setDescription("Use the buttons below to configure the bot.")
         .setColor(WEBHOOK_COLOR)
         .setThumbnail(guild.iconURL({ dynamic: true, size: 256 }))
         .addFields(
@@ -704,12 +836,13 @@ function buildSetupEmbed(guild) {
                 value: [
                     "**Enabled:** " + (an.enabled ? "Yes" : "No"),
                     "**Threshold:** " + an.threshold + " events / " + Math.floor(an.windowMs / 1000) + "s",
-                    "**Whitelisted Users:** " + an.whitelist.length
+                    "**Whitelisted:** " + an.whitelist.length,
+                    "**On 24h Rejoin Watch:** " + watchCount
                 ].join("\n"),
                 inline: false
             }
         )
-        .setFooter({ text: "V.1.4 • " + guild.name, iconURL: guild.iconURL({ dynamic: true }) || undefined })
+        .setFooter({ text: "V.1.4.1 • " + guild.name, iconURL: guild.iconURL({ dynamic: true }) || undefined })
         .setTimestamp();
 }
 
@@ -819,9 +952,10 @@ function buildAntinukeMenuRows() {
         new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId("setup_an_unwhitelist").setLabel("Unwhitelist User").setEmoji("❌").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_an_list").setLabel("Show Whitelist").setEmoji("📋").setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId("setup_an_reset").setLabel("Reset Counters").setEmoji("♻️").setStyle(ButtonStyle.Danger)
+            new ButtonBuilder().setCustomId("setup_an_watchlist").setLabel("Show Watchlist").setEmoji("👁️").setStyle(ButtonStyle.Secondary)
         ),
         new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("setup_an_reset").setLabel("Reset Counters").setEmoji("♻️").setStyle(ButtonStyle.Danger),
             new ButtonBuilder().setCustomId("setup_back").setLabel("Back to Menu").setEmoji("◀️").setStyle(ButtonStyle.Danger)
         )
     ];
@@ -836,97 +970,47 @@ async function updateSetupMessage(interaction, view) {
     const gc = getGuildConfig(guild.id);
     let embed, rows;
 
-    if (view === "main") {
-        embed = buildSetupEmbed(guild);
-        rows = buildSetupRows();
-    } else if (view === "channels") {
-        embed = new EmbedBuilder()
-            .setTitle("📁 Channel Configuration")
-            .setDescription(
-                "**Main Log** — all general events\n" +
-                "**Verification Log** — Roblox verifications only\n" +
-                "**Transcript Channel** — ticket transcripts\n" +
-                "**Welcome** — welcome messages\n" +
-                "**Suggestions** — /suggest posts\n" +
-                "**Staff Feedback** — /staff-feedback posts\n" +
-                "**Staff Log** — punishments/actions\n" +
-                "**HR Log** — accept/promote/demote/infract\n" +
-                "**Verify Panel Ch** — where verify panel is posted\n" +
-                "**Ticket Log** — ticket open/close events"
-            )
-            .setColor(WEBHOOK_COLOR)
-            .setThumbnail(guild.iconURL({ dynamic: true }))
-            .setTimestamp();
+    if (view === "main") { embed = buildSetupEmbed(guild); rows = buildSetupRows(); }
+    else if (view === "channels") {
+        embed = new EmbedBuilder().setTitle("📁 Channel Configuration")
+            .setDescription("**Main Log** — all events\n**Verification Log** — verifications\n**Transcript Channel** — ticket transcripts\n**Welcome** — welcome messages\n**Suggestions** — /suggest\n**Staff Feedback** — /staff-feedback\n**Staff Log** — punishments\n**HR Log** — accept/promote/demote/infract\n**Verify Panel Ch** — verify panel\n**Ticket Log** — ticket events")
+            .setColor(WEBHOOK_COLOR).setThumbnail(guild.iconURL({ dynamic: true })).setTimestamp();
         rows = buildChannelsMenuRows();
     } else if (view === "roles") {
-        embed = new EmbedBuilder()
-            .setTitle("🎭 Role Tiers")
-            .setDescription(
-                "**Staff** — basic staff (mute/kick)\n" +
-                "**Admin** — full admin (ban, config)\n" +
-                "**Management** ⭐ — highest tier, pinged on High Rank tickets\n" +
-                "**Exempt** — cannot be moderated\n" +
-                "**Verify Role** — auto-given on Roblox verification\n" +
-                "**Accept Roles** — given when a user is accepted"
-            )
-            .setColor(WEBHOOK_COLOR)
-            .setThumbnail(guild.iconURL({ dynamic: true }))
-            .setTimestamp();
+        embed = new EmbedBuilder().setTitle("🎭 Role Tiers")
+            .setDescription("**Staff** — basic staff\n**Admin** — full admin\n**Management** ⭐ — highest tier, pinged on High Rank tickets\n**Exempt** — cannot be moderated\n**Verify Role** — auto-given on verify\n**Accept Roles** — given on accept")
+            .setColor(WEBHOOK_COLOR).setThumbnail(guild.iconURL({ dynamic: true })).setTimestamp();
         rows = buildRolesMenuRows();
     } else if (view === "tickets") {
-        embed = new EmbedBuilder()
-            .setTitle("🎫 Ticket Configuration")
-            .setDescription(
-                "**Support Tickets** — go to Support category, ping Support Ping Role\n" +
-                "**High Rank Tickets** — go to High Rank category, ping High Rank Ping Role **plus Management roles**\n\n" +
-                "**Current:**\n" +
-                "• Support Category: " + (gc.ticketSupportCategoryId ? "<#" + gc.ticketSupportCategoryId + ">" : "❌") + "\n" +
-                "• Support Ping: " + fmtRole(gc, "ticketSupportPingRoleId") + "\n" +
-                "• High Rank Category: " + (gc.ticketHighRankCategoryId ? "<#" + gc.ticketHighRankCategoryId + ">" : "❌") + "\n" +
-                "• High Rank Ping: " + fmtRole(gc, "ticketHighRankPingRoleId") + "\n" +
-                "• Management: " + fmtRoleList(gc.managementRoles)
-            )
-            .setColor(WEBHOOK_COLOR)
-            .setThumbnail(guild.iconURL({ dynamic: true }))
-            .setTimestamp();
+        embed = new EmbedBuilder().setTitle("🎫 Ticket Configuration")
+            .setDescription("**Support:** Support Category + Support Ping Role\n**High Rank:** High Rank Category + High Rank Ping Role (Management always pinged)")
+            .setColor(WEBHOOK_COLOR).setThumbnail(guild.iconURL({ dynamic: true })).setTimestamp();
         rows = buildTicketsMenuRows();
     } else if (view === "templates") {
-        embed = new EmbedBuilder()
-            .setTitle("✉️ DM Templates")
-            .setDescription(
-                "**Variables:** `{server}` `{rank}` `{type}` `{reason}` `{notes}`\n\n" +
-                "**Accept:**\n" + gc.dmTemplates.accept + "\n\n" +
-                "**Promote:**\n" + gc.dmTemplates.promote + "\n\n" +
-                "**Demote:**\n" + gc.dmTemplates.demote + "\n\n" +
-                "**Infract:**\n" + gc.dmTemplates.infract + "\n\n" +
-                "_Click a button below to edit the template._"
-            )
-            .setColor(WEBHOOK_COLOR)
-            .setTimestamp();
+        embed = new EmbedBuilder().setTitle("✉️ DM Templates")
+            .setDescription("**Variables:** `{server}` `{rank}` `{type}` `{reason}` `{notes}`\n\n**Accept:**\n" + gc.dmTemplates.accept + "\n\n**Promote:**\n" + gc.dmTemplates.promote + "\n\n**Demote:**\n" + gc.dmTemplates.demote + "\n\n**Infract:**\n" + gc.dmTemplates.infract)
+            .setColor(WEBHOOK_COLOR).setTimestamp();
         rows = buildTemplatesMenuRows();
     } else if (view === "antinuke") {
         const an = gc.antinuke;
-        embed = new EmbedBuilder()
-            .setTitle("🛡️ Anti-Nuke Settings")
+        embed = new EmbedBuilder().setTitle("🛡️ Anti-Nuke Settings")
             .setDescription(
                 "**What it does:**\n" +
-                "If a user deletes more than **" + an.threshold + "** channels / roles, kicks, or bans **" + an.threshold + "** members within **" + Math.floor(an.windowMs / 1000) + " seconds**, the bot:\n" +
-                "> 1. Removes **all of their roles**\n" +
-                "> 2. **DMs them** with a warning\n" +
-                "> 3. **DMs the server owner** with full details\n" +
-                "> 4. Logs to the main log channel and webhook\n\n" +
-                "**Current Settings:**\n" +
-                "• Enabled: " + (an.enabled ? "✅ Yes" : "❌ No") + "\n" +
-                "• Threshold: **" + an.threshold + "** events\n" +
+                "If a user deletes more than **" + an.threshold + "** channels/roles, kicks, or bans **" + an.threshold + "** members within **" + Math.floor(an.windowMs / 1000) + "s**, the bot:\n" +
+                "> 1. Removes **every role** from the user (except @everyone)\n" +
+                "> 2. **Kicks** the user\n" +
+                "> 3. **24-hour rejoin watch** — if they rejoin, roles stripped + **24h mute**\n" +
+                "> 4. DMs the offender + server owner\n" +
+                "> 5. Logs to main log + webhook\n\n" +
+                "**Current:**\n" +
+                "• Enabled: " + (an.enabled ? "✅" : "❌") + "\n" +
+                "• Threshold: **" + an.threshold + "**\n" +
                 "• Window: **" + Math.floor(an.windowMs / 1000) + "s**\n" +
-                "• Whitelisted Users: **" + an.whitelist.length + "**"
+                "• Whitelisted: **" + an.whitelist.length + "**"
             )
-            .setColor(0xED4245)
-            .setThumbnail(guild.iconURL({ dynamic: true }))
-            .setTimestamp();
+            .setColor(0xED4245).setThumbnail(guild.iconURL({ dynamic: true })).setTimestamp();
         rows = buildAntinukeMenuRows();
     }
-
     await interaction.update({ embeds: [embed], components: rows });
 }
 
@@ -941,20 +1025,16 @@ client.on("interactionCreate", async interaction => {
         if (interaction.isStringSelectMenu() || interaction.isChannelSelectMenu() || interaction.isRoleSelectMenu() || interaction.isUserSelectMenu()) {
             return handleSelect(interaction);
         }
-
         if (!interaction.isChatInputCommand()) return;
         const guild = interaction.guild;
         if (!guild) return;
         const gc = getGuildConfig(guild.id);
         const command = interaction.commandName;
 
-        // ---------- /setup ----------
         if (command === "setup") {
             if (!isAdmin(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Admin only.")], ephemeral: true });
             return interaction.reply({ embeds: [buildSetupEmbed(guild)], components: buildSetupRows(), ephemeral: true });
         }
-
-        // ---------- /setprefix ----------
         if (command === "setprefix") {
             if (!isAdmin(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Admin only.")], ephemeral: true });
             const prefix = interaction.options.getString("prefix");
@@ -962,24 +1042,17 @@ client.on("interactionCreate", async interaction => {
             gc.prefix = prefix; saveConfig();
             return interaction.reply({ embeds: [createSuccessEmbed("Prefix set to `" + prefix + "`.")] });
         }
-
-        // ---------- /setupverify ----------
         if (command === "setupverify") {
             if (!isAdmin(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Admin only.")], ephemeral: true });
-            gc.verifyChannelId = interaction.channel.id;
-            saveConfig();
+            gc.verifyChannelId = interaction.channel.id; saveConfig();
             await interaction.channel.send({ embeds: [buildVerifyEmbed(guild)], components: buildVerifyRows() });
             return interaction.reply({ embeds: [createSuccessEmbed("Verification panel posted.")], ephemeral: true });
         }
-
-        // ---------- /setuptickets ----------
         if (command === "setuptickets") {
             if (!isAdmin(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Admin only.")], ephemeral: true });
             await interaction.channel.send({ embeds: [buildTicketPanelEmbed(guild)], components: buildTicketPanelRows() });
             return interaction.reply({ embeds: [createSuccessEmbed("Ticket panel posted.")], ephemeral: true });
         }
-
-        // ---------- Webhook ----------
         if (command === "set-webhook") {
             if (!isAdmin(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Admin only.")], ephemeral: true });
             const url = interaction.options.getString("url");
@@ -992,30 +1065,13 @@ client.on("interactionCreate", async interaction => {
             gc.webhookUrl = null; saveConfig();
             return interaction.reply({ embeds: [createSuccessEmbed("Removed.")], ephemeral: true });
         }
-
-        // ---------- /acceptsetup ----------
         if (command === "acceptsetup") {
             if (!isAdmin(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Admin only.")], ephemeral: true });
             const sub = interaction.options.getSubcommand();
-            if (sub === "add") {
-                const role = interaction.options.getRole("role");
-                if (!gc.acceptRoleIds.includes(role.id)) gc.acceptRoleIds.push(role.id);
-                saveConfig();
-                return interaction.reply({ embeds: [createSuccessEmbed(role + " added.")] });
-            }
-            if (sub === "remove") {
-                const role = interaction.options.getRole("role");
-                gc.acceptRoleIds = gc.acceptRoleIds.filter(id => id !== role.id);
-                saveConfig();
-                return interaction.reply({ embeds: [createSuccessEmbed("Removed.")] });
-            }
-            if (sub === "list") {
-                return interaction.reply({ embeds: [createInfoEmbed("**Accept Roles:** " + fmtRoleList(gc.acceptRoleIds))], ephemeral: true });
-            }
-            if (sub === "clear") {
-                gc.acceptRoleIds = []; saveConfig();
-                return interaction.reply({ embeds: [createSuccessEmbed("Cleared.")] });
-            }
+            if (sub === "add") { const role = interaction.options.getRole("role"); if (!gc.acceptRoleIds.includes(role.id)) gc.acceptRoleIds.push(role.id); saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed(role + " added.")] }); }
+            if (sub === "remove") { const role = interaction.options.getRole("role"); gc.acceptRoleIds = gc.acceptRoleIds.filter(id => id !== role.id); saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed("Removed.")] }); }
+            if (sub === "list") return interaction.reply({ embeds: [createInfoEmbed("**Accept Roles:** " + fmtRoleList(gc.acceptRoleIds))], ephemeral: true });
+            if (sub === "clear") { gc.acceptRoleIds = []; saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed("Cleared.")] }); }
         }
 
         // ---------- /antinuke ----------
@@ -1023,46 +1079,37 @@ client.on("interactionCreate", async interaction => {
             if (!isAdmin(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Admin only.")], ephemeral: true });
             const sub = interaction.options.getSubcommand();
             const an = gc.antinuke;
+
             if (sub === "status") {
+                const watchCount = Object.keys(an.watchlist).filter(uid => an.watchlist[uid] > Date.now()).length;
                 const embed = new EmbedBuilder().setTitle("🛡️ Anti-Nuke Status").setColor(WEBHOOK_COLOR)
                     .addFields(
                         { name: "Enabled", value: an.enabled ? "✅" : "❌", inline: true },
                         { name: "Threshold", value: String(an.threshold), inline: true },
                         { name: "Window", value: Math.floor(an.windowMs / 1000) + "s", inline: true },
-                        { name: "Whitelist", value: an.whitelist.length ? an.whitelist.map(id => "<@" + id + ">").join(", ") : "None", inline: false }
+                        { name: "Whitelist", value: an.whitelist.length ? an.whitelist.map(id => "<@" + id + ">").join(", ") : "None", inline: false },
+                        { name: "24h Rejoin Watch", value: String(watchCount) + " user(s)", inline: true }
                     );
                 return interaction.reply({ embeds: [embed], ephemeral: true });
             }
             if (sub === "enable") { an.enabled = true; saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed("Anti-Nuke enabled.")] }); }
             if (sub === "disable") { an.enabled = false; saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed("Anti-Nuke disabled.")] }); }
-            if (sub === "threshold") {
-                const count = interaction.options.getInteger("count");
-                an.threshold = count; saveConfig();
-                return interaction.reply({ embeds: [createSuccessEmbed("Threshold set to **" + count + "** events.")] });
+            if (sub === "threshold") { const count = interaction.options.getInteger("count"); an.threshold = count; saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed("Threshold set to **" + count + "**.")] }); }
+            if (sub === "whitelist-add") { const user = interaction.options.getUser("user"); if (!an.whitelist.includes(user.id)) an.whitelist.push(user.id); saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed(user.tag + " whitelisted.")] }); }
+            if (sub === "whitelist-remove") { const user = interaction.options.getUser("user"); an.whitelist = an.whitelist.filter(id => id !== user.id); saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed("Removed.")] }); }
+            if (sub === "whitelist-list") { const list = an.whitelist.length ? an.whitelist.map(id => "<@" + id + ">").join(", ") : "None"; return interaction.reply({ embeds: [createInfoEmbed("**Whitelisted:** " + list)], ephemeral: true }); }
+            if (sub === "watchlist") {
+                const now = Date.now();
+                const entries = Object.entries(an.watchlist).filter(([, e]) => e > now);
+                if (!entries.length) return interaction.reply({ embeds: [createInfoEmbed("No users on 24h rejoin watch.")], ephemeral: true });
+                const lines = entries.map(([uid, e]) => "• <@" + uid + "> — expires <t:" + Math.floor(e / 1000) + ":R>");
+                return interaction.reply({ embeds: [createInfoEmbed("**On Rejoin Watch:**\n" + lines.join("\n"))], ephemeral: true });
             }
-            if (sub === "whitelist-add") {
-                const user = interaction.options.getUser("user");
-                if (!an.whitelist.includes(user.id)) an.whitelist.push(user.id);
-                saveConfig();
-                return interaction.reply({ embeds: [createSuccessEmbed(user.tag + " whitelisted.")] });
-            }
-            if (sub === "whitelist-remove") {
-                const user = interaction.options.getUser("user");
-                an.whitelist = an.whitelist.filter(id => id !== user.id);
-                saveConfig();
-                return interaction.reply({ embeds: [createSuccessEmbed(user.tag + " removed from whitelist.")] });
-            }
-            if (sub === "whitelist-list") {
-                const list = an.whitelist.length ? an.whitelist.map(id => "<@" + id + ">").join(", ") : "None";
-                return interaction.reply({ embeds: [createInfoEmbed("**Whitelisted:** " + list)], ephemeral: true });
-            }
-            if (sub === "reset") {
-                an.counters = {}; saveConfig();
-                return interaction.reply({ embeds: [createSuccessEmbed("All counters reset.")] });
-            }
+            if (sub === "unwatch") { const user = interaction.options.getUser("user"); delete an.watchlist[user.id]; saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed(user.tag + " removed from watch.")] }); }
+            if (sub === "reset") { an.counters = {}; saveConfig(); return interaction.reply({ embeds: [createSuccessEmbed("Counters reset.")] }); }
         }
 
-        // ---------- /accept ----------
+        // ---------- HR ----------
         if (command === "accept") {
             if (!isStaff(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Staff only.")], ephemeral: true });
             const targetUser = interaction.options.getUser("user");
@@ -1071,24 +1118,20 @@ client.on("interactionCreate", async interaction => {
             let roleGiven = 0;
             if (gc.acceptRoleIds.length) {
                 const member = await guild.members.fetch(targetUser.id).catch(() => null);
-                if (member) for (const rid of gc.acceptRoleIds) {
-                    try { await member.roles.add(rid, "Accepted"); roleGiven++; } catch (e) {}
-                }
+                if (member) for (const rid of gc.acceptRoleIds) { try { await member.roles.add(rid, "Accepted"); roleGiven++; } catch (e) {} }
             }
             const dmSent = await tryDM(targetUser, buildTemplateDM(guild, "accept", { notes: notes || "" }));
             const logEmbed = new EmbedBuilder().setTitle("Application Accepted").setColor(0x57F287)
                 .addFields(
                     { name: "User", value: targetUser.tag + " (" + targetUser.id + ")", inline: false },
-                    { name: "Accepted By", value: interaction.user.tag, inline: true },
-                    { name: "Roles Given", value: roleGiven > 0 ? String(roleGiven) : "None", inline: true },
+                    { name: "By", value: interaction.user.tag, inline: true },
+                    { name: "Roles", value: String(roleGiven), inline: true },
                     { name: "DM Sent", value: dmSent ? "Yes" : "No", inline: true }
                 ).setTimestamp();
             if (notes) logEmbed.addFields({ name: "Notes", value: notes.slice(0, 1024) });
             await sendHRLog(guild, logEmbed); await sendLog(guild, logEmbed); await sendWebhook(guild, logEmbed);
-            return interaction.editReply({ embeds: [createSuccessEmbed("**" + targetUser.tag + "** accepted.")] });
+            return interaction.editReply({ embeds: [createSuccessEmbed(targetUser.tag + " accepted.")] });
         }
-
-        // ---------- /promote ----------
         if (command === "promote") {
             if (!isStaff(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Staff only.")], ephemeral: true });
             const targetUser = interaction.options.getUser("user");
@@ -1101,14 +1144,12 @@ client.on("interactionCreate", async interaction => {
                     { name: "User", value: targetUser.tag + " (" + targetUser.id + ")", inline: false },
                     { name: "New Rank", value: rank, inline: true },
                     { name: "By", value: interaction.user.tag, inline: true },
-                    { name: "DM Sent", value: dmSent ? "Yes" : "No", inline: true }
+                    { name: "DM", value: dmSent ? "Yes" : "No", inline: true }
                 ).setTimestamp();
             if (notes) logEmbed.addFields({ name: "Notes", value: notes.slice(0, 1024) });
             await sendHRLog(guild, logEmbed); await sendLog(guild, logEmbed); await sendWebhook(guild, logEmbed);
-            return interaction.editReply({ embeds: [createSuccessEmbed("**" + targetUser.tag + "** promoted to **" + rank + "**.")] });
+            return interaction.editReply({ embeds: [createSuccessEmbed(targetUser.tag + " promoted to **" + rank + "**.")] });
         }
-
-        // ---------- /demote ----------
         if (command === "demote") {
             if (!isStaff(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Staff only.")], ephemeral: true });
             const targetUser = interaction.options.getUser("user");
@@ -1121,14 +1162,12 @@ client.on("interactionCreate", async interaction => {
                     { name: "User", value: targetUser.tag + " (" + targetUser.id + ")", inline: false },
                     { name: "New Rank", value: rank, inline: true },
                     { name: "By", value: interaction.user.tag, inline: true },
-                    { name: "DM Sent", value: dmSent ? "Yes" : "No", inline: true }
+                    { name: "DM", value: dmSent ? "Yes" : "No", inline: true }
                 ).setTimestamp();
             if (notes) logEmbed.addFields({ name: "Notes", value: notes.slice(0, 1024) });
             await sendHRLog(guild, logEmbed); await sendLog(guild, logEmbed); await sendWebhook(guild, logEmbed);
-            return interaction.editReply({ embeds: [createSuccessEmbed("**" + targetUser.tag + "** demoted.")] });
+            return interaction.editReply({ embeds: [createSuccessEmbed(targetUser.tag + " demoted.")] });
         }
-
-        // ---------- /infract ----------
         if (command === "infract") {
             if (!isStaff(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Staff only.")], ephemeral: true });
             const targetUser = interaction.options.getUser("user");
@@ -1143,12 +1182,12 @@ client.on("interactionCreate", async interaction => {
                     { name: "User", value: targetUser.tag + " (" + targetUser.id + ")", inline: false },
                     { name: "Type", value: type, inline: true },
                     { name: "By", value: interaction.user.tag, inline: true },
-                    { name: "DM Sent", value: dmSent ? "Yes" : "No", inline: true },
+                    { name: "DM", value: dmSent ? "Yes" : "No", inline: true },
                     { name: "Reason", value: reason, inline: false }
                 ).setTimestamp();
             if (notes) logEmbed.addFields({ name: "Notes", value: notes.slice(0, 1024) });
             await sendHRLog(guild, logEmbed); await sendLog(guild, logEmbed); await sendWebhook(guild, logEmbed);
-            return interaction.editReply({ embeds: [createSuccessEmbed("**" + targetUser.tag + "** infracted: **" + type + "**.")] });
+            return interaction.editReply({ embeds: [createSuccessEmbed(targetUser.tag + " infracted.")] });
         }
 
         // ---------- Moderation ----------
@@ -1224,7 +1263,6 @@ client.on("interactionCreate", async interaction => {
             } catch (e) { return interaction.reply({ embeds: [createErrorEmbed("Failed.")], ephemeral: true }); }
         }
 
-        // ---------- /loguser ----------
         if (command === "loguser") {
             if (!isStaff(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Staff only.")], ephemeral: true });
             const username = interaction.options.getString("username");
@@ -1245,7 +1283,6 @@ client.on("interactionCreate", async interaction => {
             return interaction.editReply({ embeds: [createSuccessEmbed("Recorded.")] });
         }
 
-        // ---------- /suggest ----------
         if (command === "suggest") {
             if (!gc.suggestionChannelId) return interaction.reply({ embeds: [createErrorEmbed("Suggestions channel not set.")], ephemeral: true });
             const suggestion = interaction.options.getString("suggestion");
@@ -1259,7 +1296,6 @@ client.on("interactionCreate", async interaction => {
             return interaction.editReply({ embeds: [createSuccessEmbed("Submitted!")] });
         }
 
-        // ---------- /staff-feedback ----------
         if (command === "staff-feedback") {
             if (!gc.staffFeedbackChannelId) return interaction.reply({ embeds: [createErrorEmbed("Staff feedback channel not set.")], ephemeral: true });
             const staffMember = interaction.options.getUser("staff");
@@ -1274,14 +1310,13 @@ client.on("interactionCreate", async interaction => {
             return interaction.editReply({ embeds: [createSuccessEmbed("Submitted!")] });
         }
 
-        // ---------- /help ----------
         if (command === "help") {
             const prefix = getPrefix(guild.id);
-            const embed = new EmbedBuilder().setTitle(guild.name + " — Bot Commands V.1.4")
+            const embed = new EmbedBuilder().setTitle(guild.name + " — Bot Commands V.1.4.1")
                 .setColor(WEBHOOK_COLOR).setThumbnail(guild.iconURL({ dynamic: true }))
                 .addFields(
                     { name: "Setup", value: ["`/setup`", "`/setupverify`", "`/setuptickets`"].join("\n") },
-                    { name: "Anti-Nuke", value: ["`/antinuke status`", "`/antinuke enable|disable`", "`/antinuke threshold <count>`", "`/antinuke whitelist-add|remove|list`", "`/antinuke reset`"].join("\n") },
+                    { name: "Anti-Nuke", value: ["`/antinuke status`", "`/antinuke enable|disable`", "`/antinuke threshold <n>`", "`/antinuke whitelist-add|remove|list`", "`/antinuke watchlist`", "`/antinuke unwatch <user>`", "`/antinuke reset`"].join("\n") },
                     { name: "HR", value: ["`/acceptsetup`", "`/accept`", "`/promote`", "`/demote`", "`/infract`"].join("\n") },
                     { name: "Moderation", value: ["`/mute`", "`/unmute`", "`/kick`", "`/ban`", "`/unban`"].join("\n") },
                     { name: "Other", value: ["`/suggest`", "`/staff-feedback`", "`/loguser`", "`" + prefix + "loguser`"].join("\n") }
@@ -1307,7 +1342,6 @@ async function handleButton(interaction) {
     const guild = interaction.guild;
     const gc = getGuildConfig(guild.id);
 
-    // ---- NAV ----
     if (id === "setup_back") return updateSetupMessage(interaction, "main");
     if (id === "setup_channels") return updateSetupMessage(interaction, "channels");
     if (id === "setup_roles") return updateSetupMessage(interaction, "roles");
@@ -1315,7 +1349,6 @@ async function handleButton(interaction) {
     if (id === "setup_dm_templates") return updateSetupMessage(interaction, "templates");
     if (id === "setup_antinuke") return updateSetupMessage(interaction, "antinuke");
 
-    // ---- PREFIX / WEBHOOK MODALS ----
     if (id === "setup_prefix") {
         const modal = new ModalBuilder().setCustomId("modal_prefix").setTitle("Set Prefix");
         modal.addComponents(new ActionRowBuilder().addComponents(
@@ -1331,7 +1364,6 @@ async function handleButton(interaction) {
         return interaction.showModal(modal);
     }
 
-    // ---- CHANNELS ----
     const channelMap = {
         setup_ch_log: { key: "logChannelId", name: "Main Log" },
         setup_ch_verifylog: { key: "verificationLogChannelId", name: "Verification Log" },
@@ -1346,129 +1378,71 @@ async function handleButton(interaction) {
     };
     if (channelMap[id]) {
         const cfg = channelMap[id];
-        const select = new ChannelSelectMenuBuilder()
-            .setCustomId("select_channel_" + cfg.key)
-            .setPlaceholder("Pick a channel for: " + cfg.name)
-            .setChannelTypes([ChannelType.GuildText, ChannelType.GuildAnnouncement]);
         return interaction.update({
             embeds: [createInfoEmbed("Choose a channel for **" + cfg.name + "**:")],
-            components: [new ActionRowBuilder().addComponents(select)]
+            components: [new ActionRowBuilder().addComponents(
+                new ChannelSelectMenuBuilder().setCustomId("select_channel_" + cfg.key).setPlaceholder("Pick a channel").setChannelTypes([ChannelType.GuildText, ChannelType.GuildAnnouncement])
+            )]
         });
     }
 
-    // ---- ROLES ----
     const roleMap = {
-        setup_role_staff: { key: "staffRoles", name: "Staff Roles", multi: true },
-        setup_role_admin: { key: "adminRoles", name: "Admin Roles", multi: true },
-        setup_role_management: { key: "managementRoles", name: "Management Roles", multi: true },
-        setup_role_exempt: { key: "exemptRoles", name: "Exempt Roles", multi: true },
+        setup_role_staff: { key: "staffRoles", name: "Staff Roles", single: false },
+        setup_role_admin: { key: "adminRoles", name: "Admin Roles", single: false },
+        setup_role_management: { key: "managementRoles", name: "Management Roles", single: false },
+        setup_role_exempt: { key: "exemptRoles", name: "Exempt Roles", single: false },
         setup_role_verify: { key: "verifyRoleId", name: "Verify Role", single: true },
-        setup_role_accept: { key: "acceptRoleIds", name: "Accept Roles", multi: true }
+        setup_role_accept: { key: "acceptRoleIds", name: "Accept Roles", single: false }
     };
     if (roleMap[id]) {
         const cfg = roleMap[id];
-        const select = new RoleSelectMenuBuilder()
-            .setCustomId("select_role_" + cfg.key)
-            .setPlaceholder("Pick roles for: " + cfg.name)
-            .setMaxValues(cfg.single ? 1 : 10);
         return interaction.update({
             embeds: [createInfoEmbed("Choose roles for **" + cfg.name + "**:")],
-            components: [new ActionRowBuilder().addComponents(select)]
+            components: [new ActionRowBuilder().addComponents(
+                new RoleSelectMenuBuilder().setCustomId("select_role_" + cfg.key).setPlaceholder("Pick roles").setMaxValues(cfg.single ? 1 : 10)
+            )]
         });
     }
 
-    // ---- CLEAR ----
     if (id === "setup_clear_staff") { gc.staffRoles = []; saveConfig(); return updateSetupMessage(interaction, "roles"); }
     if (id === "setup_clear_admin") { gc.adminRoles = []; saveConfig(); return updateSetupMessage(interaction, "roles"); }
     if (id === "setup_clear_management") { gc.managementRoles = []; saveConfig(); return updateSetupMessage(interaction, "roles"); }
     if (id === "setup_clear_exempt") { gc.exemptRoles = []; saveConfig(); return updateSetupMessage(interaction, "roles"); }
     if (id === "setup_clear_accept") { gc.acceptRoleIds = []; saveConfig(); return updateSetupMessage(interaction, "roles"); }
 
-    // ---- TICKETS ----
-    if (id === "setup_ticket_support_cat") {
-        return interaction.update({
-            embeds: [createInfoEmbed("Choose the **Support Tickets Category**:")],
-            components: [new ActionRowBuilder().addComponents(
-                new ChannelSelectMenuBuilder().setCustomId("select_ticketcat_support").setPlaceholder("Pick a category").setChannelTypes([ChannelType.GuildCategory])
-            )]
-        });
-    }
-    if (id === "setup_ticket_high_cat") {
-        return interaction.update({
-            embeds: [createInfoEmbed("Choose the **High Rank Tickets Category**:")],
-            components: [new ActionRowBuilder().addComponents(
-                new ChannelSelectMenuBuilder().setCustomId("select_ticketcat_highrank").setPlaceholder("Pick a category").setChannelTypes([ChannelType.GuildCategory])
-            )]
-        });
-    }
-    if (id === "setup_ticket_support_ping") {
-        return interaction.update({
-            embeds: [createInfoEmbed("Choose the **Support Ping Role**:")],
-            components: [new ActionRowBuilder().addComponents(
-                new RoleSelectMenuBuilder().setCustomId("select_ticketping_support").setPlaceholder("Pick a role").setMaxValues(1)
-            )]
-        });
-    }
-    if (id === "setup_ticket_high_ping") {
-        return interaction.update({
-            embeds: [createInfoEmbed("Choose the **High Rank Ping Role**:")],
-            components: [new ActionRowBuilder().addComponents(
-                new RoleSelectMenuBuilder().setCustomId("select_ticketping_highrank").setPlaceholder("Pick a role").setMaxValues(1)
-            )]
-        });
-    }
+    if (id === "setup_ticket_support_cat") return interaction.update({ embeds: [createInfoEmbed("Choose the **Support Tickets Category**:")], components: [new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("select_ticketcat_support").setPlaceholder("Pick a category").setChannelTypes([ChannelType.GuildCategory]))] });
+    if (id === "setup_ticket_high_cat") return interaction.update({ embeds: [createInfoEmbed("Choose the **High Rank Tickets Category**:")], components: [new ActionRowBuilder().addComponents(new ChannelSelectMenuBuilder().setCustomId("select_ticketcat_highrank").setPlaceholder("Pick a category").setChannelTypes([ChannelType.GuildCategory]))] });
+    if (id === "setup_ticket_support_ping") return interaction.update({ embeds: [createInfoEmbed("Choose the **Support Ping Role**:")], components: [new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId("select_ticketping_support").setPlaceholder("Pick a role").setMaxValues(1))] });
+    if (id === "setup_ticket_high_ping") return interaction.update({ embeds: [createInfoEmbed("Choose the **High Rank Ping Role**:")], components: [new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId("select_ticketping_highrank").setPlaceholder("Pick a role").setMaxValues(1))] });
     if (id === "setup_ticket_ping_management") {
         if (!gc.managementRoles.length) return interaction.reply({ embeds: [createErrorEmbed("Set Management roles first.")], ephemeral: true });
-        gc.ticketHighRankPingRoleId = gc.managementRoles[0];
-        saveConfig();
+        gc.ticketHighRankPingRoleId = gc.managementRoles[0]; saveConfig();
         return updateSetupMessage(interaction, "tickets");
     }
 
-    // ---- ANTI-NUKE ----
-    if (id === "setup_an_toggle") {
-        gc.antinuke.enabled = !gc.antinuke.enabled;
-        saveConfig();
-        return updateSetupMessage(interaction, "antinuke");
-    }
+    if (id === "setup_an_toggle") { gc.antinuke.enabled = !gc.antinuke.enabled; saveConfig(); return updateSetupMessage(interaction, "antinuke"); }
     if (id === "setup_an_threshold") {
         const modal = new ModalBuilder().setCustomId("modal_an_threshold").setTitle("Set Anti-Nuke Threshold");
         modal.addComponents(new ActionRowBuilder().addComponents(
-            new TextInputBuilder()
-                .setCustomId("threshold")
-                .setLabel("Trigger after this many events (2-20)")
-                .setStyle(TextInputStyle.Short)
-                .setValue(String(gc.antinuke.threshold))
-                .setRequired(true)
+            new TextInputBuilder().setCustomId("threshold").setLabel("Trigger after this many events (2-20)").setStyle(TextInputStyle.Short).setValue(String(gc.antinuke.threshold)).setRequired(true)
         ));
         return interaction.showModal(modal);
     }
-    if (id === "setup_an_whitelist") {
-        return interaction.update({
-            embeds: [createInfoEmbed("Choose a user to **whitelist** (exempt from anti-nuke):")],
-            components: [new ActionRowBuilder().addComponents(
-                new UserSelectMenuBuilder().setCustomId("select_an_whitelist_add").setPlaceholder("Pick a user").setMaxValues(1)
-            )]
-        });
-    }
-    if (id === "setup_an_unwhitelist") {
-        return interaction.update({
-            embeds: [createInfoEmbed("Choose a user to **remove from whitelist**:")],
-            components: [new ActionRowBuilder().addComponents(
-                new UserSelectMenuBuilder().setCustomId("select_an_whitelist_remove").setPlaceholder("Pick a user").setMaxValues(1)
-            )]
-        });
-    }
+    if (id === "setup_an_whitelist") return interaction.update({ embeds: [createInfoEmbed("Choose a user to **whitelist**:")], components: [new ActionRowBuilder().addComponents(new UserSelectMenuBuilder().setCustomId("select_an_whitelist_add").setPlaceholder("Pick a user").setMaxValues(1))] });
+    if (id === "setup_an_unwhitelist") return interaction.update({ embeds: [createInfoEmbed("Choose a user to **unwhitelist**:")], components: [new ActionRowBuilder().addComponents(new UserSelectMenuBuilder().setCustomId("select_an_whitelist_remove").setPlaceholder("Pick a user").setMaxValues(1))] });
     if (id === "setup_an_list") {
         const list = gc.antinuke.whitelist.length ? gc.antinuke.whitelist.map(id => "<@" + id + ">").join(", ") : "None";
-        return interaction.reply({ embeds: [createInfoEmbed("**Whitelisted Users:** " + list)], ephemeral: true });
+        return interaction.reply({ embeds: [createInfoEmbed("**Whitelisted:** " + list)], ephemeral: true });
     }
-    if (id === "setup_an_reset") {
-        gc.antinuke.counters = {};
-        saveConfig();
-        return updateSetupMessage(interaction, "antinuke");
+    if (id === "setup_an_watchlist") {
+        const now = Date.now();
+        const entries = Object.entries(gc.antinuke.watchlist).filter(([, e]) => e > now);
+        if (!entries.length) return interaction.reply({ embeds: [createInfoEmbed("No users on rejoin watch.")], ephemeral: true });
+        const lines = entries.map(([uid, e]) => "• <@" + uid + "> — expires <t:" + Math.floor(e / 1000) + ":R>");
+        return interaction.reply({ embeds: [createInfoEmbed("**Rejoin Watch:**\n" + lines.join("\n"))], ephemeral: true });
     }
+    if (id === "setup_an_reset") { gc.antinuke.counters = {}; saveConfig(); return updateSetupMessage(interaction, "antinuke"); }
 
-    // ---- POST PANELS ----
     if (id === "setup_post_verify") {
         await interaction.channel.send({ embeds: [buildVerifyEmbed(guild)], components: buildVerifyRows() });
         return interaction.reply({ embeds: [createSuccessEmbed("Verification panel posted.")], ephemeral: true });
@@ -1478,43 +1452,28 @@ async function handleButton(interaction) {
         return interaction.reply({ embeds: [createSuccessEmbed("Ticket panel posted.")], ephemeral: true });
     }
 
-    // ---- DM TEMPLATES ----
     const tplMap = {
-        setup_tpl_accept: { key: "accept", name: "Accept DM", label: "Template sent when a user is accepted. Vars: {server} {notes}" },
-        setup_tpl_promote: { key: "promote", name: "Promote DM", label: "Template sent when a user is promoted. Vars: {server} {rank} {notes}" },
-        setup_tpl_demote: { key: "demote", name: "Demote DM", label: "Template sent when a user is demoted. Vars: {server} {rank} {notes}" },
-        setup_tpl_infract: { key: "infract", name: "Infract DM", label: "Template sent when a user is infracted. Vars: {server} {type} {reason} {notes}" }
+        setup_tpl_accept: { key: "accept", name: "Accept DM", label: "Vars: {server} {notes}" },
+        setup_tpl_promote: { key: "promote", name: "Promote DM", label: "Vars: {server} {rank} {notes}" },
+        setup_tpl_demote: { key: "demote", name: "Demote DM", label: "Vars: {server} {rank} {notes}" },
+        setup_tpl_infract: { key: "infract", name: "Infract DM", label: "Vars: {server} {type} {reason} {notes}" }
     };
     if (tplMap[id]) {
         const cfg = tplMap[id];
         const currentValue = gc.dmTemplates[cfg.key] || "";
-        // Discord max 4000 chars for TextInput value; truncate safely
-        const safeValue = currentValue.length > 4000 ? currentValue.slice(0, 4000) : currentValue;
-
+        const safeValue = currentValue.length > 2000 ? currentValue.slice(0, 2000) : currentValue;
         const modal = new ModalBuilder().setCustomId("modal_tpl_" + cfg.key).setTitle("Edit " + cfg.name);
-        const input = new TextInputBuilder()
-            .setCustomId("template")
-            .setLabel(cfg.label.slice(0, 45))
-            .setStyle(TextInputStyle.Paragraph)
-            .setRequired(true)
-            .setMaxLength(2000);
+        const input = new TextInputBuilder().setCustomId("template").setLabel(cfg.label.slice(0, 45)).setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(2000);
         if (safeValue) input.setValue(safeValue);
         modal.addComponents(new ActionRowBuilder().addComponents(input));
         return interaction.showModal(modal);
     }
 
-    // ---- VOTES ----
     if (id.startsWith("vote_")) return handleVoteButton(interaction);
-
-    // ---- VERIFY ----
     if (id === "verify_start") return handleVerifyStart(interaction);
     if (id === "verify_check") return handleVerifyCheck(interaction);
     if (id === "verify_help") return handleTicketCreate(interaction, "support", "User clicked **I Can't Verify** on the verification panel.");
-
-    // ---- TICKET PANEL ----
-    if (id === "ticket_open_menu") {
-        return interaction.reply({ embeds: [createInfoEmbed("**Which support do you need?**")], components: buildTicketTypeRows(), ephemeral: true });
-    }
+    if (id === "ticket_open_menu") return interaction.reply({ embeds: [createInfoEmbed("**Which support do you need?**")], components: buildTicketTypeRows(), ephemeral: true });
     if (id === "ticket_rules") return interaction.reply({ embeds: [buildTicketRulesEmbed(guild)], ephemeral: true });
     if (id === "ticket_type_support") return handleTicketCreate(interaction, "support");
     if (id === "ticket_type_highrank") return handleTicketCreate(interaction, "highrank");
@@ -1530,8 +1489,7 @@ async function handleSelect(interaction) {
     const gc = getGuildConfig(interaction.guild.id);
 
     if (id.startsWith("select_channel_")) {
-        const key = id.slice("select_channel_".length);
-        gc[key] = interaction.values[0];
+        gc[id.slice("select_channel_".length)] = interaction.values[0];
         saveConfig();
         return updateSetupMessage(interaction, "channels");
     }
@@ -1547,20 +1505,8 @@ async function handleSelect(interaction) {
     if (id === "select_ticketcat_highrank") { gc.ticketHighRankCategoryId = interaction.values[0]; saveConfig(); return updateSetupMessage(interaction, "tickets"); }
     if (id === "select_ticketping_support") { gc.ticketSupportPingRoleId = interaction.values[0]; saveConfig(); return updateSetupMessage(interaction, "tickets"); }
     if (id === "select_ticketping_highrank") { gc.ticketHighRankPingRoleId = interaction.values[0]; saveConfig(); return updateSetupMessage(interaction, "tickets"); }
-
-    // Anti-nuke whitelist
-    if (id === "select_an_whitelist_add") {
-        const uid = interaction.values[0];
-        if (!gc.antinuke.whitelist.includes(uid)) gc.antinuke.whitelist.push(uid);
-        saveConfig();
-        return updateSetupMessage(interaction, "antinuke");
-    }
-    if (id === "select_an_whitelist_remove") {
-        const uid = interaction.values[0];
-        gc.antinuke.whitelist = gc.antinuke.whitelist.filter(x => x !== uid);
-        saveConfig();
-        return updateSetupMessage(interaction, "antinuke");
-    }
+    if (id === "select_an_whitelist_add") { const uid = interaction.values[0]; if (!gc.antinuke.whitelist.includes(uid)) gc.antinuke.whitelist.push(uid); saveConfig(); return updateSetupMessage(interaction, "antinuke"); }
+    if (id === "select_an_whitelist_remove") { const uid = interaction.values[0]; gc.antinuke.whitelist = gc.antinuke.whitelist.filter(x => x !== uid); saveConfig(); return updateSetupMessage(interaction, "antinuke"); }
 }
 
 // ==========================================
@@ -1576,7 +1522,7 @@ async function handleModal(interaction) {
         const prefix = interaction.fields.getTextInputValue("prefix");
         if (/\s/.test(prefix)) return interaction.reply({ embeds: [createErrorEmbed("No spaces.")], ephemeral: true });
         gc.prefix = prefix; saveConfig();
-        return interaction.reply({ embeds: [createSuccessEmbed("Prefix set to `" + prefix + "`.")], ephemeral: true });
+        return interaction.reply({ embeds: [createSuccessEmbed("Prefix: `" + prefix + "`.")], ephemeral: true });
     }
     if (id === "modal_webhook") {
         const url = interaction.fields.getTextInputValue("url");
@@ -1587,23 +1533,16 @@ async function handleModal(interaction) {
     if (id.startsWith("modal_tpl_")) {
         const key = id.slice("modal_tpl_".length);
         const value = interaction.fields.getTextInputValue("template");
-        gc.dmTemplates[key] = value;
-        saveConfig();
-
-        const previewEmbed = new EmbedBuilder()
-            .setTitle("✅ Template Updated: " + key)
-            .setDescription("**New template:**\n" + value)
-            .setColor(0x57F287)
-            .setTimestamp();
-        return interaction.reply({ embeds: [previewEmbed], ephemeral: true });
+        gc.dmTemplates[key] = value; saveConfig();
+        const preview = new EmbedBuilder().setTitle("✅ Template Updated: " + key).setDescription("**New template:**\n" + value).setColor(0x57F287).setTimestamp();
+        return interaction.reply({ embeds: [preview], ephemeral: true });
     }
     if (id === "modal_an_threshold") {
         const raw = interaction.fields.getTextInputValue("threshold").trim();
         const n = parseInt(raw, 10);
         if (isNaN(n) || n < 2 || n > 20) return interaction.reply({ embeds: [createErrorEmbed("Enter a number between 2 and 20.")], ephemeral: true });
-        gc.antinuke.threshold = n;
-        saveConfig();
-        return interaction.reply({ embeds: [createSuccessEmbed("Threshold set to **" + n + "** events.")], ephemeral: true });
+        gc.antinuke.threshold = n; saveConfig();
+        return interaction.reply({ embeds: [createSuccessEmbed("Threshold: **" + n + "**.")], ephemeral: true });
     }
     if (id === "modal_verify_username") {
         const username = interaction.fields.getTextInputValue("username").trim();
@@ -1613,14 +1552,8 @@ async function handleModal(interaction) {
         gc.verifySessions[interaction.user.id] = { code, robloxId: robloxData.id, robloxUsername: robloxData.username, createdAt: Date.now() };
         saveConfig();
         const embed = new EmbedBuilder().setTitle("Verification Code")
-            .setDescription(
-                "**Step 1:** Open your profile: [Click here](" + robloxData.profileUrl + ")\n" +
-                "**Step 2:** Paste this code into your **About** section and save:\n\n`" + code + "`\n\n" +
-                "**Step 3:** Return and click **Check Verification**."
-            )
-            .setColor(WEBHOOK_COLOR)
-            .setThumbnail(robloxData.avatarUrl || guild.iconURL({ dynamic: true }))
-            .setTimestamp();
+            .setDescription("**Step 1:** Open your profile: [Click here](" + robloxData.profileUrl + ")\n**Step 2:** Paste this into your **About** and save:\n\n`" + code + "`\n\n**Step 3:** Return and click **Check Verification**.")
+            .setColor(WEBHOOK_COLOR).setThumbnail(robloxData.avatarUrl || guild.iconURL({ dynamic: true })).setTimestamp();
         return interaction.reply({ embeds: [embed], ephemeral: true });
     }
 }
@@ -1642,34 +1575,22 @@ async function handleVerifyCheck(interaction) {
     const gc = getGuildConfig(guild.id);
     const session = gc.verifySessions[interaction.user.id];
     if (!session) return interaction.reply({ embeds: [createErrorEmbed("No active session.")], ephemeral: true });
-
     await interaction.deferReply({ ephemeral: true });
     const robloxData = await lookupRobloxUser(session.robloxUsername);
     if (!robloxData) return interaction.editReply({ embeds: [createErrorEmbed("Fetch failed.")] });
-    if (!robloxData.description.includes(session.code)) {
-        return interaction.editReply({ embeds: [createErrorEmbed("Code not found in profile.")] });
-    }
-
+    if (!robloxData.description.includes(session.code)) return interaction.editReply({ embeds: [createErrorEmbed("Code not found in profile.")] });
     gc.verifiedUsers[interaction.user.id] = { robloxId: robloxData.id, robloxUsername: robloxData.username, verifiedAt: Date.now() };
     delete gc.verifySessions[interaction.user.id];
     saveConfig();
-
     let roleGiven = false;
-    if (gc.verifyRoleId) {
-        try { await interaction.member.roles.add(gc.verifyRoleId, "Verified"); roleGiven = true; } catch (e) {}
-    }
-
-    const successEmbed = new EmbedBuilder().setTitle("✅ Verification Successful")
-        .setDescription("Welcome, **" + robloxData.username + "**! You have been verified.")
-        .setColor(0x57F287).setThumbnail(robloxData.avatarUrl || null).setTimestamp();
-
+    if (gc.verifyRoleId) { try { await interaction.member.roles.add(gc.verifyRoleId, "Verified"); roleGiven = true; } catch (e) {} }
+    const successEmbed = new EmbedBuilder().setTitle("✅ Verification Successful").setDescription("Welcome, **" + robloxData.username + "**! You have been verified.").setColor(0x57F287).setThumbnail(robloxData.avatarUrl || null).setTimestamp();
     const logEmbed = new EmbedBuilder().setTitle("User Verified").setColor(WEBHOOK_COLOR)
         .addFields(
             { name: "Discord", value: interaction.user.tag + " (" + interaction.user.id + ")", inline: true },
             { name: "Roblox", value: robloxData.username + " (" + robloxData.id + ")", inline: true },
             { name: "Role Given", value: roleGiven ? "Yes" : "No", inline: true }
         ).setThumbnail(robloxData.avatarUrl || null).setTimestamp();
-
     await sendVerificationLog(guild, logEmbed);
     await sendLog(guild, logEmbed);
     await sendWebhook(guild, logEmbed);
@@ -1696,17 +1617,14 @@ async function handleTicketCreate(interaction, type, prefillReason) {
         const ch = guild.channels.cache.get(existing[0]);
         return interaction.reply({ embeds: [createErrorEmbed(ch ? "You have an open ticket: " + ch : "You already have an open ticket.")], ephemeral: true });
     }
-
     const categoryId = gc[cfg.categoryKey];
     if (!categoryId) return interaction.reply({ embeds: [createErrorEmbed("Category not set. Configure in `/setup → Tickets`.")], ephemeral: true });
     const category = guild.channels.cache.get(categoryId);
     if (!category || category.type !== ChannelType.GuildCategory) return interaction.reply({ embeds: [createErrorEmbed("Category missing.")], ephemeral: true });
 
     if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ ephemeral: true });
-
     const ticketNumber = (gc.ticketCounter || 0) + 1;
     gc.ticketCounter = ticketNumber;
-
     const cleanUser = interaction.user.username.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 15) || "user";
     const channelName = ticketNumber + "-" + cfg.slug + "-" + cleanUser;
 
@@ -1715,14 +1633,9 @@ async function handleTicketCreate(interaction, type, prefillReason) {
         { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks] },
         { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ReadMessageHistory] }
     ];
-
     const viewRoleIds = new Set([...gc.staffRoles, ...gc.adminRoles, ...gc.managementRoles]);
     if (gc[cfg.pingKey]) viewRoleIds.add(gc[cfg.pingKey]);
-    for (const rid of viewRoleIds) {
-        if (!overwrites.find(o => o.id === rid)) {
-            overwrites.push({ id: rid, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
-        }
-    }
+    for (const rid of viewRoleIds) if (!overwrites.find(o => o.id === rid)) overwrites.push({ id: rid, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
 
     let channel;
     try {
@@ -1731,10 +1644,7 @@ async function handleTicketCreate(interaction, type, prefillReason) {
             permissionOverwrites: overwrites,
             topic: "Ticket #" + ticketNumber + " • " + cfg.label + " • " + interaction.user.tag
         });
-    } catch (e) {
-        console.error(e);
-        return interaction.editReply({ embeds: [createErrorEmbed("Could not create ticket.")] });
-    }
+    } catch (e) { console.error(e); return interaction.editReply({ embeds: [createErrorEmbed("Could not create.")] }); }
 
     gc.tickets[channel.id] = { userId: interaction.user.id, type, number: ticketNumber, name: cfg.slug, open: true, createdAt: Date.now() };
     saveConfig();
@@ -1746,15 +1656,9 @@ async function handleTicketCreate(interaction, type, prefillReason) {
 
     const welcomeEmbed = new EmbedBuilder()
         .setTitle(cfg.emoji + " " + cfg.label + " — Ticket #" + ticketNumber)
-        .setDescription(
-            "**" + interaction.user + "**, thank you for opening a ticket.\n\n" +
-            (prefillReason ? "**Reason:** " + prefillReason + "\n\n" : "") +
-            "A staff member will assist you shortly."
-        )
-        .setColor(WEBHOOK_COLOR)
-        .setThumbnail(guild.iconURL({ dynamic: true, size: 256 }))
-        .setFooter({ text: guild.name, iconURL: guild.iconURL({ dynamic: true }) || undefined })
-        .setTimestamp();
+        .setDescription("**" + interaction.user + "**, thank you for opening a ticket.\n\n" + (prefillReason ? "**Reason:** " + prefillReason + "\n\n" : "") + "A staff member will assist you shortly.")
+        .setColor(WEBHOOK_COLOR).setThumbnail(guild.iconURL({ dynamic: true, size: 256 }))
+        .setFooter({ text: guild.name, iconURL: guild.iconURL({ dynamic: true }) || undefined }).setTimestamp();
 
     const closeRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId("ticket_close").setLabel("Close Ticket").setEmoji("🔒").setStyle(ButtonStyle.Danger)
@@ -1769,10 +1673,8 @@ async function handleTicketCreate(interaction, type, prefillReason) {
             { name: "User", value: interaction.user.tag, inline: true },
             { name: "Channel", value: channel.toString(), inline: false }
         ).setTimestamp();
-
     await sendTicketLog(guild, logEmbed);
     await sendWebhook(guild, logEmbed);
-
     return interaction.editReply({ embeds: [createSuccessEmbed("Ticket created: " + channel)] });
 }
 
@@ -1781,30 +1683,19 @@ async function handleTicketClose(interaction) {
     const gc = getGuildConfig(guild.id);
     const ticket = gc.tickets[interaction.channel.id];
     if (!ticket) return interaction.reply({ embeds: [createErrorEmbed("Not a ticket.")], ephemeral: true });
-
     const isOwner = interaction.user.id === ticket.userId;
     if (!isOwner && !isStaff(interaction.member)) return interaction.reply({ embeds: [createErrorEmbed("Only owner or staff.")], ephemeral: true });
-
     await interaction.reply({ embeds: [createInfoEmbed("🔒 Closing and generating transcript...")] });
-
     try {
         const messages = await interaction.channel.messages.fetch({ limit: 500 });
         const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-        let text = "=== Ticket #" + ticket.number + " Transcript ===\n";
-        text += "Type: " + ticket.type + "\n";
-        text += "User ID: " + ticket.userId + "\n";
-        text += "Closed by: " + interaction.user.tag + " (" + interaction.user.id + ")\n";
-        text += "Closed at: " + new Date().toISOString() + "\n";
-        text += "======================================\n\n";
+        let text = "=== Ticket #" + ticket.number + " Transcript ===\nType: " + ticket.type + "\nUser ID: " + ticket.userId + "\nClosed by: " + interaction.user.tag + " (" + interaction.user.id + ")\nClosed at: " + new Date().toISOString() + "\n======================================\n\n";
         for (const m of sorted) {
             text += "[" + new Date(m.createdTimestamp).toISOString() + "] " + m.author.tag + ": " + (m.content || "<no text>") + "\n";
             if (m.attachments.size) for (const a of m.attachments.values()) text += "   [attachment] " + a.url + "\n";
         }
         const attachment = new AttachmentBuilder(Buffer.from(text, "utf8"), { name: "transcript-" + ticket.number + "-" + ticket.type + ".txt" });
-
-        const transcriptEmbed = new EmbedBuilder()
-            .setTitle("Ticket Transcript — #" + ticket.number)
-            .setColor(WEBHOOK_COLOR)
+        const transcriptEmbed = new EmbedBuilder().setTitle("Ticket Transcript — #" + ticket.number).setColor(WEBHOOK_COLOR)
             .addFields(
                 { name: "Type", value: ticket.type, inline: true },
                 { name: "Owner", value: "<@" + ticket.userId + ">", inline: true },
@@ -1812,25 +1703,16 @@ async function handleTicketClose(interaction) {
             ).setTimestamp();
         await sendTranscript(guild, attachment, transcriptEmbed);
     } catch (e) { console.error("transcript:", e); }
-
-    ticket.open = false;
-    ticket.closedAt = Date.now();
-    ticket.closedBy = interaction.user.id;
-    saveConfig();
-
+    ticket.open = false; ticket.closedAt = Date.now(); ticket.closedBy = interaction.user.id; saveConfig();
     const logEmbed = new EmbedBuilder().setTitle("Ticket Closed").setColor(0xED4245)
         .addFields(
             { name: "Ticket #", value: String(ticket.number), inline: true },
             { name: "Type", value: ticket.type, inline: true },
             { name: "Closed By", value: interaction.user.tag, inline: true }
         ).setTimestamp();
-
     await sendTicketLog(guild, logEmbed);
     await sendWebhook(guild, logEmbed);
-
-    setTimeout(async () => {
-        try { await interaction.channel.delete("Ticket closed"); } catch (e) {}
-    }, 5000);
+    setTimeout(async () => { try { await interaction.channel.delete("Ticket closed"); } catch (e) {} }, 5000);
 }
 
 // ==========================================
@@ -1841,9 +1723,7 @@ async function handleVoteButton(interaction) {
     try {
         const parts = interaction.customId.split("_");
         if (parts.length < 4) return interaction.reply({ embeds: [createErrorEmbed("Invalid.")], ephemeral: true });
-        const direction = parts[1];
-        const type = parts[2];
-        const messageId = parts[3];
+        const direction = parts[1], type = parts[2], messageId = parts[3];
         const gc = getGuildConfig(interaction.guild.id);
         const store = type === "suggestion" ? gc.suggestions : gc.staffFeedback;
         if (!store[messageId]) return interaction.reply({ embeds: [createErrorEmbed("Invalid vote.")], ephemeral: true });
@@ -1864,10 +1744,7 @@ async function handleVoteButton(interaction) {
         }
         await interaction.message.edit({ embeds: [updatedEmbed], components: [buildVoteRow(messageId, type)] });
         return interaction.reply({ embeds: [createSuccessEmbed("Voted.")], ephemeral: true });
-    } catch (e) {
-        console.error(e);
-        try { if (!interaction.replied) await interaction.reply({ embeds: [createErrorEmbed("Failed.")], ephemeral: true }); } catch (x) {}
-    }
+    } catch (e) { console.error(e); }
 }
 
 function buildSuggestionEmbed(suggestion, author, upvotes, downvotes) {
@@ -1898,89 +1775,46 @@ function buildVoteRow(id, type) {
 // ==========================================
 
 function buildVerifyEmbed(guild) {
-    return new EmbedBuilder()
-        .setTitle("Verification Required")
+    return new EmbedBuilder().setTitle("Verification Required")
         .setDescription(
-            "**Welcome to " + guild.name + ".**\n\n" +
-            "Please complete Roblox verification to unlock access to all channels.\n\n" +
-            "**How to verify:**\n" +
-            "> 1. Click the **Verify** button below.\n" +
-            "> 2. Enter your Roblox username.\n" +
-            "> 3. Paste the code into your Roblox profile's **About** section.\n" +
-            "> 4. Return and click **Check Verification**.\n\n" +
-            "**Need help?**\n" +
-            "> Click **I Can't Verify** to open a support ticket."
+            "**Welcome to " + guild.name + ".**\n\nPlease complete Roblox verification to unlock access to all channels.\n\n" +
+            "**How to verify:**\n> 1. Click **Verify** below.\n> 2. Enter your Roblox username.\n> 3. Paste the code into your Roblox About section.\n> 4. Return and click **Check Verification**.\n\n" +
+            "**Need help?**\n> Click **I Can't Verify** to open a support ticket."
         )
-        .setColor(EMBED_ACCENT)
-        .setThumbnail(guild.iconURL({ dynamic: true, size: 256 }))
-        .setFooter({ text: guild.name + " • Verification System", iconURL: guild.iconURL({ dynamic: true }) || undefined })
-        .setTimestamp();
+        .setColor(EMBED_ACCENT).setThumbnail(guild.iconURL({ dynamic: true, size: 256 }))
+        .setFooter({ text: guild.name + " • Verification System", iconURL: guild.iconURL({ dynamic: true }) || undefined }).setTimestamp();
 }
-
 function buildVerifyRows() {
-    return [
-        new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("verify_start").setLabel("Verify").setEmoji("✅").setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId("verify_check").setLabel("Check Verification").setEmoji("🔄").setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId("verify_help").setLabel("I Can't Verify").setEmoji("❓").setStyle(ButtonStyle.Secondary)
-        )
-    ];
+    return [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("verify_start").setLabel("Verify").setEmoji("✅").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId("verify_check").setLabel("Check Verification").setEmoji("🔄").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("verify_help").setLabel("I Can't Verify").setEmoji("❓").setStyle(ButtonStyle.Secondary)
+    )];
 }
-
 function buildTicketPanelEmbed(guild) {
-    return new EmbedBuilder()
-        .setTitle("🎫 Need Assistance?")
-        .setDescription(
-            "**" + guild.name + " | Support Assistant**\n\n" +
-            "⚙️ **Need Assistance?**\n" +
-            "> Click the **Open a Ticket** button below to get started.\n\n" +
-            "ℹ️ **Server Rules**\n" +
-            "> Please review the Ticket Rules before proceeding."
-        )
-        .setColor(EMBED_ACCENT)
-        .setThumbnail(guild.iconURL({ dynamic: true, size: 256 }))
-        .setFooter({ text: guild.name + " • Support System", iconURL: guild.iconURL({ dynamic: true }) || undefined })
-        .setTimestamp();
+    return new EmbedBuilder().setTitle("🎫 Need Assistance?")
+        .setDescription("**" + guild.name + " | Support Assistant**\n\n⚙️ **Need Assistance?**\n> Click **Open a Ticket** below.\n\nℹ️ **Server Rules**\n> Please review the Ticket Rules before proceeding.")
+        .setColor(EMBED_ACCENT).setThumbnail(guild.iconURL({ dynamic: true, size: 256 }))
+        .setFooter({ text: guild.name + " • Support System", iconURL: guild.iconURL({ dynamic: true }) || undefined }).setTimestamp();
 }
-
 function buildTicketPanelRows() {
-    return [
-        new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("ticket_open_menu").setLabel("Open a Ticket").setEmoji("🎫").setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId("ticket_rules").setLabel("Ticket Rules").setEmoji("📋").setStyle(ButtonStyle.Secondary)
-        )
-    ];
+    return [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("ticket_open_menu").setLabel("Open a Ticket").setEmoji("🎫").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("ticket_rules").setLabel("Ticket Rules").setEmoji("📋").setStyle(ButtonStyle.Secondary)
+    )];
 }
-
 function buildTicketTypeRows() {
-    return [
-        new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId("ticket_type_support").setLabel("General Support").setEmoji("⚙️").setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId("ticket_type_highrank").setLabel("High Rank Tickets").setEmoji("🛡️").setStyle(ButtonStyle.Danger)
-        )
-    ];
+    return [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("ticket_type_support").setLabel("General Support").setEmoji("⚙️").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId("ticket_type_highrank").setLabel("High Rank Tickets").setEmoji("🛡️").setStyle(ButtonStyle.Danger)
+    )];
 }
-
 function buildTicketRulesEmbed(guild) {
-    return new EmbedBuilder()
-        .setTitle("📋 Ticket Rules")
+    return new EmbedBuilder().setTitle("📋 Ticket Rules")
         .setDescription(
-            "**1.** Be patient and do not ping support roles.\n" +
-            "**2.** Be respectful toward the person helping you.\n" +
-            "**3.** Respect the authority of high-ranking members.\n" +
-            "**4.** Do not open tickets for jokes, trolling, or unnecessary reasons.\n" +
-            "**5.** Do not open multiple tickets for the same issue.\n" +
-            "**6.** Keep all messages relevant to your support request.\n" +
-            "**7.** False information may result in punishment or denial of support.\n" +
-            "**8.** No spam, arguing, or disruptions inside tickets.\n" +
-            "**9.** Follow all server rules while using the support system.\n" +
-            "**10.** Staff may close tickets that are inactive, resolved, or unnecessary.\n" +
-            "**11.** Harassment, discrimination, or threats will not be tolerated.\n" +
-            "**12.** Screenshots, proof, or additional details may be requested."
+            "**1.** Be patient and do not ping support roles.\n**2.** Be respectful.\n**3.** Respect high-ranking members.\n**4.** No joke/troll tickets.\n**5.** One ticket per issue.\n**6.** Stay on topic.\n**7.** False info = punishment.\n**8.** No spam or arguing.\n**9.** Follow all server rules.\n**10.** Staff may close inactive tickets.\n**11.** Harassment = zero tolerance.\n**12.** Proof may be requested."
         )
-        .setColor(EMBED_ACCENT)
-        .setFooter({ text: guild.name + " • Ticket Rules", iconURL: guild.iconURL({ dynamic: true }) || undefined })
-        .setTimestamp();
+        .setColor(EMBED_ACCENT).setFooter({ text: guild.name + " • Ticket Rules", iconURL: guild.iconURL({ dynamic: true }) || undefined }).setTimestamp();
 }
 
 // ==========================================
@@ -1996,7 +1830,6 @@ client.on("messageCreate", async message => {
     const command = (args.shift() || "").toLowerCase();
     if (!command) return;
     const guild = message.guild;
-
     try {
         if (command === "help") {
             const embed = new EmbedBuilder().setTitle(guild.name + " — Prefix Commands").setColor(WEBHOOK_COLOR)
@@ -2021,20 +1854,22 @@ client.on("messageCreate", async message => {
             await sendStaffLog(guild, logEmbed); await sendLog(guild, logEmbed); await sendWebhook(guild, logEmbed);
             return message.reply({ embeds: [createSuccessEmbed("Recorded.")] });
         }
-    } catch (e) {
-        console.error(e);
-        try { await message.reply({ embeds: [createErrorEmbed("Error.")] }); } catch (x) {}
-    }
+    } catch (e) { console.error(e); try { await message.reply({ embeds: [createErrorEmbed("Error.")] }); } catch (x) {} }
 });
 
 // ==========================================
-// MEMBER EVENTS
+// MEMBER JOIN — WELCOME + REJOIN WATCH
 // ==========================================
 
 client.on("guildMemberAdd", async member => {
     try {
         const guild = member.guild;
         const gc = getGuildConfig(guild.id);
+
+        // ---- CHECK REJOIN WATCH FIRST ----
+        const wasMuted = await checkRejoinWatch(member);
+
+        // ---- WELCOME (still sent so they see context) ----
         if (gc.welcomeChannelId) {
             const ch = guild.channels.cache.get(gc.welcomeChannelId);
             if (ch) {
@@ -2042,13 +1877,15 @@ client.on("guildMemberAdd", async member => {
                 await ch.send({ content: member.toString() + " Hello, and welcome to **" + guild.name + "**! You are our **" + n + getOrdinalSuffix(n) + "** member, enjoy your stay!" });
             }
         }
+
+        // ---- LOG ----
         const accountAge = Math.floor((Date.now() - member.user.createdTimestamp) / 86400000);
         const embed = createLogEmbed("Member Joined",
-            "**User:** " + member + " (" + member.user.tag + ")\n**ID:** " + member.id + "\n**Account Age:** " + accountAge + " days\n**Member Count:** " + guild.memberCount,
-            0x57F287);
+            "**User:** " + member + " (" + member.user.tag + ")\n**ID:** " + member.id + "\n**Account Age:** " + accountAge + " days\n**Member Count:** " + guild.memberCount + (wasMuted ? "\n\n⚠️ **Auto-muted (24h rejoin watch)**" : ""),
+            wasMuted ? 0xED4245 : 0x57F287);
         await sendLog(guild, embed);
         await sendWebhook(guild, embed);
-    } catch (e) { console.error(e); }
+    } catch (e) { console.error("guildMemberAdd:", e); }
 });
 
 client.on("guildMemberRemove", async member => {
@@ -2056,6 +1893,11 @@ client.on("guildMemberRemove", async member => {
         const embed = createLogEmbed("Member Left", "**User:** " + member.user.tag + "\n**ID:** " + member.id, 0xED4245);
         await sendLog(member.guild, embed);
         await sendWebhook(member.guild, embed);
+
+        // Antinuke: kick detection
+        if (!member.guild.members.me.permissions.has(PermissionFlagsBits.ViewAuditLog)) return;
+        const executor = await fetchAuditExecutor(member.guild, 20 /* MEMBER_KICK */, member.id);
+        if (executor) await handleAntinukeEvent(member.guild, executor.id, "Kick");
     } catch (e) { console.error(e); }
 });
 
@@ -2066,45 +1908,28 @@ client.on("guildMemberRemove", async member => {
 client.on("channelDelete", async channel => {
     try {
         if (!channel.guild) return;
-        const embed = createLogEmbed("Channel Deleted", "**Name:** " + channel.name + "\n**ID:** " + channel.id, 0xED4245);
-        await sendLog(channel.guild, embed);
-
+        await sendLog(channel.guild, createLogEmbed("Channel Deleted", "**Name:** " + channel.name + "\n**ID:** " + channel.id, 0xED4245));
         if (!channel.guild.members.me.permissions.has(PermissionFlagsBits.ViewAuditLog)) return;
-        const executor = await fetchAuditExecutor(channel.guild, 12 /* CHANNEL_DELETE */, channel.id);
+        const executor = await fetchAuditExecutor(channel.guild, 12, channel.id);
         if (executor) await handleAntinukeEvent(channel.guild, executor.id, "Channel Delete");
     } catch (e) { console.error("channelDelete:", e); }
 });
 
 client.on("roleDelete", async role => {
     try {
-        const embed = createLogEmbed("Role Deleted", "**Role:** " + role.name + "\n**ID:** " + role.id, 0xED4245);
-        await sendLog(role.guild, embed);
-
+        await sendLog(role.guild, createLogEmbed("Role Deleted", "**Role:** " + role.name + "\n**ID:** " + role.id, 0xED4245));
         if (!role.guild.members.me.permissions.has(PermissionFlagsBits.ViewAuditLog)) return;
-        const executor = await fetchAuditExecutor(role.guild, 32 /* ROLE_DELETE */, role.id);
+        const executor = await fetchAuditExecutor(role.guild, 32, role.id);
         if (executor) await handleAntinukeEvent(role.guild, executor.id, "Role Delete");
     } catch (e) { console.error("roleDelete:", e); }
 });
 
-client.on("guildMemberRemove", async member => {
-    try {
-        if (!member.guild) return;
-        if (!member.guild.members.me.permissions.has(PermissionFlagsBits.ViewAuditLog)) return;
-        const executor = await fetchAuditExecutor(member.guild, 20 /* MEMBER_KICK */, member.id);
-        if (executor) await handleAntinukeEvent(member.guild, executor.id, "Kick");
-    } catch (e) { /* ignore */ }
-});
-
 client.on("guildBanAdd", async ban => {
     try {
-        const embed = createLogEmbed("Member Banned",
-            "**User:** " + ban.user.tag + "\n**ID:** " + ban.user.id + "\n**Reason:** " + (ban.reason || "None"),
-            0xED4245);
-        await sendLog(ban.guild, embed);
-        await sendWebhook(ban.guild, embed);
-
+        await sendLog(ban.guild, createLogEmbed("Member Banned", "**User:** " + ban.user.tag + "\n**ID:** " + ban.user.id + "\n**Reason:** " + (ban.reason || "None"), 0xED4245));
+        await sendWebhook(ban.guild, createLogEmbed("Member Banned", "**User:** " + ban.user.tag + "\n**ID:** " + ban.user.id, 0xED4245));
         if (!ban.guild.members.me.permissions.has(PermissionFlagsBits.ViewAuditLog)) return;
-        const executor = await fetchAuditExecutor(ban.guild, 22 /* MEMBER_BAN_ADD */, ban.user.id);
+        const executor = await fetchAuditExecutor(ban.guild, 22, ban.user.id);
         if (executor) await handleAntinukeEvent(ban.guild, executor.id, "Ban");
     } catch (e) { console.error("guildBanAdd:", e); }
 });
@@ -2130,13 +1955,11 @@ client.on("messageUpdate", async (o, n) => {
 });
 
 client.on("roleCreate", async role => {
-    try { await sendLog(role.guild, createLogEmbed("Role Created", "**Role:** " + role + "\n**ID:** " + role.id, 0x57F287)); }
-    catch (e) { console.error(e); }
+    try { await sendLog(role.guild, createLogEmbed("Role Created", "**Role:** " + role + "\n**ID:** " + role.id, 0x57F287)); } catch (e) { console.error(e); }
 });
 
 client.on("channelCreate", async channel => {
-    try { if (!channel.guild) return; await sendLog(channel.guild, createLogEmbed("Channel Created", "**Channel:** " + channel + "\n**Name:** " + channel.name, 0x57F287)); }
-    catch (e) { console.error(e); }
+    try { if (!channel.guild) return; await sendLog(channel.guild, createLogEmbed("Channel Created", "**Channel:** " + channel + "\n**Name:** " + channel.name, 0x57F287)); } catch (e) { console.error(e); }
 });
 
 client.on("voiceStateUpdate", async (o, n) => {
