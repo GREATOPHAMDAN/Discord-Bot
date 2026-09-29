@@ -1,5 +1,5 @@
-// ==========================================
-// EAGLE COUNTY ROLEPLAY BOT - V.2.1
+ // ==========================================
+// EAGLE COUNTY ROLEPLAY BOT - V.2.2
 // ==========================================
 
 const {
@@ -8,7 +8,7 @@ const {
     ActionRowBuilder, ButtonBuilder, ButtonStyle,
     ChannelType, ModalBuilder, TextInputBuilder, TextInputStyle,
     ChannelSelectMenuBuilder, RoleSelectMenuBuilder, UserSelectMenuBuilder,
-    WebhookClient, AttachmentBuilder
+    WebhookClient, AttachmentBuilder, version: djsVersion
 } = require("discord.js");
 
 const fs = require("fs");
@@ -19,6 +19,9 @@ const dotenv = require("dotenv");
 dotenv.config();
 const TOKEN = process.env.TOKEN;
 if (!TOKEN) { console.error("ERROR: TOKEN missing from .env"); process.exit(1); }
+
+const BOT_VERSION = "V.2.2";
+const BOT_START_TIME = Date.now();
 
 // ==========================================
 // CONSTANTS
@@ -81,7 +84,16 @@ const DEFAULT_COMMAND_PERMS = {
     giveaway: ["highrank", "management"],
 
     roles: ["staff", "admin", "highrank", "management"],
+    history: ["staff", "admin", "highrank", "management"],
+    roleinfo: ["everyone"],
+    userinfo: ["everyone"],
+    banner: ["everyone"],
+    membercount: ["everyone"],
     serverinfo: ["everyone"],
+    botinfo: ["everyone"],
+    ping: ["everyone"],
+    uptime: ["everyone"],
+    invite: ["everyone"],
     afk: ["everyone"],
     av: ["everyone"],
 
@@ -123,7 +135,8 @@ const guildConfigCache = new Map();
 const _prefixCache = new Map();
 const _memberTierCache = new Map();
 const _tierCacheTTL = 30_000;
-const _pendingCloseConfirmations = new Map(); // messageId -> { userId, channelId, guildId, reason, expiresAt }
+const _pendingCloseConfirmations = new Map();
+const _userHistory = new Map(); // userId -> [{type, reason, moderator, at, guildId}]
 
 // ==========================================
 // CONFIG
@@ -384,6 +397,13 @@ function formatDuration(ms) {
     return d + "d" + (rh ? " " + rh + "h" : "");
 }
 
+function formatBytes(bytes) {
+    if (bytes < 1024) return bytes + " B";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + " KB";
+    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + " MB";
+    return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB";
+}
+
 async function resolveMember(guild, input) {
     if (!input) return null;
     const mentionMatch = input.match(/^<@!?(\d+)>$/);
@@ -404,6 +424,13 @@ async function resolveUser(clientRef, input) {
     if (mentionMatch) return clientRef.users.fetch(mentionMatch[1]).catch(() => null);
     if (/^\d{15,25}$/.test(input)) return clientRef.users.fetch(input).catch(() => null);
     return null;
+}
+
+function recordHistory(userId, entry) {
+    if (!_userHistory.has(userId)) _userHistory.set(userId, []);
+    const arr = _userHistory.get(userId);
+    arr.unshift(entry);
+    if (arr.length > 50) arr.length = 50;
 }
 
 // ==========================================
@@ -775,6 +802,26 @@ function getSlashCommands() {
         new SlashCommandBuilder().setName("ticketclose").setDescription("Close the current ticket")
             .addStringOption(o => o.setName("reason").setDescription("Reason for closing").setRequired(false).setMaxLength(400)),
 
+        // ========== V.2.2 QOL COMMANDS ==========
+        new SlashCommandBuilder().setName("botinfo").setDescription("Show information about this bot"),
+        new SlashCommandBuilder().setName("stats").setDescription("Alias for /botinfo"),
+        new SlashCommandBuilder().setName("ping").setDescription("Check the bot's latency"),
+        new SlashCommandBuilder().setName("uptime").setDescription("Show how long the bot has been running"),
+        new SlashCommandBuilder().setName("invite").setDescription("Get the bot's invite link"),
+        new SlashCommandBuilder().setName("membercount").setDescription("Show the member count breakdown"),
+
+        new SlashCommandBuilder().setName("userinfo").setDescription("Show info about a user")
+            .addUserOption(o => o.setName("user").setDescription("User (leave empty for yourself)").setRequired(false)),
+
+        new SlashCommandBuilder().setName("roleinfo").setDescription("Show info about a role")
+            .addRoleOption(o => o.setName("role").setDescription("Role").setRequired(true)),
+
+        new SlashCommandBuilder().setName("banner").setDescription("Show a user's banner")
+            .addUserOption(o => o.setName("user").setDescription("User (leave empty for yourself)").setRequired(false)),
+
+        new SlashCommandBuilder().setName("history").setDescription("Show recent moderation history for a user")
+            .addUserOption(o => o.setName("user").setDescription("User").setRequired(true)),
+
         new SlashCommandBuilder().setName("antinuke").setDescription("Anti-Nuke settings")
             .addSubcommand(s => s.setName("status").setDescription("Show anti-nuke status"))
             .addSubcommand(s => s.setName("enable").setDescription("Enable anti-nuke"))
@@ -827,7 +874,7 @@ client.once("ready", async () => {
     }
     await Promise.all(jobs);
 
-    client.user.setActivity("Eagle County Roleplay | V.2.1");
+    client.user.setActivity("Eagle County Roleplay | " + BOT_VERSION);
 
     for (const guild of client.guilds.cache.values()) {
         const gc = getGuildConfig(guild.id);
@@ -890,7 +937,7 @@ async function tryDM(user, embed) {
 }
 
 // ==========================================
-// SETUP MENU
+// SETUP MENU (abbreviated — same as V.2.1)
 // ==========================================
 
 function fmtCh(gc, k)   { return gc[k] ? "<#" + gc[k] + ">" : "❌ Not set"; }
@@ -901,12 +948,12 @@ function buildSetupEmbed(guild) {
     const gc = getGuildConfig(guild.id);
     const an = gc.antinuke;
     const am = gc.automod;
-    const watchCount = Object.values(an.watchlist).filter(e => e > Date.now()).length;
+    const watchCount = Object.values(an.watchlist).filter(e => Date.now() < e).length;
     const afkCount = Object.keys(gc.afk).length;
     const activeGiveaways = Object.values(gc.giveaways || {}).filter(g => !g.ended).length;
 
     return new EmbedBuilder()
-        .setTitle("⚙️ " + guild.name + " — Setup Menu (V.2.1)")
+        .setTitle("⚙️ " + guild.name + " — Setup Menu (" + BOT_VERSION + ")")
         .setDescription("**Quick Overview** — use the buttons below to configure each section.")
         .setColor(WEBHOOK_COLOR)
         .setThumbnail(guild.iconURL({ size: 256 }))
@@ -932,8 +979,7 @@ function buildSetupEmbed(guild) {
                 name: "📁 Key Channels",
                 value:
                     "**Log:** " + fmtCh(gc, "logChannelId") + " • **Staff Log:** " + fmtCh(gc, "staffLogChannelId") + "\n" +
-                    "**HR Log:** " + fmtCh(gc, "hrLogChannelId") + " • **Welcome:** " + fmtCh(gc, "welcomeChannelId") + "\n" +
-                    "_Set the rest in the **Channels** menu._",
+                    "**HR Log:** " + fmtCh(gc, "hrLogChannelId") + " • **Welcome:** " + fmtCh(gc, "welcomeChannelId"),
                 inline: false
             },
             {
@@ -944,7 +990,7 @@ function buildSetupEmbed(guild) {
                 inline: false
             }
         )
-        .setFooter({ text: "V.2.1 • " + guild.name, iconURL: guild.iconURL() || undefined })
+        .setFooter({ text: BOT_VERSION + " • " + guild.name, iconURL: guild.iconURL() || undefined })
         .setTimestamp();
 }
 
@@ -1099,10 +1145,10 @@ function buildTemplatesMenuRows() {
 const PERM_GROUPS = {
     setup: { name: "⚙️ Setup & Config", commands: ["setup", "setprefix", "setupverify", "setuptickets", "set-webhook", "remove-webhook", "antinuke"] },
     hr:    { name: "👑 HR / Applications", commands: ["acceptsetup", "accept", "deny", "promote", "demote", "infract"] },
-    mod:   { name: "🔨 Moderation & Utility", commands: ["mute", "unmute", "warn", "kick", "ban", "unban", "roles"] },
+    mod:   { name: "🔨 Moderation & Utility", commands: ["mute", "unmute", "warn", "kick", "ban", "unban", "roles", "history"] },
     logs:  { name: "📝 Logging", commands: ["loguser"] },
     events:{ name: "🎉 Events", commands: ["poll", "giveaway"] },
-    public:{ name: "🌐 Public & Fun", commands: ["suggest", "staff-feedback", "help", "serverinfo", "afk", "av"] }
+    public:{ name: "🌐 Public & Fun", commands: ["suggest", "staff-feedback", "help", "serverinfo", "afk", "av", "botinfo", "ping", "uptime", "invite", "membercount", "userinfo", "roleinfo", "banner"] }
 };
 
 function buildPermsMenuRows() {
@@ -1249,7 +1295,7 @@ async function updateSetupMessage(interaction, view) {
 }
 
 // ==========================================
-// POLL / GIVEAWAY BUILDERS
+// POLL / GIVEAWAY BUILDERS + ENDERS
 // ==========================================
 
 function buildPollEmbed(question, options, votes, closed, durationMin) {
@@ -1322,10 +1368,6 @@ function buildGiveawayRows(giveawayId, closed) {
     )];
 }
 
-// ==========================================
-// POLL / GIVEAWAY END
-// ==========================================
-
 async function endPoll(pollId) {
     const p = polls.get(pollId);
     if (!p || p.ended) return;
@@ -1391,6 +1433,7 @@ async function doMute(guild, executor, targetMember, durationInput, reason) {
     try {
         await targetMember.timeout(duration, reason);
         limit.mutes++; saveConfig();
+        recordHistory(targetMember.id, { type: "mute", reason, moderator: executor.tag, at: Date.now(), guildId: guild.id, duration: durationInput });
         const embed = logEmbed("Member Muted",
             "**User:** " + targetMember + " (" + targetMember.user.tag + ")\n**Mod:** " + executor + "\n**Duration:** " + durationInput + "\n**Reason:** " + reason);
         broadcast(guild, embed, ["log", "staff", "webhook"]).catch(() => {});
@@ -1410,6 +1453,7 @@ async function doUnmute(guild, executor, targetMember, reason) {
 
 async function doWarn(guild, executor, targetMember, reason) {
     if (!targetMember) return { ok: false, msg: "Member not found." };
+    recordHistory(targetMember.id, { type: "warn", reason, moderator: executor.tag, at: Date.now(), guildId: guild.id });
     const embed = logEmbed("Member Warned", "**User:** " + targetMember + "\n**Mod:** " + executor + "\n**Reason:** " + reason, 0xFEE75C);
     broadcast(guild, embed, ["log", "staff", "webhook"]).catch(() => {});
     targetMember.send({ embeds: [logEmbed("You were warned in " + guild.name, "**Reason:** " + reason, 0xFEE75C)] }).catch(() => {});
@@ -1422,6 +1466,7 @@ async function doKick(guild, executor, targetMember, reason) {
     if (!canModerate(executor, targetMember)) return { ok: false, msg: "Role hierarchy blocks this." };
     try {
         await targetMember.kick(reason);
+        recordHistory(targetMember.id, { type: "kick", reason, moderator: executor.tag, at: Date.now(), guildId: guild.id });
         const embed = logEmbed("Member Kicked", "**User:** " + targetMember.user.tag + "\n**Mod:** " + executor + "\n**Reason:** " + reason);
         broadcast(guild, embed, ["log", "staff", "webhook"]).catch(() => {});
         return { ok: true, msg: targetMember.user.tag + " has been kicked." };
@@ -1434,6 +1479,7 @@ async function doBan(guild, executor, targetMember, reason) {
     if (!canModerate(executor, targetMember)) return { ok: false, msg: "Role hierarchy blocks this." };
     try {
         await targetMember.ban({ reason });
+        recordHistory(targetMember.id, { type: "ban", reason, moderator: executor.tag, at: Date.now(), guildId: guild.id });
         const embed = logEmbed("Member Banned", "**User:** " + targetMember.user.tag + "\n**Mod:** " + executor + "\n**Reason:** " + reason);
         broadcast(guild, embed, ["log", "staff", "webhook"]).catch(() => {});
         return { ok: true, msg: targetMember.user.tag + " has been banned." };
@@ -1478,10 +1524,6 @@ async function doLogUser(guild, executor, username, punishment, reason, notes) {
     broadcast(guild, embed, ["staff", "log", "webhook"]).catch(() => {});
     return { ok: true, msg: "**" + meta.label + "** logged for **" + (robloxData?.username || username) + "**." };
 }
-
-// ==========================================
-// SHARED: accept / deny / promote / demote / infract
-// ==========================================
 
 async function doAccept(guild, executor, targetUser, notes) {
     const gc = getGuildConfig(guild.id);
@@ -1548,6 +1590,7 @@ async function doDemote(guild, executor, targetUser, rank, notes) {
 async function doInfract(guild, executor, targetUser, type, reason, notes) {
     const dmSent = await tryDM(targetUser, buildTemplateDM(guild, "infract", { type, reason, notes: notes || "" }));
     const colors = { warn: 0xFEE75C, strike: 0xED4245, demotion: 0xED4245, suspension: 0x992D22 };
+    recordHistory(targetUser.id, { type: "infract:" + type, reason, moderator: executor.tag, at: Date.now(), guildId: guild.id });
     const embed = new EmbedBuilder().setTitle("Infraction").setColor(colors[type] || 0xED4245)
         .addFields(
             { name: "User", value: targetUser.tag + " (" + targetUser.id + ")", inline: false },
@@ -1562,89 +1605,202 @@ async function doInfract(guild, executor, targetUser, type, reason, notes) {
 }
 
 // ==========================================
-// TICKET CLOSE (SHARED)
+// V.2.2 NEW UTILITY COMMANDS
 // ==========================================
 
-async function performTicketClose(interaction, guild, member, reason) {
-    const gc = getGuildConfig(guild.id);
-    const channel = interaction.channel;
-    const ticket = gc.tickets[channel.id];
+async function cmdBotInfo(ctx, isSlash) {
+    const uptimeMs = Date.now() - BOT_START_TIME;
+    const mem = process.memoryUsage();
+    const guilds = client.guilds.cache.size;
+    const users = client.guilds.cache.reduce((a, g) => a + g.memberCount, 0);
+    const channels = client.channels.cache.size;
+    const ping = client.ws.ping;
+    const djsVer = djsVersion || "unknown";
 
-    if (!ticket) {
-        return interaction.reply({ embeds: [errorEmbed("This channel is not an active ticket.")], ephemeral: true });
-    }
-
-    const isOwner = interaction.user.id === ticket.userId;
-    const memberTiers = getMemberTiers(member);
-    const isStaffish = memberTiers.size > 0;
-    if (!isOwner && !isStaffish) {
-        return interaction.reply({ embeds: [errorEmbed("Only the ticket owner or staff can close this ticket.")], ephemeral: true });
-    }
-
-    await interaction.reply({ embeds: [infoEmbed("🔒 Closing ticket and generating transcript...")] });
-
-    // Generate transcript (async, non-blocking)
-    (async () => {
-        try {
-            const messages = await channel.messages.fetch({ limit: 500 });
-            const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-            let text = "=== Ticket #" + ticket.number + " Transcript ===\nType: " + ticket.type + "\nUser ID: " + ticket.userId + "\nClosed by: " + interaction.user.tag + " (" + interaction.user.id + ")\nReason: " + (reason || "No reason provided") + "\nClosed at: " + new Date().toISOString() + "\n======================================\n\n";
-            for (const m of sorted) {
-                text += "[" + new Date(m.createdTimestamp).toISOString() + "] " + m.author.tag + ": " + (m.content || "<no text>") + "\n";
-                if (m.attachments.size) for (const a of m.attachments.values()) text += "   [attachment] " + a.url + "\n";
-            }
-            const attachment = new AttachmentBuilder(Buffer.from(text, "utf8"), { name: "transcript-" + ticket.number + "-" + ticket.type + ".txt" });
-            const tEmbed = new EmbedBuilder().setTitle("Ticket Transcript — #" + ticket.number).setColor(WEBHOOK_COLOR)
-                .addFields(
-                    { name: "Type", value: ticket.type, inline: true },
-                    { name: "Owner", value: "<@" + ticket.userId + ">", inline: true },
-                    { name: "Closed By", value: interaction.user.tag, inline: true },
-                    { name: "Reason", value: (reason || "No reason provided").slice(0, 1024), inline: false }
-                ).setTimestamp();
-            await sendTranscript(guild, attachment, tEmbed);
-        } catch (e) { console.error("transcript:", e); }
-    })();
-
-    // Mark ticket closed
-    ticket.open = false;
-    ticket.closedAt = Date.now();
-    ticket.closedBy = interaction.user.id;
-    ticket.closeReason = reason || "No reason provided";
-    saveConfig();
-
-    // DM the opener
-    try {
-        const opener = await client.users.fetch(ticket.userId).catch(() => null);
-        if (opener) {
-            opener.send({
-                embeds: [new EmbedBuilder()
-                    .setTitle("🎫 Ticket Closed")
-                    .setDescription(
-                        "Your ticket **#" + ticket.number + "** in **" + guild.name + "** has been closed.\n\n" +
-                        "**Closed by:** " + interaction.user.tag + "\n" +
-                        "**Reason:** " + (reason || "No reason provided")
-                    )
-                    .setColor(WEBHOOK_COLOR)
-                    .setThumbnail(guild.iconURL({ size: 256 }))
-                    .setTimestamp()]
-            }).catch(() => {});
-        }
-    } catch {}
-
-    // Log
-    const logE = new EmbedBuilder().setTitle("Ticket Closed").setColor(0xED4245)
+    const embed = new EmbedBuilder()
+        .setTitle("🤖 Bot Info — " + client.user.username)
+        .setThumbnail(client.user.displayAvatarURL({ size: 256 }))
+        .setColor(WEBHOOK_COLOR)
         .addFields(
-            { name: "Ticket #", value: String(ticket.number), inline: true },
-            { name: "Type", value: ticket.type, inline: true },
-            { name: "Closed By", value: interaction.user.tag, inline: true },
-            { name: "Reason", value: (reason || "No reason provided").slice(0, 1024), inline: false }
-        ).setTimestamp();
-    broadcast(guild, logE, ["ticket", "webhook"]).catch(() => {});
+            { name: "Version", value: BOT_VERSION, inline: true },
+            { name: "Uptime", value: formatDuration(uptimeMs), inline: true },
+            { name: "Ping", value: ping + "ms", inline: true },
+            { name: "Servers", value: String(guilds), inline: true },
+            { name: "Users", value: String(users), inline: true },
+            { name: "Channels", value: String(channels), inline: true },
+            { name: "discord.js", value: "v" + djsVer, inline: true },
+            { name: "Node.js", value: process.version, inline: true },
+            { name: "Memory", value: formatBytes(mem.heapUsed) + " / " + formatBytes(mem.heapTotal), inline: true },
+            { name: "Bot ID", value: client.user.id, inline: false },
+            { name: "Created", value: "<t:" + ((client.user.createdTimestamp / 1000) | 0) + ":R>", inline: true }
+        )
+        .setFooter({ text: BOT_VERSION, iconURL: client.user.displayAvatarURL() })
+        .setTimestamp();
 
-    // Delete the channel after 5s
-    setTimeout(async () => {
-        try { await channel.delete("Ticket closed"); } catch {}
-    }, 5000);
+    if (isSlash) await ctx.reply({ embeds: [embed] });
+    else await ctx.reply({ embeds: [embed] });
+}
+
+async function cmdPing(ctx, isSlash) {
+    const sent = Date.now();
+    if (isSlash) {
+        const m = await ctx.reply({ content: "🏓 Pinging..." });
+        const roundtrip = Date.now() - sent;
+        const embed = new EmbedBuilder().setDescription("🏓 **Pong!**\n**WebSocket:** `" + client.ws.ping + "ms`\n**Roundtrip:** `" + roundtrip + "ms`").setColor(0x57F287).setTimestamp();
+        await ctx.editReply({ content: "", embeds: [embed] });
+    } else {
+        const m = await ctx.reply({ content: "🏓 Pinging..." });
+        const roundtrip = Date.now() - sent;
+        const embed = new EmbedBuilder().setDescription("🏓 **Pong!**\n**WebSocket:** `" + client.ws.ping + "ms`\n**Roundtrip:** `" + roundtrip + "ms`").setColor(0x57F287).setTimestamp();
+        m.edit({ content: "", embeds: [embed] }).catch(() => {});
+    }
+}
+
+async function cmdUptime(ctx, isSlash) {
+    const embed = new EmbedBuilder()
+        .setDescription("⏱️ **Uptime:** " + formatDuration(Date.now() - BOT_START_TIME) + "\n**Started:** <t:" + ((BOT_START_TIME / 1000) | 0) + ":R>")
+        .setColor(WEBHOOK_COLOR).setTimestamp();
+    if (isSlash) await ctx.reply({ embeds: [embed] });
+    else await ctx.reply({ embeds: [embed] });
+}
+
+async function cmdInvite(ctx, isSlash) {
+    const url = "https://discord.com/oauth2/authorize?client_id=" + client.user.id + "&permissions=8&scope=bot%20applications.commands";
+    const embed = new EmbedBuilder()
+        .setTitle("🔗 Invite Link")
+        .setDescription("[Click here to invite me](" + url + ")")
+        .setColor(WEBHOOK_COLOR).setTimestamp();
+    if (isSlash) await ctx.reply({ embeds: [embed] });
+    else await ctx.reply({ embeds: [embed] });
+}
+
+async function cmdMemberCount(ctx, isSlash) {
+    const guild = ctx.guild;
+    await guild.members.fetch().catch(() => {});
+    const total = guild.memberCount;
+    const bots = guild.members.cache.filter(m => m.user.bot).size;
+    const humans = total - bots;
+    const online = guild.members.cache.filter(m => m.presence?.status && m.presence.status !== "offline").size;
+
+    const embed = new EmbedBuilder()
+        .setTitle("👥 Member Count — " + guild.name)
+        .setColor(WEBHOOK_COLOR)
+        .addFields(
+            { name: "Total", value: String(total), inline: true },
+            { name: "Humans", value: String(humans), inline: true },
+            { name: "Bots", value: String(bots), inline: true },
+            { name: "Online (cached)", value: String(online), inline: true }
+        )
+        .setTimestamp();
+    if (isSlash) await ctx.reply({ embeds: [embed] });
+    else await ctx.reply({ embeds: [embed] });
+}
+
+async function cmdUserInfo(ctx, isSlash, targetUser) {
+    const guild = ctx.guild;
+    const user = targetUser || (isSlash ? ctx.user : ctx.author);
+    const member = await guild.members.fetch(user.id).catch(() => null);
+
+    const embed = new EmbedBuilder()
+        .setTitle("👤 " + user.tag)
+        .setThumbnail(user.displayAvatarURL({ size: 256 }))
+        .setColor(member?.displayHexColor !== "#000000" ? (member?.displayColor || WEBHOOK_COLOR) : WEBHOOK_COLOR)
+        .addFields(
+            { name: "Username", value: user.username, inline: true },
+            { name: "Display Name", value: member?.displayName || user.username, inline: true },
+            { name: "ID", value: user.id, inline: true },
+            { name: "Bot?", value: user.bot ? "Yes" : "No", inline: true },
+            { name: "Account Created", value: "<t:" + ((user.createdTimestamp / 1000) | 0) + ":F>\n(<t:" + ((user.createdTimestamp / 1000) | 0) + ":R>)", inline: true }
+        )
+        .setFooter({ text: "Requested by " + (isSlash ? ctx.user.tag : ctx.author.tag) })
+        .setTimestamp();
+
+    if (member) {
+        embed.addFields(
+            { name: "Joined Server", value: member.joinedTimestamp ? "<t:" + ((member.joinedTimestamp / 1000) | 0) + ":F>\n(<t:" + ((member.joinedTimestamp / 1000) | 0) + ":R>)" : "Unknown", inline: true },
+            { name: "Highest Role", value: member.roles.highest.toString(), inline: true },
+            { name: "Roles (" + (member.roles.cache.size - 1) + ")", value: member.roles.cache.filter(r => r.id !== guild.id).map(r => r.toString()).slice(0, 15).join(", ") || "None", inline: false }
+        );
+        if (member.premiumSinceTimestamp) {
+            embed.addFields({ name: "Boosting Since", value: "<t:" + ((member.premiumSinceTimestamp / 1000) | 0) + ":R>", inline: true });
+        }
+    }
+
+    const flags = user.flags?.toArray() || [];
+    if (flags.length) embed.addFields({ name: "Flags", value: flags.join(", "), inline: false });
+
+    if (isSlash) await ctx.reply({ embeds: [embed] });
+    else await ctx.reply({ embeds: [embed] });
+}
+
+async function cmdRoleInfo(ctx, isSlash, role) {
+    const guild = ctx.guild;
+    const members = guild.members.cache.filter(m => m.roles.cache.has(role.id)).size;
+    const perms = role.permissions.toArray().map(p => p.replace(/([A-Z])/g, " $1").toLowerCase());
+
+    const embed = new EmbedBuilder()
+        .setTitle("🎭 Role Info — " + role.name)
+        .setColor(role.hexColor !== "#000000" ? role.color : WEBHOOK_COLOR)
+        .addFields(
+            { name: "Name", value: role.name, inline: true },
+            { name: "ID", value: role.id, inline: true },
+            { name: "Color", value: role.hexColor, inline: true },
+            { name: "Position", value: String(role.position), inline: true },
+            { name: "Hoisted", value: role.hoist ? "Yes" : "No", inline: true },
+            { name: "Mentionable", value: role.mentionable ? "Yes" : "No", inline: true },
+            { name: "Managed", value: role.managed ? "Yes" : "No", inline: true },
+            { name: "Members", value: String(members), inline: true },
+            { name: "Created", value: "<t:" + ((role.createdTimestamp / 1000) | 0) + ":R>", inline: true },
+            { name: "Permissions", value: perms.length ? perms.slice(0, 25).map(p => "`" + p + "`").join(", ") : "None", inline: false }
+        )
+        .setTimestamp();
+    if (isSlash) await ctx.reply({ embeds: [embed] });
+    else await ctx.reply({ embeds: [embed] });
+}
+
+async function cmdBanner(ctx, isSlash, targetUser) {
+    const user = targetUser || (isSlash ? ctx.user : ctx.author);
+    const full = await client.users.fetch(user.id, { force: true }).catch(() => null);
+    const banner = full?.bannerURL({ size: 1024 });
+    if (!banner) {
+        const embed = new EmbedBuilder().setDescription("❌ **" + user.tag + "** has no banner.").setColor(0xED4245).setTimestamp();
+        if (isSlash) return ctx.reply({ embeds: [embed] });
+        return ctx.reply({ embeds: [embed] });
+    }
+    const embed = new EmbedBuilder()
+        .setTitle("🖼️ " + user.username + "'s Banner")
+        .setImage(banner)
+        .setColor(WEBHOOK_COLOR)
+        .setFooter({ text: "Requested by " + (isSlash ? ctx.user.tag : ctx.author.tag) })
+        .setTimestamp();
+    if (isSlash) await ctx.reply({ embeds: [embed] });
+    else await ctx.reply({ embeds: [embed] });
+}
+
+async function cmdHistory(ctx, isSlash, targetUser) {
+    const guild = ctx.guild;
+    const entries = _userHistory.get(targetUser.id) || [];
+    const guildEntries = entries.filter(e => e.guildId === guild.id);
+
+    const embed = new EmbedBuilder()
+        .setTitle("📜 Moderation History — " + targetUser.tag)
+        .setColor(WEBHOOK_COLOR)
+        .setThumbnail(targetUser.displayAvatarURL())
+        .setFooter({ text: "Last 15 entries • " + guild.name })
+        .setTimestamp();
+
+    if (!guildEntries.length) {
+        embed.setDescription("No moderation history found in this server.\n\n_Note: history is in-memory only — it resets when the bot restarts._");
+    } else {
+        embed.setDescription(
+            guildEntries.slice(0, 15).map((e, i) => {
+                return "**" + (i + 1) + ". " + e.type.toUpperCase() + "** — " + e.moderator + "\n> " + (e.reason || "No reason") + " • <t:" + ((e.at / 1000) | 0) + ":R>";
+            }).join("\n\n")
+        );
+    }
+
+    if (isSlash) await ctx.reply({ embeds: [embed] });
+    else await ctx.reply({ embeds: [embed] });
 }
 
 // ==========================================
@@ -1669,6 +1825,18 @@ client.on("interactionCreate", async interaction => {
             return interaction.reply({ embeds: [errorEmbed("You don't have permission to use this command.\n**Required:** " + fmtTiers(required))], ephemeral: true });
         }
 
+        // ---- V.2.2 NEW QOL COMMANDS ----
+        if (command === "botinfo" || command === "stats")   return cmdBotInfo(interaction, true);
+        if (command === "ping")                              return cmdPing(interaction, true);
+        if (command === "uptime")                            return cmdUptime(interaction, true);
+        if (command === "invite")                            return cmdInvite(interaction, true);
+        if (command === "membercount")                       return cmdMemberCount(interaction, true);
+        if (command === "userinfo")                          return cmdUserInfo(interaction, true, interaction.options.getUser("user"));
+        if (command === "roleinfo")                          return cmdRoleInfo(interaction, true, interaction.options.getRole("role"));
+        if (command === "banner")                            return cmdBanner(interaction, true, interaction.options.getUser("user"));
+        if (command === "history")                           return cmdHistory(interaction, true, interaction.options.getUser("user"));
+
+        // ---- EXISTING ----
         if (command === "setup") return interaction.reply({ embeds: [buildSetupEmbed(guild)], components: buildSetupRows(), ephemeral: true });
 
         if (command === "setprefix") {
@@ -1709,7 +1877,7 @@ client.on("interactionCreate", async interaction => {
             const sub = interaction.options.getSubcommand();
             const an = gc.antinuke;
             if (sub === "status") {
-                const watchCount = Object.values(an.watchlist).filter(e => e > Date.now()).length;
+                const watchCount = Object.values(an.watchlist).filter(e => Date.now() < e).length;
                 return interaction.reply({ embeds: [new EmbedBuilder().setTitle("🛡️ Anti-Nuke Status").setColor(WEBHOOK_COLOR)
                     .addFields(
                         { name: "Enabled", value: an.enabled ? "✅" : "❌", inline: true },
@@ -1735,7 +1903,7 @@ client.on("interactionCreate", async interaction => {
             if (sub === "reset")   { an.counters = {}; saveConfig(); return interaction.reply({ embeds: [successEmbed("Reset.")] }); }
         }
 
-        // ---------- HR ----------
+        // ---- HR ----
         if (command === "accept") {
             const targetUser = interaction.options.getUser("user");
             const notes = interaction.options.getString("notes") || null;
@@ -1777,7 +1945,7 @@ client.on("interactionCreate", async interaction => {
             return interaction.editReply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
         }
 
-        // ---------- Moderation ----------
+        // ---- Moderation ----
         if (command === "mute") {
             const target = await guild.members.fetch(interaction.options.getUser("user").id).catch(() => null);
             const reason = interaction.options.getString("reason") || "No reason provided";
@@ -1815,7 +1983,7 @@ client.on("interactionCreate", async interaction => {
             return interaction.editReply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
         }
 
-        // ---------- Logging ----------
+        // ---- Logging ----
         if (command === "loguser") {
             await interaction.deferReply();
             const r = await doLogUser(guild, interaction.user,
@@ -1826,7 +1994,7 @@ client.on("interactionCreate", async interaction => {
             return interaction.editReply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
         }
 
-        // ---------- Events ----------
+        // ---- Events ----
         if (command === "poll") {
             const question = interaction.options.getString("question");
             const options = [];
@@ -1876,19 +2044,18 @@ client.on("interactionCreate", async interaction => {
             return;
         }
 
-        // ---------- Utility ----------
+        // ---- Utility ----
         if (command === "roles")      return cmdRoles(interaction, true);
         if (command === "serverinfo") return cmdServerInfo(interaction, true);
         if (command === "afk")        return cmdAfk(interaction, true, interaction.options.getString("reason"));
         if (command === "av")         return cmdAv(interaction, true, interaction.options.getUser("user"));
 
-        // ---------- Ticket close aliases ----------
         if (command === "close" || command === "closeticket" || command === "ticketclose") {
             const reason = interaction.options.getString("reason") || null;
             return performTicketClose(interaction, guild, interaction.member, reason);
         }
 
-        // ---------- Public ----------
+        // ---- Public ----
         if (command === "suggest") {
             if (!gc.suggestionChannelId) return interaction.reply({ embeds: [errorEmbed("Suggestions channel not set.")], ephemeral: true });
             const suggestion = interaction.options.getString("suggestion");
@@ -1917,19 +2084,19 @@ client.on("interactionCreate", async interaction => {
 
         if (command === "help") {
             const prefix = getPrefix(guild.id);
-            const embed = new EmbedBuilder().setTitle(guild.name + " — Bot Commands V.2.1")
+            const embed = new EmbedBuilder().setTitle(guild.name + " — Bot Commands " + BOT_VERSION)
                 .setColor(WEBHOOK_COLOR).setThumbnail(guild.iconURL())
                 .addFields(
-                    { name: "Setup (Management)", value: "`/setup` `/setupverify` `/setuptickets`", inline: false },
-                    { name: "Anti-Nuke", value: "`/antinuke status|enable|disable`\n`/antinuke threshold <n>` `/antinuke whitelist-*` `/antinuke watchlist`", inline: false },
-                    { name: "HR", value: "`/accept` `/deny` `/promote` `/demote` `/infract`", inline: false },
-                    { name: "Moderation", value: "`/mute` `/unmute` `/warn` `/kick` `/ban` `/unban`", inline: false },
-                    { name: "Tickets", value: "`/close` `/closeticket` `/ticketclose` — close current ticket\n`/setupverify` `/setuptickets`", inline: false },
-                    { name: "Logging", value: "`/loguser <user> <Warn|Kick|Ban> <reason>`", inline: false },
-                    { name: "Events", value: "`/poll` `/giveaway`", inline: false },
-                    { name: "Utility", value: "`/roles` `/serverinfo` `/av` `/afk`", inline: false },
-                    { name: "Public", value: "`/suggest` `/staff-feedback`", inline: false },
-                    { name: "Prefix Support", value: "All commands above also work with `" + prefix + "` prefix. Ticket-close aliases: `" + prefix + "close`, `" + prefix + "closeticket`, `" + prefix + "ticketclose`", inline: false }
+                    { name: "🛠️ Setup (Management)", value: "`/setup` `/setupverify` `/setuptickets`", inline: false },
+                    { name: "🛡️ Anti-Nuke", value: "`/antinuke status|enable|disable`\n`/antinuke threshold <n>` `/antinuke whitelist-*` `/antinuke watchlist`", inline: false },
+                    { name: "👑 HR", value: "`/accept` `/deny` `/promote` `/demote` `/infract`", inline: false },
+                    { name: "🔨 Moderation", value: "`/mute` `/unmute` `/warn` `/kick` `/ban` `/unban`", inline: false },
+                    { name: "🎫 Tickets", value: "`/close` `/closeticket` `/ticketclose`", inline: false },
+                    { name: "📝 Logging", value: "`/loguser <user> <Warn|Kick|Ban> <reason>`", inline: false },
+                    { name: "🎉 Events", value: "`/poll` `/giveaway`", inline: false },
+                    { name: "🔧 Utility (V.2.2)", value: "`/botinfo` `/stats` `/ping` `/uptime` `/invite` `/membercount`\n`/userinfo [user]` `/roleinfo <role>` `/banner [user]`\n`/roles` `/serverinfo` `/av [user]` `/afk [reason]` `/history <user>`", inline: false },
+                    { name: "🌐 Public", value: "`/suggest` `/staff-feedback`", inline: false },
+                    { name: "💬 Prefix", value: "All commands work with `" + prefix + "` prefix.\nExamples: `" + prefix + "botinfo`, `" + prefix + "ping`, `" + prefix + "userinfo @user`, `" + prefix + "close`", inline: false }
                 );
             return interaction.reply({ embeds: [embed] });
         }
@@ -1944,7 +2111,7 @@ client.on("interactionCreate", async interaction => {
 });
 
 // ==========================================
-// BUTTON HANDLER
+// BUTTON HANDLER (unchanged from V.2.1)
 // ==========================================
 
 async function handleButton(interaction) {
@@ -1995,7 +2162,6 @@ async function handleButton(interaction) {
         return;
     }
 
-    // ---- TICKET CLOSE CONFIRMATION BUTTONS ----
     if (id.startsWith("ticket_close_confirm_") || id.startsWith("ticket_close_cancel_")) {
         const isConfirm = id.startsWith("ticket_close_confirm_");
         const rest = id.slice(isConfirm ? "ticket_close_confirm_".length : "ticket_close_cancel_".length);
@@ -2003,12 +2169,8 @@ async function handleButton(interaction) {
         const reason = reasonParts.join("|") || "No reason provided";
 
         const pending = _pendingCloseConfirmations.get(interaction.message.id);
-        if (!pending) {
-            return interaction.reply({ embeds: [errorEmbed("This confirmation has expired.")], ephemeral: true });
-        }
-        if (pending.userId !== interaction.user.id) {
-            return interaction.reply({ embeds: [errorEmbed("Only the person who initiated this close can confirm.")], ephemeral: true });
-        }
+        if (!pending) return interaction.reply({ embeds: [errorEmbed("This confirmation has expired.")], ephemeral: true });
+        if (pending.userId !== interaction.user.id) return interaction.reply({ embeds: [errorEmbed("Only the person who initiated this close can confirm.")], ephemeral: true });
 
         _pendingCloseConfirmations.delete(interaction.message.id);
 
@@ -2017,20 +2179,15 @@ async function handleButton(interaction) {
             return;
         }
 
-        // Perform the close
         await interaction.update({ embeds: [infoEmbed("🔒 Closing ticket...")], components: [] }).catch(() => {});
 
         const ticketChannel = await client.channels.fetch(ticketChannelId).catch(() => null);
         if (!ticketChannel) return;
 
         const ticket = gc.tickets[ticketChannelId];
-        if (!ticket || !ticket.open) {
-            return interaction.followUp({ embeds: [errorEmbed("This ticket is already closed.")], ephemeral: true }).catch(() => {});
-        }
+        if (!ticket || !ticket.open) return interaction.followUp({ embeds: [errorEmbed("This ticket is already closed.")], ephemeral: true }).catch(() => {});
 
-        // Reuse the same closing flow as performTicketClose but without the interaction.reply()
         await doTicketCloseWork(guild, ticketChannel, ticket, interaction.user, reason);
-
         return;
     }
 
@@ -2230,7 +2387,6 @@ async function handleButton(interaction) {
     if (id === "ticket_type_support")      return handleTicketCreate(interaction, "support");
     if (id === "ticket_type_highrank")     return handleTicketCreate(interaction, "highrank");
     if (id === "ticket_close") {
-        // Show confirmation
         const reason = "Closed via button";
         const row = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId("ticket_close_confirm_" + interaction.channel.id + "|" + reason).setLabel("Confirm Close").setEmoji("✅").setStyle(ButtonStyle.Danger),
@@ -2254,13 +2410,10 @@ async function handleButton(interaction) {
 }
 
 // ==========================================
-// SHARED CLOSE-WORKER (used by prefix, slash, button)
+// SHARED CLOSE WORKER
 // ==========================================
 
 async function doTicketCloseWork(guild, ticketChannel, ticket, executorUser, reason) {
-    const gc = getGuildConfig(guild.id);
-
-    // Generate transcript
     (async () => {
         try {
             const messages = await ticketChannel.messages.fetch({ limit: 500 });
@@ -2288,7 +2441,6 @@ async function doTicketCloseWork(guild, ticketChannel, ticket, executorUser, rea
     ticket.closeReason = reason || "No reason provided";
     saveConfig();
 
-    // DM the opener
     try {
         const opener = await client.users.fetch(ticket.userId).catch(() => null);
         if (opener) {
@@ -2319,6 +2471,36 @@ async function doTicketCloseWork(guild, ticketChannel, ticket, executorUser, rea
     setTimeout(async () => {
         try { await ticketChannel.delete("Ticket closed"); } catch {}
     }, 5000);
+}
+
+async function performTicketClose(interaction, guild, member, reason) {
+    const gc = getGuildConfig(guild.id);
+    const channel = interaction.channel;
+    const ticket = gc.tickets[channel.id];
+
+    if (!ticket) return interaction.reply({ embeds: [errorEmbed("This channel is not an active ticket.")], ephemeral: true });
+
+    const isOwner = interaction.user.id === ticket.userId;
+    const memberTiers = getMemberTiers(member);
+    const isStaffish = memberTiers.size > 0;
+    if (!isOwner && !isStaffish) return interaction.reply({ embeds: [errorEmbed("Only the ticket owner or staff can close this ticket.")], ephemeral: true });
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("ticket_close_confirm_" + channel.id + "|" + (reason || "No reason provided")).setLabel("Confirm Close").setEmoji("✅").setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId("ticket_close_cancel_" + channel.id + "|" + (reason || "No reason provided")).setLabel("Cancel").setEmoji("❌").setStyle(ButtonStyle.Secondary)
+    );
+    const sent = await interaction.reply({
+        embeds: [infoEmbed("Are you sure you want to close this ticket?\n**Reason:** " + (reason || "No reason provided"))],
+        components: [row],
+        fetchReply: true
+    });
+    _pendingCloseConfirmations.set(sent.id, {
+        userId: interaction.user.id,
+        channelId: channel.id,
+        guildId: guild.id,
+        reason: reason || "No reason provided",
+        expiresAt: Date.now() + TICKET_CLOSE_CONFIRM_MS
+    });
 }
 
 // ==========================================
@@ -2491,7 +2673,6 @@ async function handleTicketCreate(interaction, type, prefillReason) {
         { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks] },
         { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ReadMessageHistory] }
     ];
-
     if (pingRoleId && !overwrites.find(o => o.id === pingRoleId)) {
         overwrites.push({ id: pingRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
     }
@@ -2515,14 +2696,7 @@ async function handleTicketCreate(interaction, type, prefillReason) {
         return interaction.editReply({ embeds: [errorEmbed("Could not create the ticket channel.")] });
     }
 
-    gc.tickets[channel.id] = {
-        userId: interaction.user.id,
-        type,
-        number: ticketNumber,
-        name: cfg.slug,
-        open: true,
-        createdAt: Date.now()
-    };
+    gc.tickets[channel.id] = { userId: interaction.user.id, type, number: ticketNumber, name: cfg.slug, open: true, createdAt: Date.now() };
     saveConfig();
 
     const pingParts = [interaction.user.toString()];
@@ -2561,7 +2735,6 @@ async function handleTicketCreate(interaction, type, prefillReason) {
         ).setTimestamp();
     broadcast(guild, logE, ["ticket", "webhook"]).catch(() => {});
 
-    // DM the opener with the ticket link
     interaction.user.send({
         embeds: [new EmbedBuilder()
             .setTitle("🎫 Ticket Created")
@@ -2680,7 +2853,7 @@ function buildTicketRulesEmbed(guild) {
 }
 
 // ==========================================
-// UTILITY COMMANDS
+// UTILITY COMMANDS (roles, serverinfo, afk, av)
 // ==========================================
 
 async function cmdRoles(interactionOrMessage, isSlash) {
@@ -2747,7 +2920,7 @@ async function cmdServerInfo(interactionOrMessage, isSlash) {
 async function cmdAfk(interactionOrMessage, isSlash, reason) {
     const guild = interactionOrMessage.guild;
     const user = isSlash ? interactionOrMessage.user : interactionOrMessage.author;
-    const member = isSlash ? interactionOrMessage.member : interactionOrMessage.member;
+    const member = interactionOrMessage.member;
     const gc = getGuildConfig(guild.id);
 
     const trimmed = (reason || "AFK").slice(0, 200);
@@ -2890,19 +3063,63 @@ client.on("messageCreate", async message => {
         if (command === "help") {
             const embed = new EmbedBuilder().setTitle(guild.name + " — Prefix Commands").setColor(WEBHOOK_COLOR)
                 .addFields(
-                    { name: "Setup", value: "`" + prefix + "help` — this menu\n`" + prefix + "setprefix <p>` — change prefix", inline: false },
-                    { name: "Utility", value: "`" + prefix + "roles` — list roles (staff)\n`" + prefix + "serverinfo`\n`" + prefix + "av [@user]`\n`" + prefix + "afk [reason]`", inline: false },
+                    { name: "Setup", value: "`" + prefix + "help` — this menu\n`" + prefix + "setprefix <p>`", inline: false },
+                    { name: "Utility (V.2.2)", value: "`" + prefix + "botinfo` / `" + prefix + "stats`\n`" + prefix + "ping` / `" + prefix + "uptime` / `" + prefix + "invite`\n`" + prefix + "membercount`\n`" + prefix + "userinfo [@user]`\n`" + prefix + "roleinfo @role`\n`" + prefix + "banner [@user]`\n`" + prefix + "history @user` (staff)\n`" + prefix + "roles` (staff)\n`" + prefix + "serverinfo`\n`" + prefix + "av [@user]`\n`" + prefix + "afk [reason]`", inline: false },
                     { name: "Moderation", value: "`" + prefix + "mute @user 10m [reason]`\n`" + prefix + "unmute @user [reason]`\n`" + prefix + "warn @user [reason]`\n`" + prefix + "kick @user [reason]`\n`" + prefix + "ban @user [reason]`\n`" + prefix + "unban <userId> [reason]`", inline: false },
-                    { name: "HR", value: "`" + prefix + "accept @user [notes]`\n`" + prefix + "deny @user <reason> [notes]`\n`" + prefix + "promote @user <rank> [notes]`\n`" + prefix + "demote @user <rank> [notes]`\n`" + prefix + "infract @user <warn|strike|demotion|suspension> <reason>`", inline: false },
-                    { name: "Tickets", value: "`" + prefix + "close [reason]` — close current ticket\n`" + prefix + "closeticket [reason]`\n`" + prefix + "ticketclose [reason]`", inline: false },
+                    { name: "HR", value: "`" + prefix + "accept @user [notes]`\n`" + prefix + "deny @user <reason>`\n`" + prefix + "promote @user <rank>`\n`" + prefix + "demote @user <rank>`\n`" + prefix + "infract @user <type> <reason>`", inline: false },
+                    { name: "Tickets", value: "`" + prefix + "close [reason]`\n`" + prefix + "closeticket [reason]`\n`" + prefix + "ticketclose [reason]`", inline: false },
                     { name: "Logging", value: "`" + prefix + "loguser <username> <warn|kick|ban> <reason>`", inline: false },
-                    { name: "Events", value: "`" + prefix + "poll <question> | <opt1> | <opt2> ...`\n`" + prefix + "giveaway <prize> <minutes> [winners]`", inline: false },
+                    { name: "Events", value: "`" + prefix + "poll <question> | <opt1> | <opt2>`\n`" + prefix + "giveaway <prize> <minutes> [winners]`", inline: false },
                     { name: "Public", value: "`" + prefix + "suggest <text>`\n`" + prefix + "staff-feedback @user <text>`", inline: false }
                 );
             return message.reply({ embeds: [embed] });
         }
 
-        // ---- UTILITY ----
+        // ---- V.2.2 NEW UTILITY ----
+        if (command === "botinfo" || command === "stats") {
+            if (!canRunCommand(executorMember, "botinfo")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            return cmdBotInfo(message, false);
+        }
+        if (command === "ping") {
+            if (!canRunCommand(executorMember, "ping")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            return cmdPing(message, false);
+        }
+        if (command === "uptime") {
+            if (!canRunCommand(executorMember, "uptime")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            return cmdUptime(message, false);
+        }
+        if (command === "invite") {
+            if (!canRunCommand(executorMember, "invite")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            return cmdInvite(message, false);
+        }
+        if (command === "membercount" || command === "mc") {
+            if (!canRunCommand(executorMember, "membercount")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            return cmdMemberCount(message, false);
+        }
+        if (command === "userinfo" || command === "whois") {
+            if (!canRunCommand(executorMember, "userinfo")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            const target = message.mentions.users.first() || (args[0] ? await resolveUser(client, args[0]) : null) || executor;
+            return cmdUserInfo(message, false, target);
+        }
+        if (command === "roleinfo") {
+            if (!canRunCommand(executorMember, "roleinfo")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            const role = message.mentions.roles.first() || (args[0] ? guild.roles.cache.get(args[0].replace(/\D/g, "")) : null);
+            if (!role) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "roleinfo @role`")] });
+            return cmdRoleInfo(message, false, role);
+        }
+        if (command === "banner") {
+            if (!canRunCommand(executorMember, "banner")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            const target = message.mentions.users.first() || executor;
+            return cmdBanner(message, false, target);
+        }
+        if (command === "history") {
+            if (!canRunCommand(executorMember, "history")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            const target = message.mentions.users.first() || (args[0] ? await resolveUser(client, args[0]) : null);
+            if (!target) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "history @user`")] });
+            return cmdHistory(message, false, target);
+        }
+
+        // ---- EXISTING UTILITY ----
         if (command === "roles") {
             if (!canRunCommand(executorMember, "roles")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
             return cmdRoles(message, false);
@@ -2936,8 +3153,7 @@ client.on("messageCreate", async message => {
         // ---- MODERATION ----
         if (command === "mute") {
             if (!canRunCommand(executorMember, "mute")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
-            const targetInput = args[0];
-            const durationInput = args[1];
+            const targetInput = args[0], durationInput = args[1];
             const reason = args.slice(2).join(" ") || "No reason provided";
             if (!targetInput || !durationInput) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "mute @user 10m [reason]`")] });
             const target = await resolveMember(guild, targetInput);
@@ -3001,9 +3217,7 @@ client.on("messageCreate", async message => {
             const raw = (args[1] || "").toLowerCase();
             const reason = args.slice(2).join(" ");
             const valid = ["warn", "kick", "ban"];
-            if (!username || !valid.includes(raw) || !reason) {
-                return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "loguser <username> <warn|kick|ban> <reason>`")] });
-            }
+            if (!username || !valid.includes(raw) || !reason) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "loguser <username> <warn|kick|ban> <reason>`")] });
             message.channel.sendTyping().catch(() => {});
             const r = await doLogUser(guild, executor, username, raw, reason, null);
             return message.reply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
@@ -3034,8 +3248,7 @@ client.on("messageCreate", async message => {
         }
         if (command === "promote") {
             if (!canRunCommand(executorMember, "promote")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
-            const targetInput = args[0];
-            const rank = args[1];
+            const targetInput = args[0], rank = args[1];
             const notes = args.slice(2).join(" ") || null;
             if (!targetInput || !rank) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "promote @user <rank> [notes]`")] });
             const target = await resolveMember(guild, targetInput);
@@ -3046,8 +3259,7 @@ client.on("messageCreate", async message => {
         }
         if (command === "demote") {
             if (!canRunCommand(executorMember, "demote")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
-            const targetInput = args[0];
-            const rank = args[1];
+            const targetInput = args[0], rank = args[1];
             const notes = args.slice(2).join(" ") || null;
             if (!targetInput || !rank) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "demote @user <rank> [notes]`")] });
             const target = await resolveMember(guild, targetInput);
@@ -3070,18 +3282,16 @@ client.on("messageCreate", async message => {
             return message.reply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
         }
 
-        // ---- TICKET CLOSE ALIASES (prefix) ----
+        // ---- TICKET CLOSE ----
         if (command === "close" || command === "closeticket" || command === "ticketclose") {
             const reason = args.join(" ").slice(0, 400) || null;
             const ticket = gc.tickets[message.channel.id];
             if (!ticket) return message.reply({ embeds: [errorEmbed("This channel is not an active ticket.")] });
-
             const isOwner = executor.id === ticket.userId;
             const memberTiers = getMemberTiers(executorMember);
             const isStaffish = memberTiers.size > 0;
             if (!isOwner && !isStaffish) return message.reply({ embeds: [errorEmbed("Only the ticket owner or staff can close this ticket.")] });
 
-            // Show confirmation buttons
             const row = new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setCustomId("ticket_close_confirm_" + message.channel.id + "|" + (reason || "No reason provided")).setLabel("Confirm Close").setEmoji("✅").setStyle(ButtonStyle.Danger),
                 new ButtonBuilder().setCustomId("ticket_close_cancel_" + message.channel.id + "|" + (reason || "No reason provided")).setLabel("Cancel").setEmoji("❌").setStyle(ButtonStyle.Secondary)
@@ -3091,11 +3301,8 @@ client.on("messageCreate", async message => {
                 components: [row]
             });
             _pendingCloseConfirmations.set(sent.id, {
-                userId: executor.id,
-                channelId: message.channel.id,
-                guildId: guild.id,
-                reason: reason || "No reason provided",
-                expiresAt: Date.now() + TICKET_CLOSE_CONFIRM_MS
+                userId: executor.id, channelId: message.channel.id, guildId: guild.id,
+                reason: reason || "No reason provided", expiresAt: Date.now() + TICKET_CLOSE_CONFIRM_MS
             });
             return;
         }
@@ -3104,7 +3311,7 @@ client.on("messageCreate", async message => {
         if (command === "poll") {
             if (!canRunCommand(executorMember, "poll")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
             const parts = args.join(" ").split("|").map(s => s.trim()).filter(Boolean);
-            if (parts.length < 3) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "poll <question> | <opt1> | <opt2> ...` (min 2 options)")] });
+            if (parts.length < 3) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "poll <question> | <opt1> | <opt2> ...`")] });
             const question = parts[0].slice(0, 250);
             const options = parts.slice(1, 11).map(o => o.slice(0, 80));
             const pollId = crypto.randomBytes(6).toString("hex");
@@ -3119,16 +3326,10 @@ client.on("messageCreate", async message => {
             const prize = args[0];
             const minutes = parseInt(args[1], 10);
             const winners = parseInt(args[2], 10) || 1;
-            if (!prize || !minutes || minutes < 1 || minutes > 10080) {
-                return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "giveaway <prize> <minutes> [winners]`")] });
-            }
+            if (!prize || !minutes || minutes < 1 || minutes > 10080) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "giveaway <prize> <minutes> [winners]`")] });
             const endsAt = Date.now() + minutes * 60 * 1000;
             const giveawayId = crypto.randomBytes(6).toString("hex");
-            const giveaway = {
-                prize: prize.slice(0, 200), winners: Math.min(winners, 20),
-                requiredRoleId: null, hostId: executor.id, endsAt,
-                entries: [], ended: false, channelId: message.channel.id, messageId: null
-            };
+            const giveaway = { prize: prize.slice(0, 200), winners: Math.min(winners, 20), requiredRoleId: null, hostId: executor.id, endsAt, entries: [], ended: false, channelId: message.channel.id, messageId: null };
             const msg = await message.channel.send({ embeds: [buildGiveawayEmbed(giveaway, false, [])], components: buildGiveawayRows(giveawayId, false) });
             giveaway.messageId = msg.id;
             gc.giveaways[giveawayId] = giveaway;
@@ -3192,7 +3393,6 @@ client.on("messageDelete", async message => {
         const tracked = _recentPingedMessages.get(message.id);
         if (!tracked) return;
         _recentPingedMessages.delete(message.id);
-
         if (Date.now() - tracked.at > GHOST_PING_TTL) return;
 
         const author = await message.guild.members.fetch(tracked.authorId).catch(() => null);
@@ -3204,8 +3404,7 @@ client.on("messageDelete", async message => {
                 "**User:** " + author.user.tag + " (" + author.id + ")\n" +
                 "**Channel:** <#" + tracked.channelId + ">\n" +
                 "**Pinged:** " + tracked.mentions.map(id => "<@" + id + ">").join(", ") + "\n" +
-                "**Content:** " + (tracked.content || "*empty*") + "\n\n" +
-                "⚠️ Auto-warned for ghost-pinging."
+                "**Content:** " + (tracked.content || "*empty*") + "\n\n⚠️ Auto-warned for ghost-pinging."
             )
             .setThumbnail(author.user.displayAvatarURL())
             .setTimestamp();
