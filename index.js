@@ -1,5 +1,5 @@
- // ==========================================
-// EAGLE COUNTY ROLEPLAY BOT - V.2.2
+// ==========================================
+// EAGLE COUNTY ROLEPLAY BOT - V.2.3
 // ==========================================
 
 const {
@@ -20,7 +20,7 @@ dotenv.config();
 const TOKEN = process.env.TOKEN;
 if (!TOKEN) { console.error("ERROR: TOKEN missing from .env"); process.exit(1); }
 
-const BOT_VERSION = "V.2.2";
+const BOT_VERSION = "V.2.3";
 const BOT_START_TIME = Date.now();
 
 // ==========================================
@@ -41,6 +41,7 @@ const GHOST_PING_TTL = 60 * 1000;
 const GHOST_MAP_MAX = 500;
 
 const TICKET_CLOSE_CONFIRM_MS = 30 * 1000;
+const SNIPE_TTL = 5 * 60 * 1000;
 
 const DEFAULT_ANTINUKE = {
     enabled: true, threshold: 5, windowMs: 60000,
@@ -97,6 +98,20 @@ const DEFAULT_COMMAND_PERMS = {
     afk: ["everyone"],
     av: ["everyone"],
 
+    // ===== V.2.3 NEW =====
+    slowmode: ["staff", "admin", "highrank", "management"],
+    lock: ["staff", "admin", "highrank", "management"],
+    unlock: ["staff", "admin", "highrank", "management"],
+    purge: ["staff", "admin", "highrank", "management"],
+    deafen: ["staff", "admin", "highrank", "management"],
+    undeafen: ["staff", "admin", "highrank", "management"],
+    moveall: ["staff", "admin", "highrank", "management"],
+    announce: ["highrank", "management"],
+    addrole: ["staff", "admin", "highrank", "management"],
+    removerole: ["staff", "admin", "highrank", "management"],
+    nickname: ["staff", "admin", "highrank", "management"],
+    snipe: ["staff", "admin", "highrank", "management"],
+
     suggest: ["everyone"], "staff-feedback": ["everyone"], help: ["everyone"]
 };
 
@@ -136,7 +151,8 @@ const _prefixCache = new Map();
 const _memberTierCache = new Map();
 const _tierCacheTTL = 30_000;
 const _pendingCloseConfirmations = new Map();
-const _userHistory = new Map(); // userId -> [{type, reason, moderator, at, guildId}]
+const _userHistory = new Map();
+const _snipeCache = new Map(); // channelId -> { author, content, at, attachments }
 
 // ==========================================
 // CONFIG
@@ -802,7 +818,7 @@ function getSlashCommands() {
         new SlashCommandBuilder().setName("ticketclose").setDescription("Close the current ticket")
             .addStringOption(o => o.setName("reason").setDescription("Reason for closing").setRequired(false).setMaxLength(400)),
 
-        // ========== V.2.2 QOL COMMANDS ==========
+        // ========== V.2.2 COMMANDS ==========
         new SlashCommandBuilder().setName("botinfo").setDescription("Show information about this bot"),
         new SlashCommandBuilder().setName("stats").setDescription("Alias for /botinfo"),
         new SlashCommandBuilder().setName("ping").setDescription("Check the bot's latency"),
@@ -821,6 +837,50 @@ function getSlashCommands() {
 
         new SlashCommandBuilder().setName("history").setDescription("Show recent moderation history for a user")
             .addUserOption(o => o.setName("user").setDescription("User").setRequired(true)),
+
+        // ========== V.2.3 NEW COMMANDS ==========
+        new SlashCommandBuilder().setName("slowmode").setDescription("Set channel slowmode (0 to disable)")
+            .addIntegerOption(o => o.setName("seconds").setDescription("Seconds (0-21600)").setRequired(true).setMinValue(0).setMaxValue(21600)),
+
+        new SlashCommandBuilder().setName("lock").setDescription("Lock the current channel for @everyone")
+            .addStringOption(o => o.setName("reason").setDescription("Reason").setRequired(false).setMaxLength(300)),
+        new SlashCommandBuilder().setName("unlock").setDescription("Unlock the current channel")
+            .addStringOption(o => o.setName("reason").setDescription("Reason").setRequired(false).setMaxLength(300)),
+
+        new SlashCommandBuilder().setName("purge").setDescription("Bulk delete messages in this channel")
+            .addIntegerOption(o => o.setName("amount").setDescription("Number of messages (1-100)").setRequired(true).setMinValue(1).setMaxValue(100))
+            .addUserOption(o => o.setName("user").setDescription("Only delete messages from this user (optional)").setRequired(false)),
+
+        new SlashCommandBuilder().setName("deafen").setDescription("Server-deafen a member in voice")
+            .addUserOption(o => o.setName("user").setDescription("Member").setRequired(true))
+            .addStringOption(o => o.setName("reason").setDescription("Reason").setRequired(false)),
+
+        new SlashCommandBuilder().setName("undeafen").setDescription("Remove server-deafen")
+            .addUserOption(o => o.setName("user").setDescription("Member").setRequired(true))
+            .addStringOption(o => o.setName("reason").setDescription("Reason").setRequired(false)),
+
+        new SlashCommandBuilder().setName("moveall").setDescription("Move everyone in your voice channel to another")
+            .addChannelOption(o => o.setName("channel").setDescription("Target voice channel").setRequired(true)
+                .addChannelTypes(ChannelType.GuildVoice, ChannelType.GuildStageVoice)),
+
+        new SlashCommandBuilder().setName("announce").setDescription("Send an announcement as the bot")
+            .addChannelOption(o => o.setName("channel").setDescription("Target channel").setRequired(true)
+                .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement))
+            .addStringOption(o => o.setName("message").setDescription("Announcement text").setRequired(true).setMaxLength(2000)),
+
+        new SlashCommandBuilder().setName("addrole").setDescription("Add a role to a member")
+            .addUserOption(o => o.setName("user").setDescription("Member").setRequired(true))
+            .addRoleOption(o => o.setName("role").setDescription("Role").setRequired(true)),
+
+        new SlashCommandBuilder().setName("removerole").setDescription("Remove a role from a member")
+            .addUserOption(o => o.setName("user").setDescription("Member").setRequired(true))
+            .addRoleOption(o => o.setName("role").setDescription("Role").setRequired(true)),
+
+        new SlashCommandBuilder().setName("nickname").setDescription("Change or clear a member's nickname")
+            .addUserOption(o => o.setName("user").setDescription("Member").setRequired(true))
+            .addStringOption(o => o.setName("name").setDescription("New nickname (leave empty to reset)").setRequired(false).setMaxLength(32)),
+
+        new SlashCommandBuilder().setName("snipe").setDescription("Show the most recently deleted message in this channel"),
 
         new SlashCommandBuilder().setName("antinuke").setDescription("Anti-Nuke settings")
             .addSubcommand(s => s.setName("status").setDescription("Show anti-nuke status"))
@@ -899,6 +959,7 @@ client.once("ready", async () => {
         for (const [id, p] of polls) if (p.ended) polls.delete(id);
         for (const [k, v] of _memberTierCache) if (now - v.at > _tierCacheTTL * 4) _memberTierCache.delete(k);
         for (const [k, v] of _pendingCloseConfirmations) if (now > v.expiresAt) _pendingCloseConfirmations.delete(k);
+        for (const [k, v] of _snipeCache) if (now - v.at > SNIPE_TTL) _snipeCache.delete(k);
     }, 10 * 60 * 1000).unref?.();
 });
 
@@ -937,7 +998,7 @@ async function tryDM(user, embed) {
 }
 
 // ==========================================
-// SETUP MENU (abbreviated — same as V.2.1)
+// SETUP MENU
 // ==========================================
 
 function fmtCh(gc, k)   { return gc[k] ? "<#" + gc[k] + ">" : "❌ Not set"; }
@@ -1145,7 +1206,7 @@ function buildTemplatesMenuRows() {
 const PERM_GROUPS = {
     setup: { name: "⚙️ Setup & Config", commands: ["setup", "setprefix", "setupverify", "setuptickets", "set-webhook", "remove-webhook", "antinuke"] },
     hr:    { name: "👑 HR / Applications", commands: ["acceptsetup", "accept", "deny", "promote", "demote", "infract"] },
-    mod:   { name: "🔨 Moderation & Utility", commands: ["mute", "unmute", "warn", "kick", "ban", "unban", "roles", "history"] },
+    mod:   { name: "🔨 Moderation & Utility", commands: ["mute", "unmute", "warn", "kick", "ban", "unban", "roles", "history", "slowmode", "lock", "unlock", "purge", "deafen", "undeafen", "moveall", "announce", "addrole", "removerole", "nickname", "snipe"] },
     logs:  { name: "📝 Logging", commands: ["loguser"] },
     events:{ name: "🎉 Events", commands: ["poll", "giveaway"] },
     public:{ name: "🌐 Public & Fun", commands: ["suggest", "staff-feedback", "help", "serverinfo", "afk", "av", "botinfo", "ping", "uptime", "invite", "membercount", "userinfo", "roleinfo", "banner"] }
@@ -1295,7 +1356,7 @@ async function updateSetupMessage(interaction, view) {
 }
 
 // ==========================================
-// POLL / GIVEAWAY BUILDERS + ENDERS
+// POLL / GIVEAWAY
 // ==========================================
 
 function buildPollEmbed(question, options, votes, closed, durationMin) {
@@ -1605,7 +1666,7 @@ async function doInfract(guild, executor, targetUser, type, reason, notes) {
 }
 
 // ==========================================
-// V.2.2 NEW UTILITY COMMANDS
+// V.2.2 UTILITY
 // ==========================================
 
 async function cmdBotInfo(ctx, isSlash) {
@@ -1643,17 +1704,11 @@ async function cmdBotInfo(ctx, isSlash) {
 
 async function cmdPing(ctx, isSlash) {
     const sent = Date.now();
-    if (isSlash) {
-        const m = await ctx.reply({ content: "🏓 Pinging..." });
-        const roundtrip = Date.now() - sent;
-        const embed = new EmbedBuilder().setDescription("🏓 **Pong!**\n**WebSocket:** `" + client.ws.ping + "ms`\n**Roundtrip:** `" + roundtrip + "ms`").setColor(0x57F287).setTimestamp();
-        await ctx.editReply({ content: "", embeds: [embed] });
-    } else {
-        const m = await ctx.reply({ content: "🏓 Pinging..." });
-        const roundtrip = Date.now() - sent;
-        const embed = new EmbedBuilder().setDescription("🏓 **Pong!**\n**WebSocket:** `" + client.ws.ping + "ms`\n**Roundtrip:** `" + roundtrip + "ms`").setColor(0x57F287).setTimestamp();
-        m.edit({ content: "", embeds: [embed] }).catch(() => {});
-    }
+    const m = await ctx.reply({ content: "🏓 Pinging..." });
+    const roundtrip = Date.now() - sent;
+    const embed = new EmbedBuilder().setDescription("🏓 **Pong!**\n**WebSocket:** `" + client.ws.ping + "ms`\n**Roundtrip:** `" + roundtrip + "ms`").setColor(0x57F287).setTimestamp();
+    if (isSlash) await ctx.editReply({ content: "", embeds: [embed] });
+    else m.edit({ content: "", embeds: [embed] }).catch(() => {});
 }
 
 async function cmdUptime(ctx, isSlash) {
@@ -1804,6 +1859,137 @@ async function cmdHistory(ctx, isSlash, targetUser) {
 }
 
 // ==========================================
+// V.2.3 NEW COMMANDS
+// ==========================================
+
+async function cmdSlowmode(ctx, isSlash, seconds) {
+    const ch = ctx.channel;
+    if (!ch || !ch.isTextBased?.()) return isSlash ? ctx.reply({ embeds: [errorEmbed("Not a text channel.")], ephemeral: true }) : ctx.reply({ embeds: [errorEmbed("Not a text channel.")] });
+    try {
+        await ch.setRateLimitPerUser(seconds, "Slowmode by " + (isSlash ? ctx.user.tag : ctx.author.tag));
+        const embed = new EmbedBuilder().setDescription(seconds > 0 ? "🐢 Slowmode set to **" + seconds + "s** in " + ch + "." : "🐢 Slowmode disabled in " + ch + ".").setColor(0x57F287).setTimestamp();
+        if (isSlash) await ctx.reply({ embeds: [embed] });
+        else await ctx.reply({ embeds: [embed] });
+    } catch (e) { console.error(e); if (isSlash) await ctx.reply({ embeds: [errorEmbed("Failed to set slowmode.")], ephemeral: true }); }
+}
+
+async function cmdLock(ctx, isSlash, lock, reason) {
+    const guild = ctx.guild;
+    const ch = ctx.channel;
+    try {
+        await ch.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: lock ? false : null }, { reason: reason || (lock ? "Channel locked" : "Channel unlocked") });
+        const embed = new EmbedBuilder()
+            .setDescription((lock ? "🔒 **Channel locked.**" : "🔓 **Channel unlocked.**") + (reason ? "\n**Reason:** " + reason : ""))
+            .setColor(lock ? 0xED4245 : 0x57F287).setTimestamp();
+        if (isSlash) await ctx.reply({ embeds: [embed] });
+        else await ctx.reply({ embeds: [embed] });
+        broadcast(guild, logEmbed(lock ? "Channel Locked" : "Channel Unlocked",
+            "**Channel:** " + ch + "\n**Mod:** " + (isSlash ? ctx.user.tag : ctx.author.tag) + (reason ? "\n**Reason:** " + reason : ""),
+            lock ? 0xED4245 : 0x57F287), ["log"]).catch(() => {});
+    } catch (e) { console.error(e); if (isSlash) await ctx.reply({ embeds: [errorEmbed("Failed.")], ephemeral: true }); }
+}
+
+async function cmdPurge(ctx, isSlash, amount, filterUser) {
+    const ch = ctx.channel;
+    if (!ch || !ch.isTextBased?.()) return isSlash ? ctx.reply({ embeds: [errorEmbed("Not a text channel.")], ephemeral: true }) : ctx.reply({ embeds: [errorEmbed("Not a text channel.")] });
+    const n = Math.min(Math.max(amount, 1), 100);
+    try {
+        const fetched = await ch.messages.fetch({ limit: n });
+        const filtered = filterUser ? fetched.filter(m => m.author.id === filterUser.id) : fetched;
+        const deleted = await ch.bulkDelete(filtered, true);
+        const embed = new EmbedBuilder().setDescription("🧹 Deleted **" + deleted.size + "** message" + (deleted.size === 1 ? "" : "s") + (filterUser ? " from **" + filterUser.tag + "**" : "") + ".").setColor(0x57F287).setTimestamp();
+        if (isSlash) await ctx.reply({ embeds: [embed], ephemeral: true });
+        else {
+            const m = await ctx.reply({ embeds: [embed] });
+            setTimeout(() => m.delete().catch(() => {}), 5000);
+        }
+    } catch (e) { console.error(e); if (isSlash) await ctx.reply({ embeds: [errorEmbed("Failed to purge (messages may be older than 14 days).")], ephemeral: true }); }
+}
+
+async function cmdDeafen(ctx, isSlash, targetMember, deafen, reason) {
+    if (!targetMember) return isSlash ? ctx.reply({ embeds: [errorEmbed("Member not found.")], ephemeral: true }) : ctx.reply({ embeds: [errorEmbed("Member not found.")] });
+    try {
+        await targetMember.voice.setDeaf(deafen, reason || (deafen ? "Server-deafened" : "Undeafened"));
+        const embed = new EmbedBuilder().setDescription((deafen ? "🔇 Deafened " : "🔊 Undeafened ") + targetMember + ".").setColor(0x57F287).setTimestamp();
+        if (isSlash) await ctx.reply({ embeds: [embed] });
+        else await ctx.reply({ embeds: [embed] });
+        broadcast(ctx.guild, logEmbed(deafen ? "Member Deafened" : "Member Undeafened",
+            "**User:** " + targetMember + "\n**Mod:** " + (isSlash ? ctx.user.tag : ctx.author.tag) + (reason ? "\n**Reason:** " + reason : ""),
+            deafen ? 0xED4245 : 0x57F287), ["log"]).catch(() => {});
+    } catch (e) { console.error(e); if (isSlash) await ctx.reply({ embeds: [errorEmbed("Failed (user must be in voice?).")], ephemeral: true }); }
+}
+
+async function cmdMoveAll(ctx, isSlash, targetChannel) {
+    const guild = ctx.guild;
+    const member = isSlash ? ctx.member : ctx.member;
+    const voiceState = member?.voice;
+    if (!voiceState?.channel) return isSlash ? ctx.reply({ embeds: [errorEmbed("You must be in a voice channel.")], ephemeral: true }) : ctx.reply({ embeds: [errorEmbed("You must be in a voice channel.")] });
+    if (targetChannel.type !== ChannelType.GuildVoice && targetChannel.type !== ChannelType.GuildStageVoice) return isSlash ? ctx.reply({ embeds: [errorEmbed("Target must be a voice channel.")], ephemeral: true }) : ctx.reply({ embeds: [errorEmbed("Target must be a voice channel.")] });
+    const source = voiceState.channel;
+    const members = [...source.members.values()];
+    let moved = 0;
+    for (const m of members) { try { await m.voice.setChannel(targetChannel); moved++; } catch {} }
+    const embed = new EmbedBuilder().setDescription("🚚 Moved **" + moved + "** member" + (moved === 1 ? "" : "s") + " from " + source + " to " + targetChannel + ".").setColor(0x57F287).setTimestamp();
+    if (isSlash) await ctx.reply({ embeds: [embed] });
+    else await ctx.reply({ embeds: [embed] });
+}
+
+async function cmdAnnounce(ctx, isSlash, channel, message) {
+    const target = channel || ctx.channel;
+    if (!target.isTextBased?.()) return isSlash ? ctx.reply({ embeds: [errorEmbed("Invalid channel.")], ephemeral: true }) : ctx.reply({ embeds: [errorEmbed("Invalid channel.")] });
+    const author = isSlash ? ctx.user : ctx.author;
+    const embed = new EmbedBuilder()
+        .setTitle("📣 Announcement")
+        .setDescription(message)
+        .setColor(WEBHOOK_COLOR)
+        .setThumbnail(ctx.guild.iconURL({ size: 256 }) || null)
+        .setFooter({ text: "Announced by " + author.tag, iconURL: author.displayAvatarURL() })
+        .setTimestamp();
+    try {
+        await target.send({ embeds: [embed] });
+        if (isSlash) await ctx.reply({ embeds: [successEmbed("Announcement sent to " + target + ".")], ephemeral: true });
+        else await ctx.reply({ embeds: [successEmbed("Announcement sent to " + target + ".")] });
+    } catch (e) { console.error(e); if (isSlash) await ctx.reply({ embeds: [errorEmbed("Failed to send.")], ephemeral: true }); }
+}
+
+async function cmdAddRole(ctx, isSlash, targetMember, role, remove) {
+    if (!targetMember) return isSlash ? ctx.reply({ embeds: [errorEmbed("Member not found.")], ephemeral: true }) : ctx.reply({ embeds: [errorEmbed("Member not found.")] });
+    try {
+        if (remove) await targetMember.roles.remove(role, "By " + (isSlash ? ctx.user.tag : ctx.author.tag));
+        else await targetMember.roles.add(role, "By " + (isSlash ? ctx.user.tag : ctx.author.tag));
+        const embed = new EmbedBuilder().setDescription((remove ? "➖ Removed " : "➕ Added ") + role + (remove ? " from " : " to ") + targetMember + ".").setColor(0x57F287).setTimestamp();
+        if (isSlash) await ctx.reply({ embeds: [embed] });
+        else await ctx.reply({ embeds: [embed] });
+    } catch (e) { console.error(e); if (isSlash) await ctx.reply({ embeds: [errorEmbed("Failed (check role hierarchy?).")], ephemeral: true }); }
+}
+
+async function cmdNickname(ctx, isSlash, targetMember, newName) {
+    if (!targetMember) return isSlash ? ctx.reply({ embeds: [errorEmbed("Member not found.")], ephemeral: true }) : ctx.reply({ embeds: [errorEmbed("Member not found.")] });
+    try {
+        await targetMember.setNickname(newName || null, "By " + (isSlash ? ctx.user.tag : ctx.author.tag));
+        const embed = new EmbedBuilder().setDescription("✏️ " + (newName ? "Set " + targetMember + "'s nickname to **" + newName + "**." : "Reset " + targetMember + "'s nickname.")).setColor(0x57F287).setTimestamp();
+        if (isSlash) await ctx.reply({ embeds: [embed] });
+        else await ctx.reply({ embeds: [embed] });
+    } catch (e) { console.error(e); if (isSlash) await ctx.reply({ embeds: [errorEmbed("Failed.")], ephemeral: true }); }
+}
+
+async function cmdSnipe(ctx, isSlash) {
+    const ch = ctx.channel;
+    const sniped = _snipeCache.get(ch.id);
+    if (!sniped) return isSlash ? ctx.reply({ embeds: [infoEmbed("Nothing to snipe here.")], ephemeral: true }) : ctx.reply({ embeds: [infoEmbed("Nothing to snipe here.")] });
+
+    const embed = new EmbedBuilder()
+        .setTitle("👻 Sniped Message")
+        .setDescription(sniped.content || "*No text content*")
+        .setColor(WEBHOOK_COLOR)
+        .setAuthor({ name: sniped.author.tag, iconURL: sniped.author.displayAvatarURL() })
+        .setFooter({ text: "Deleted " })
+        .setTimestamp(sniped.at);
+    if (isSlash) await ctx.reply({ embeds: [embed] });
+    else await ctx.reply({ embeds: [embed] });
+}
+
+// ==========================================
 // INTERACTION HANDLER
 // ==========================================
 
@@ -1825,7 +2011,21 @@ client.on("interactionCreate", async interaction => {
             return interaction.reply({ embeds: [errorEmbed("You don't have permission to use this command.\n**Required:** " + fmtTiers(required))], ephemeral: true });
         }
 
-        // ---- V.2.2 NEW QOL COMMANDS ----
+        // ---- V.2.3 NEW ----
+        if (command === "slowmode")   return cmdSlowmode(interaction, true, interaction.options.getInteger("seconds"));
+        if (command === "lock")       return cmdLock(interaction, true, true, interaction.options.getString("reason"));
+        if (command === "unlock")     return cmdLock(interaction, true, false, interaction.options.getString("reason"));
+        if (command === "purge")      return cmdPurge(interaction, true, interaction.options.getInteger("amount"), interaction.options.getUser("user"));
+        if (command === "deafen")     return cmdDeafen(interaction, true, await guild.members.fetch(interaction.options.getUser("user").id).catch(() => null), true, interaction.options.getString("reason"));
+        if (command === "undeafen")   return cmdDeafen(interaction, true, await guild.members.fetch(interaction.options.getUser("user").id).catch(() => null), false, interaction.options.getString("reason"));
+        if (command === "moveall")    return cmdMoveAll(interaction, true, interaction.options.getChannel("channel"));
+        if (command === "announce")   return cmdAnnounce(interaction, true, interaction.options.getChannel("channel"), interaction.options.getString("message"));
+        if (command === "addrole")    return cmdAddRole(interaction, true, await guild.members.fetch(interaction.options.getUser("user").id).catch(() => null), interaction.options.getRole("role"), false);
+        if (command === "removerole") return cmdAddRole(interaction, true, await guild.members.fetch(interaction.options.getUser("user").id).catch(() => null), interaction.options.getRole("role"), true);
+        if (command === "nickname")   return cmdNickname(interaction, true, await guild.members.fetch(interaction.options.getUser("user").id).catch(() => null), interaction.options.getString("name"));
+        if (command === "snipe")      return cmdSnipe(interaction, true);
+
+        // ---- V.2.2 ----
         if (command === "botinfo" || command === "stats")   return cmdBotInfo(interaction, true);
         if (command === "ping")                              return cmdPing(interaction, true);
         if (command === "uptime")                            return cmdUptime(interaction, true);
@@ -1836,7 +2036,7 @@ client.on("interactionCreate", async interaction => {
         if (command === "banner")                            return cmdBanner(interaction, true, interaction.options.getUser("user"));
         if (command === "history")                           return cmdHistory(interaction, true, interaction.options.getUser("user"));
 
-        // ---- EXISTING ----
+        // ---- Setup ----
         if (command === "setup") return interaction.reply({ embeds: [buildSetupEmbed(guild)], components: buildSetupRows(), ephemeral: true });
 
         if (command === "setprefix") {
@@ -2088,15 +2288,18 @@ client.on("interactionCreate", async interaction => {
                 .setColor(WEBHOOK_COLOR).setThumbnail(guild.iconURL())
                 .addFields(
                     { name: "🛠️ Setup (Management)", value: "`/setup` `/setupverify` `/setuptickets`", inline: false },
-                    { name: "🛡️ Anti-Nuke", value: "`/antinuke status|enable|disable`\n`/antinuke threshold <n>` `/antinuke whitelist-*` `/antinuke watchlist`", inline: false },
+                    { name: "🛡️ Anti-Nuke", value: "`/antinuke status|enable|disable` `/antinuke threshold <n>` `/antinuke whitelist-*` `/antinuke watchlist`", inline: false },
                     { name: "👑 HR", value: "`/accept` `/deny` `/promote` `/demote` `/infract`", inline: false },
                     { name: "🔨 Moderation", value: "`/mute` `/unmute` `/warn` `/kick` `/ban` `/unban`", inline: false },
+                    { name: "🧹 Channel Management", value: "`/slowmode <s>` `/lock` `/unlock` `/purge <n>` `/announce <ch> <msg>`", inline: false },
+                    { name: "🔊 Voice Moderation", value: "`/deafen <user>` `/undeafen <user>` `/moveall <ch>`", inline: false },
+                    { name: "🎭 Role & Nickname", value: "`/addrole <user> <role>` `/removerole` `/nickname`", inline: false },
                     { name: "🎫 Tickets", value: "`/close` `/closeticket` `/ticketclose`", inline: false },
                     { name: "📝 Logging", value: "`/loguser <user> <Warn|Kick|Ban> <reason>`", inline: false },
                     { name: "🎉 Events", value: "`/poll` `/giveaway`", inline: false },
-                    { name: "🔧 Utility (V.2.2)", value: "`/botinfo` `/stats` `/ping` `/uptime` `/invite` `/membercount`\n`/userinfo [user]` `/roleinfo <role>` `/banner [user]`\n`/roles` `/serverinfo` `/av [user]` `/afk [reason]` `/history <user>`", inline: false },
+                    { name: "🔧 Utility", value: "`/botinfo` `/stats` `/ping` `/uptime` `/invite` `/membercount`\n`/userinfo [user]` `/roleinfo <role>` `/banner [user]` `/snipe`\n`/roles` `/serverinfo` `/av [user]` `/afk [reason]` `/history <user>`", inline: false },
                     { name: "🌐 Public", value: "`/suggest` `/staff-feedback`", inline: false },
-                    { name: "💬 Prefix", value: "All commands work with `" + prefix + "` prefix.\nExamples: `" + prefix + "botinfo`, `" + prefix + "ping`, `" + prefix + "userinfo @user`, `" + prefix + "close`", inline: false }
+                    { name: "💬 Prefix", value: "All commands work with `" + prefix + "` prefix.", inline: false }
                 );
             return interaction.reply({ embeds: [embed] });
         }
@@ -2111,7 +2314,7 @@ client.on("interactionCreate", async interaction => {
 });
 
 // ==========================================
-// BUTTON HANDLER (unchanged from V.2.1)
+// BUTTON HANDLER
 // ==========================================
 
 async function handleButton(interaction) {
@@ -2633,7 +2836,7 @@ async function handleVerifyCheck(interaction) {
 }
 
 // ==========================================
-// TICKETS
+// TICKETS  (V.2.3 FIX — displays channel as <#id>)
 // ==========================================
 
 const TICKET_TYPES = {
@@ -2735,20 +2938,22 @@ async function handleTicketCreate(interaction, type, prefillReason) {
         ).setTimestamp();
     broadcast(guild, logE, ["ticket", "webhook"]).catch(() => {});
 
+    // === DM FIX: display channel as <#id> so it renders as a clickable link ===
     interaction.user.send({
         embeds: [new EmbedBuilder()
             .setTitle("🎫 Ticket Created")
-            .setDescription("Your **" + cfg.label + "** ticket in **" + guild.name + "** has been created: " + channel)
+            .setDescription("Your **" + cfg.label + "** ticket in **" + guild.name + "** has been created: <#" + channel.id + ">")
             .setColor(WEBHOOK_COLOR)
             .setThumbnail(guild.iconURL({ size: 256 }))
             .setTimestamp()]
     }).catch(() => {});
 
-    return interaction.editReply({ embeds: [successEmbed("Ticket created: " + channel)] });
+    // === REPLY FIX: also show <#id> instead of raw ID ===
+    return interaction.editReply({ embeds: [successEmbed("Ticket created: <#" + channel.id + ">")] });
 }
 
 // ==========================================
-// SUGGESTIONS / FEEDBACK VOTES
+// SUGGESTIONS / FEEDBACK
 // ==========================================
 
 async function handleVoteButton(interaction) {
@@ -2853,7 +3058,7 @@ function buildTicketRulesEmbed(guild) {
 }
 
 // ==========================================
-// UTILITY COMMANDS (roles, serverinfo, afk, av)
+// EXISTING UTILITY
 // ==========================================
 
 async function cmdRoles(interactionOrMessage, isSlash) {
@@ -3063,19 +3268,82 @@ client.on("messageCreate", async message => {
         if (command === "help") {
             const embed = new EmbedBuilder().setTitle(guild.name + " — Prefix Commands").setColor(WEBHOOK_COLOR)
                 .addFields(
-                    { name: "Setup", value: "`" + prefix + "help` — this menu\n`" + prefix + "setprefix <p>`", inline: false },
-                    { name: "Utility (V.2.2)", value: "`" + prefix + "botinfo` / `" + prefix + "stats`\n`" + prefix + "ping` / `" + prefix + "uptime` / `" + prefix + "invite`\n`" + prefix + "membercount`\n`" + prefix + "userinfo [@user]`\n`" + prefix + "roleinfo @role`\n`" + prefix + "banner [@user]`\n`" + prefix + "history @user` (staff)\n`" + prefix + "roles` (staff)\n`" + prefix + "serverinfo`\n`" + prefix + "av [@user]`\n`" + prefix + "afk [reason]`", inline: false },
-                    { name: "Moderation", value: "`" + prefix + "mute @user 10m [reason]`\n`" + prefix + "unmute @user [reason]`\n`" + prefix + "warn @user [reason]`\n`" + prefix + "kick @user [reason]`\n`" + prefix + "ban @user [reason]`\n`" + prefix + "unban <userId> [reason]`", inline: false },
-                    { name: "HR", value: "`" + prefix + "accept @user [notes]`\n`" + prefix + "deny @user <reason>`\n`" + prefix + "promote @user <rank>`\n`" + prefix + "demote @user <rank>`\n`" + prefix + "infract @user <type> <reason>`", inline: false },
-                    { name: "Tickets", value: "`" + prefix + "close [reason]`\n`" + prefix + "closeticket [reason]`\n`" + prefix + "ticketclose [reason]`", inline: false },
-                    { name: "Logging", value: "`" + prefix + "loguser <username> <warn|kick|ban> <reason>`", inline: false },
-                    { name: "Events", value: "`" + prefix + "poll <question> | <opt1> | <opt2>`\n`" + prefix + "giveaway <prize> <minutes> [winners]`", inline: false },
-                    { name: "Public", value: "`" + prefix + "suggest <text>`\n`" + prefix + "staff-feedback @user <text>`", inline: false }
+                    { name: "Setup", value: "`" + prefix + "help`\n`" + prefix + "setprefix <p>`", inline: false },
+                    { name: "Utility", value: "`" + prefix + "botinfo` / `" + prefix + "stats`\n`" + prefix + "ping` / `" + prefix + "uptime` / `" + prefix + "invite`\n`" + prefix + "membercount` / `" + prefix + "userinfo [@user]`\n`" + prefix + "roleinfo @role` / `" + prefix + "banner [@user]`\n`" + prefix + "history @user` (staff)\n`" + prefix + "roles` / `" + prefix + "serverinfo` / `" + prefix + "av` / `" + prefix + "afk`\n`" + prefix + "snipe` (staff)", inline: false },
+                    { name: "Moderation", value: "`" + prefix + "mute @user 10m [reason]`\n`" + prefix + "unmute @user`\n`" + prefix + "warn @user`\n`" + prefix + "kick @user [reason]`\n`" + prefix + "ban @user [reason]`\n`" + prefix + "unban <userId>`", inline: false },
+                    { name: "Channel Tools", value: "`" + prefix + "slowmode <seconds>`\n`" + prefix + "lock [reason]` / `" + prefix + "unlock`\n`" + prefix + "purge <amount> [@user]`\n`" + prefix + "announce #channel <msg>`", inline: false },
+                    { name: "Voice & Roles", value: "`" + prefix + "deafen @user` / `" + prefix + "undeafen @user`\n`" + prefix + "moveall #voicech`\n`" + prefix + "addrole @user @role` / `" + prefix + "removerole`\n`" + prefix + "nickname @user [new]`", inline: false },
+                    { name: "HR", value: "`" + prefix + "accept @user`\n`" + prefix + "deny @user <reason>`\n`" + prefix + "promote @user <rank>`\n`" + prefix + "demote @user <rank>`\n`" + prefix + "infract @user <type> <reason>`", inline: false },
+                    { name: "Tickets / Events / Logging", value: "`" + prefix + "close [reason]` / `" + prefix + "closeticket`\n`" + prefix + "poll <q> | <opt1> | <opt2>`\n`" + prefix + "giveaway <prize> <minutes>`\n`" + prefix + "loguser <user> <warn|kick|ban> <reason>`", inline: false },
+                    { name: "Public", value: "`" + prefix + "suggest <text>` / `" + prefix + "staff-feedback @user <text>`", inline: false }
                 );
             return message.reply({ embeds: [embed] });
         }
 
-        // ---- V.2.2 NEW UTILITY ----
+        // ---- V.2.3 ----
+        if (command === "slowmode") {
+            if (!canRunCommand(executorMember, "slowmode")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            const sec = parseInt(args[0], 10);
+            if (isNaN(sec) || sec < 0 || sec > 21600) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "slowmode <0-21600>`")] });
+            return cmdSlowmode(message, false, sec);
+        }
+        if (command === "lock") {
+            if (!canRunCommand(executorMember, "lock")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            return cmdLock(message, false, true, args.join(" ") || null);
+        }
+        if (command === "unlock") {
+            if (!canRunCommand(executorMember, "unlock")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            return cmdLock(message, false, false, args.join(" ") || null);
+        }
+        if (command === "purge" || command === "clear") {
+            if (!canRunCommand(executorMember, "purge")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            const amt = parseInt(args[0], 10);
+            if (isNaN(amt)) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "purge <amount> [@user]`")] });
+            const filterUser = message.mentions.users.first() || null;
+            return cmdPurge(message, false, amt, filterUser);
+        }
+        if (command === "deafen" || command === "undeafen") {
+            if (!canRunCommand(executorMember, command)) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            const targetInput = args[0];
+            if (!targetInput) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + command + " @user`")] });
+            const target = await resolveMember(guild, targetInput);
+            if (!target) return message.reply({ embeds: [errorEmbed("Member not found.")] });
+            return cmdDeafen(message, false, target, command === "deafen", args.slice(1).join(" ") || null);
+        }
+        if (command === "moveall") {
+            if (!canRunCommand(executorMember, "moveall")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            const targetCh = message.mentions.channels.first();
+            if (!targetCh) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "moveall #voice-channel`")] });
+            return cmdMoveAll(message, false, targetCh);
+        }
+        if (command === "announce") {
+            if (!canRunCommand(executorMember, "announce")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            const ch = message.mentions.channels.first();
+            if (!ch) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "announce #channel <message>`")] });
+            const msg = args.slice(1).join(" ");
+            if (!msg) return message.reply({ embeds: [errorEmbed("Provide a message.")] });
+            return cmdAnnounce(message, false, ch, msg);
+        }
+        if (command === "addrole" || command === "removerole") {
+            if (!canRunCommand(executorMember, command)) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            const targetMember = message.mentions.members.first();
+            const role = message.mentions.roles.first();
+            if (!targetMember || !role) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + command + " @user @role`")] });
+            return cmdAddRole(message, false, targetMember, role, command === "removerole");
+        }
+        if (command === "nickname" || command === "nick") {
+            if (!canRunCommand(executorMember, "nickname")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            const targetMember = message.mentions.members.first();
+            if (!targetMember) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "nickname @user [new name]`")] });
+            const newName = args.slice(1).join(" ") || null;
+            return cmdNickname(message, false, targetMember, newName);
+        }
+        if (command === "snipe") {
+            if (!canRunCommand(executorMember, "snipe")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            return cmdSnipe(message, false);
+        }
+
+        // ---- V.2.2 ----
         if (command === "botinfo" || command === "stats") {
             if (!canRunCommand(executorMember, "botinfo")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
             return cmdBotInfo(message, false);
@@ -3119,7 +3387,7 @@ client.on("messageCreate", async message => {
             return cmdHistory(message, false, target);
         }
 
-        // ---- EXISTING UTILITY ----
+        // ---- Existing ----
         if (command === "roles") {
             if (!canRunCommand(executorMember, "roles")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
             return cmdRoles(message, false);
@@ -3139,7 +3407,6 @@ client.on("messageCreate", async message => {
             return cmdAv(message, false, target);
         }
 
-        // ---- SETPREFIX ----
         if (command === "setprefix") {
             if (!canRunCommand(executorMember, "setprefix")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
             const newPrefix = args[0];
@@ -3150,7 +3417,6 @@ client.on("messageCreate", async message => {
             return message.reply({ embeds: [successEmbed("Prefix set to `" + newPrefix + "`.")] });
         }
 
-        // ---- MODERATION ----
         if (command === "mute") {
             if (!canRunCommand(executorMember, "mute")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
             const targetInput = args[0], durationInput = args[1];
@@ -3210,7 +3476,6 @@ client.on("messageCreate", async message => {
             return message.reply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
         }
 
-        // ---- LOGGING ----
         if (command === "loguser") {
             if (!canRunCommand(executorMember, "loguser")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
             const username = args[0];
@@ -3223,7 +3488,6 @@ client.on("messageCreate", async message => {
             return message.reply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
         }
 
-        // ---- HR ----
         if (command === "accept") {
             if (!canRunCommand(executorMember, "accept")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
             const targetInput = args[0];
@@ -3282,7 +3546,6 @@ client.on("messageCreate", async message => {
             return message.reply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
         }
 
-        // ---- TICKET CLOSE ----
         if (command === "close" || command === "closeticket" || command === "ticketclose") {
             const reason = args.join(" ").slice(0, 400) || null;
             const ticket = gc.tickets[message.channel.id];
@@ -3307,7 +3570,6 @@ client.on("messageCreate", async message => {
             return;
         }
 
-        // ---- EVENTS ----
         if (command === "poll") {
             if (!canRunCommand(executorMember, "poll")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
             const parts = args.join(" ").split("|").map(s => s.trim()).filter(Boolean);
@@ -3338,7 +3600,6 @@ client.on("messageCreate", async message => {
             return;
         }
 
-        // ---- PUBLIC ----
         if (command === "suggest") {
             if (!canRunCommand(executorMember, "suggest")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
             if (!gc.suggestionChannelId) return message.reply({ embeds: [errorEmbed("Suggestions channel not set.")] });
@@ -3376,7 +3637,7 @@ client.on("messageCreate", async message => {
 });
 
 // ==========================================
-// GHOST PING
+// SNIPE CACHE + DELETE LOG
 // ==========================================
 
 client.on("messageDelete", async message => {
@@ -3385,6 +3646,14 @@ client.on("messageDelete", async message => {
         const gc = getGuildConfig(message.guild.id);
 
         if (message.author && !message.author.bot) {
+            // Save for snipe (per channel)
+            _snipeCache.set(message.channel.id, {
+                author: message.author,
+                content: message.content || "",
+                at: Date.now(),
+                attachments: message.attachments ? [...message.attachments.values()].map(a => a.url) : []
+            });
+
             broadcast(message.guild, logEmbed("Message Deleted",
                 "**Author:** " + (message.author?.tag || "Unknown") + "\n**Channel:** " + message.channel + "\n**Content:** " + (message.content || "*None*").slice(0, 1500), 0xED4245), ["log"]).catch(() => {});
         }
