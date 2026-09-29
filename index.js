@@ -1,5 +1,5 @@
 // ==========================================
-// EAGLE COUNTY ROLEPLAY BOT - V.2.0
+// EAGLE COUNTY ROLEPLAY BOT - V.2.1
 // ==========================================
 
 const {
@@ -37,6 +37,8 @@ const REJOIN_MUTE_MS  = 24 * 60 * 60 * 1000;
 const GHOST_PING_TTL = 60 * 1000;
 const GHOST_MAP_MAX = 500;
 
+const TICKET_CLOSE_CONFIRM_MS = 30 * 1000;
+
 const DEFAULT_ANTINUKE = {
     enabled: true, threshold: 5, windowMs: 60000,
     whitelist: [], counters: {}, watchlist: {}
@@ -62,6 +64,7 @@ const DEFAULT_COMMAND_PERMS = {
     "remove-webhook": ["management"], antinuke: ["management"],
 
     acceptsetup: ["highrank", "management"], accept: ["highrank", "management"],
+    deny: ["highrank", "management"],
     promote: ["highrank", "management"], demote: ["highrank", "management"],
     infract: ["highrank", "management"],
 
@@ -120,6 +123,7 @@ const guildConfigCache = new Map();
 const _prefixCache = new Map();
 const _memberTierCache = new Map();
 const _tierCacheTTL = 30_000;
+const _pendingCloseConfirmations = new Map(); // messageId -> { userId, channelId, guildId, reason, expiresAt }
 
 // ==========================================
 // CONFIG
@@ -142,7 +146,8 @@ function createDefaultGuildConfig() {
             accept: "Congratulations! Your application for **{server}** has been accepted.\n\nPlease review the server for next steps.",
             promote: "You have been **promoted** in **{server}**!\n\n**New Rank:** {rank}",
             demote: "You have been **demoted** in **{server}**.\n\n**New Rank:** {rank}",
-            infract: "You have received an infraction in **{server}**.\n\n**Type:** {type}\n**Reason:** {reason}"
+            infract: "You have received an infraction in **{server}**.\n\n**Type:** {type}\n**Reason:** {reason}",
+            deny: "Unfortunately, your application for **{server}** has been **denied**.\n\n**Reason:** {reason}\n\nYou may reapply in the future."
         },
         antinuke: JSON.parse(JSON.stringify(DEFAULT_ANTINUKE)),
         automod: {
@@ -229,7 +234,7 @@ function getGuildConfig(guildId) {
 }
 
 // ==========================================
-// AUTOMOD HELPERS
+// AUTOMOD
 // ==========================================
 
 function getSwearRegex(guildId) {
@@ -379,16 +384,11 @@ function formatDuration(ms) {
     return d + "d" + (rh ? " " + rh + "h" : "");
 }
 
-/**
- * Resolve a user from a mention, ID, or username.
- * Returns a GuildMember or null.
- */
 async function resolveMember(guild, input) {
     if (!input) return null;
     const mentionMatch = input.match(/^<@!?(\d+)>$/);
     if (mentionMatch) return guild.members.fetch(mentionMatch[1]).catch(() => null);
     if (/^\d{15,25}$/.test(input)) return guild.members.fetch(input).catch(() => null);
-    // Username lookup (fallback)
     const lower = input.toLowerCase().replace(/^@/, "");
     await guild.members.fetch().catch(() => {});
     return guild.members.cache.find(m =>
@@ -462,7 +462,7 @@ async function sendTranscript(guild, attachment, embed) {
 }
 
 // ==========================================
-// ROBLOX LOOKUP
+// ROBLOX
 // ==========================================
 
 async function lookupRobloxUser(username) {
@@ -473,7 +473,8 @@ async function lookupRobloxUser(username) {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ usernames: [username], excludeBannedUsers: false }),
-            signal: ctrl.signal        });
+            signal: ctrl.signal
+        });
         if (!r.ok) return null;
         const d = await r.json();
         if (!d.data?.length) return null;
@@ -676,6 +677,11 @@ function getSlashCommands() {
         new SlashCommandBuilder().setName("accept").setDescription("Accept a user's application")
             .addUserOption(o => o.setName("user").setDescription("User").setRequired(true))
             .addStringOption(o => o.setName("notes").setDescription("Notes").setRequired(false)),
+        new SlashCommandBuilder().setName("deny").setDescription("Deny a user's application")
+            .addUserOption(o => o.setName("user").setDescription("User").setRequired(true))
+            .addStringOption(o => o.setName("reason").setDescription("Reason for denial").setRequired(true))
+            .addStringOption(o => o.setName("notes").setDescription("Internal notes").setRequired(false)),
+
         new SlashCommandBuilder().setName("promote").setDescription("Promote a user")
             .addUserOption(o => o.setName("user").setDescription("User").setRequired(true))
             .addStringOption(o => o.setName("rank").setDescription("New rank").setRequired(true))
@@ -761,6 +767,14 @@ function getSlashCommands() {
         new SlashCommandBuilder().setName("av").setDescription("Show your avatar or another user's avatar")
             .addUserOption(o => o.setName("user").setDescription("User (leave empty for yourself)").setRequired(false)),
 
+        // ---- TICKET CLOSE ALIASES ----
+        new SlashCommandBuilder().setName("close").setDescription("Close the current ticket")
+            .addStringOption(o => o.setName("reason").setDescription("Reason for closing").setRequired(false).setMaxLength(400)),
+        new SlashCommandBuilder().setName("closeticket").setDescription("Close the current ticket")
+            .addStringOption(o => o.setName("reason").setDescription("Reason for closing").setRequired(false).setMaxLength(400)),
+        new SlashCommandBuilder().setName("ticketclose").setDescription("Close the current ticket")
+            .addStringOption(o => o.setName("reason").setDescription("Reason for closing").setRequired(false).setMaxLength(400)),
+
         new SlashCommandBuilder().setName("antinuke").setDescription("Anti-Nuke settings")
             .addSubcommand(s => s.setName("status").setDescription("Show anti-nuke status"))
             .addSubcommand(s => s.setName("enable").setDescription("Enable anti-nuke"))
@@ -813,7 +827,7 @@ client.once("ready", async () => {
     }
     await Promise.all(jobs);
 
-    client.user.setActivity("Eagle County Roleplay | V.2.0");
+    client.user.setActivity("Eagle County Roleplay | V.2.1");
 
     for (const guild of client.guilds.cache.values()) {
         const gc = getGuildConfig(guild.id);
@@ -837,6 +851,7 @@ client.once("ready", async () => {
         }
         for (const [id, p] of polls) if (p.ended) polls.delete(id);
         for (const [k, v] of _memberTierCache) if (now - v.at > _tierCacheTTL * 4) _memberTierCache.delete(k);
+        for (const [k, v] of _pendingCloseConfirmations) if (now > v.expiresAt) _pendingCloseConfirmations.delete(k);
     }, 10 * 60 * 1000).unref?.();
 });
 
@@ -854,11 +869,17 @@ function buildTemplateDM(guild, key, vars) {
     const gc = getGuildConfig(guild.id);
     const raw = gc.dmTemplates[key] || "You have received a notification from **{server}**.";
     const text = templateReplace(raw, { server: guild.name, ...vars });
-    const titles = { accept: "Application Accepted", promote: "You Have Been Promoted", demote: "You Have Been Demoted", infract: "Infraction Notice" };
+    const titles = {
+        accept: "Application Accepted",
+        deny: "Application Denied",
+        promote: "You Have Been Promoted",
+        demote: "You Have Been Demoted",
+        infract: "Infraction Notice"
+    };
     return new EmbedBuilder()
         .setTitle(titles[key] || "Notice")
         .setDescription(text)
-        .setColor(key === "demote" || key === "infract" ? 0xED4245 : 0x57F287)
+        .setColor(key === "demote" || key === "infract" || key === "deny" ? 0xED4245 : 0x57F287)
         .setThumbnail(guild.iconURL({ size: 256 }))
         .setFooter({ text: guild.name, iconURL: guild.iconURL() || undefined })
         .setTimestamp();
@@ -885,7 +906,7 @@ function buildSetupEmbed(guild) {
     const activeGiveaways = Object.values(gc.giveaways || {}).filter(g => !g.ended).length;
 
     return new EmbedBuilder()
-        .setTitle("⚙️ " + guild.name + " — Setup Menu (V.2.0)")
+        .setTitle("⚙️ " + guild.name + " — Setup Menu (V.2.1)")
         .setDescription("**Quick Overview** — use the buttons below to configure each section.")
         .setColor(WEBHOOK_COLOR)
         .setThumbnail(guild.iconURL({ size: 256 }))
@@ -923,7 +944,7 @@ function buildSetupEmbed(guild) {
                 inline: false
             }
         )
-        .setFooter({ text: "V.2.0 • " + guild.name, iconURL: guild.iconURL() || undefined })
+        .setFooter({ text: "V.2.1 • " + guild.name, iconURL: guild.iconURL() || undefined })
         .setTimestamp();
 }
 
@@ -1064,6 +1085,7 @@ function buildTemplatesMenuRows() {
     return [
         new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId("setup_tpl_accept").setLabel("Accept DM").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId("setup_tpl_deny").setLabel("Deny DM").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_tpl_promote").setLabel("Promote DM").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_tpl_demote").setLabel("Demote DM").setStyle(ButtonStyle.Secondary),
             new ButtonBuilder().setCustomId("setup_tpl_infract").setLabel("Infract DM").setStyle(ButtonStyle.Secondary)
@@ -1076,7 +1098,7 @@ function buildTemplatesMenuRows() {
 
 const PERM_GROUPS = {
     setup: { name: "⚙️ Setup & Config", commands: ["setup", "setprefix", "setupverify", "setuptickets", "set-webhook", "remove-webhook", "antinuke"] },
-    hr:    { name: "👑 HR / Applications", commands: ["acceptsetup", "accept", "promote", "demote", "infract"] },
+    hr:    { name: "👑 HR / Applications", commands: ["acceptsetup", "accept", "deny", "promote", "demote", "infract"] },
     mod:   { name: "🔨 Moderation & Utility", commands: ["mute", "unmute", "warn", "kick", "ban", "unban", "roles"] },
     logs:  { name: "📝 Logging", commands: ["loguser"] },
     events:{ name: "🎉 Events", commands: ["poll", "giveaway"] },
@@ -1181,7 +1203,10 @@ async function updateSetupMessage(interaction, view) {
     }
     else if (view === "templates") {
         embed = new EmbedBuilder().setTitle("✉️ DM Templates")
-            .setDescription("Vars: `{server}` `{rank}` `{type}` `{reason}` `{notes}`\n\n**Accept:**\n" + gc.dmTemplates.accept +
+            .setDescription(
+                "Vars: `{server}` `{rank}` `{type}` `{reason}` `{notes}`\n\n" +
+                "**Accept:**\n" + gc.dmTemplates.accept +
+                "\n\n**Deny:**\n" + gc.dmTemplates.deny +
                 "\n\n**Promote:**\n" + gc.dmTemplates.promote +
                 "\n\n**Demote:**\n" + gc.dmTemplates.demote +
                 "\n\n**Infract:**\n" + gc.dmTemplates.infract)
@@ -1352,7 +1377,7 @@ async function endGiveaway(giveawayId) {
 }
 
 // ==========================================
-// SHARED MODERATION LOGIC (slash + prefix)
+// SHARED MODERATION
 // ==========================================
 
 async function doMute(guild, executor, targetMember, durationInput, reason) {
@@ -1455,6 +1480,174 @@ async function doLogUser(guild, executor, username, punishment, reason, notes) {
 }
 
 // ==========================================
+// SHARED: accept / deny / promote / demote / infract
+// ==========================================
+
+async function doAccept(guild, executor, targetUser, notes) {
+    const gc = getGuildConfig(guild.id);
+    let roleGiven = 0;
+    if (gc.acceptRoleIds.length) {
+        const member = await guild.members.fetch(targetUser.id).catch(() => null);
+        if (member) for (const rid of gc.acceptRoleIds) { try { await member.roles.add(rid, "Accepted"); roleGiven++; } catch {} }
+    }
+    const dmSent = await tryDM(targetUser, buildTemplateDM(guild, "accept", { notes: notes || "" }));
+    const embed = new EmbedBuilder().setTitle("Application Accepted").setColor(0x57F287)
+        .addFields(
+            { name: "User", value: targetUser.tag + " (" + targetUser.id + ")", inline: false },
+            { name: "By", value: executor.tag, inline: true },
+            { name: "Roles Given", value: String(roleGiven), inline: true },
+            { name: "DM Sent", value: dmSent ? "Yes" : "No", inline: true }
+        ).setTimestamp();
+    if (notes) embed.addFields({ name: "Notes", value: notes.slice(0, 1024) });
+    broadcast(guild, embed, ["hr", "log", "webhook"]).catch(() => {});
+    return { ok: true, msg: targetUser.tag + " has been accepted." + (dmSent ? " DM sent." : " (DM failed)") };
+}
+
+async function doDeny(guild, executor, targetUser, reason, notes) {
+    const dmSent = await tryDM(targetUser, buildTemplateDM(guild, "deny", { reason }));
+    const embed = new EmbedBuilder().setTitle("Application Denied").setColor(0xED4245)
+        .addFields(
+            { name: "User", value: targetUser.tag + " (" + targetUser.id + ")", inline: false },
+            { name: "By", value: executor.tag, inline: true },
+            { name: "DM Sent", value: dmSent ? "Yes" : "No", inline: true },
+            { name: "Reason", value: reason, inline: false }
+        ).setTimestamp();
+    if (notes) embed.addFields({ name: "Internal Notes", value: notes.slice(0, 1024) });
+    broadcast(guild, embed, ["hr", "log", "webhook"]).catch(() => {});
+    return { ok: true, msg: targetUser.tag + " has been denied." + (dmSent ? " DM sent." : " (DM failed)") };
+}
+
+async function doPromote(guild, executor, targetUser, rank, notes) {
+    const dmSent = await tryDM(targetUser, buildTemplateDM(guild, "promote", { rank, notes: notes || "" }));
+    const embed = new EmbedBuilder().setTitle("Promotion").setColor(0x57F287)
+        .addFields(
+            { name: "User", value: targetUser.tag + " (" + targetUser.id + ")", inline: false },
+            { name: "New Rank", value: rank, inline: true },
+            { name: "By", value: executor.tag, inline: true },
+            { name: "DM", value: dmSent ? "Yes" : "No", inline: true }
+        ).setTimestamp();
+    if (notes) embed.addFields({ name: "Notes", value: notes.slice(0, 1024) });
+    broadcast(guild, embed, ["hr", "log", "webhook"]).catch(() => {});
+    return { ok: true, msg: targetUser.tag + " has been promoted to **" + rank + "**." };
+}
+
+async function doDemote(guild, executor, targetUser, rank, notes) {
+    const dmSent = await tryDM(targetUser, buildTemplateDM(guild, "demote", { rank, notes: notes || "" }));
+    const embed = new EmbedBuilder().setTitle("Demotion").setColor(0xED4245)
+        .addFields(
+            { name: "User", value: targetUser.tag + " (" + targetUser.id + ")", inline: false },
+            { name: "New Rank", value: rank, inline: true },
+            { name: "By", value: executor.tag, inline: true },
+            { name: "DM", value: dmSent ? "Yes" : "No", inline: true }
+        ).setTimestamp();
+    if (notes) embed.addFields({ name: "Notes", value: notes.slice(0, 1024) });
+    broadcast(guild, embed, ["hr", "log", "webhook"]).catch(() => {});
+    return { ok: true, msg: targetUser.tag + " has been demoted to **" + rank + "**." };
+}
+
+async function doInfract(guild, executor, targetUser, type, reason, notes) {
+    const dmSent = await tryDM(targetUser, buildTemplateDM(guild, "infract", { type, reason, notes: notes || "" }));
+    const colors = { warn: 0xFEE75C, strike: 0xED4245, demotion: 0xED4245, suspension: 0x992D22 };
+    const embed = new EmbedBuilder().setTitle("Infraction").setColor(colors[type] || 0xED4245)
+        .addFields(
+            { name: "User", value: targetUser.tag + " (" + targetUser.id + ")", inline: false },
+            { name: "Type", value: type, inline: true },
+            { name: "By", value: executor.tag, inline: true },
+            { name: "DM", value: dmSent ? "Yes" : "No", inline: true },
+            { name: "Reason", value: reason, inline: false }
+        ).setTimestamp();
+    if (notes) embed.addFields({ name: "Notes", value: notes.slice(0, 1024) });
+    broadcast(guild, embed, ["hr", "log", "webhook"]).catch(() => {});
+    return { ok: true, msg: targetUser.tag + " has been infracted: **" + type + "**." };
+}
+
+// ==========================================
+// TICKET CLOSE (SHARED)
+// ==========================================
+
+async function performTicketClose(interaction, guild, member, reason) {
+    const gc = getGuildConfig(guild.id);
+    const channel = interaction.channel;
+    const ticket = gc.tickets[channel.id];
+
+    if (!ticket) {
+        return interaction.reply({ embeds: [errorEmbed("This channel is not an active ticket.")], ephemeral: true });
+    }
+
+    const isOwner = interaction.user.id === ticket.userId;
+    const memberTiers = getMemberTiers(member);
+    const isStaffish = memberTiers.size > 0;
+    if (!isOwner && !isStaffish) {
+        return interaction.reply({ embeds: [errorEmbed("Only the ticket owner or staff can close this ticket.")], ephemeral: true });
+    }
+
+    await interaction.reply({ embeds: [infoEmbed("🔒 Closing ticket and generating transcript...")] });
+
+    // Generate transcript (async, non-blocking)
+    (async () => {
+        try {
+            const messages = await channel.messages.fetch({ limit: 500 });
+            const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+            let text = "=== Ticket #" + ticket.number + " Transcript ===\nType: " + ticket.type + "\nUser ID: " + ticket.userId + "\nClosed by: " + interaction.user.tag + " (" + interaction.user.id + ")\nReason: " + (reason || "No reason provided") + "\nClosed at: " + new Date().toISOString() + "\n======================================\n\n";
+            for (const m of sorted) {
+                text += "[" + new Date(m.createdTimestamp).toISOString() + "] " + m.author.tag + ": " + (m.content || "<no text>") + "\n";
+                if (m.attachments.size) for (const a of m.attachments.values()) text += "   [attachment] " + a.url + "\n";
+            }
+            const attachment = new AttachmentBuilder(Buffer.from(text, "utf8"), { name: "transcript-" + ticket.number + "-" + ticket.type + ".txt" });
+            const tEmbed = new EmbedBuilder().setTitle("Ticket Transcript — #" + ticket.number).setColor(WEBHOOK_COLOR)
+                .addFields(
+                    { name: "Type", value: ticket.type, inline: true },
+                    { name: "Owner", value: "<@" + ticket.userId + ">", inline: true },
+                    { name: "Closed By", value: interaction.user.tag, inline: true },
+                    { name: "Reason", value: (reason || "No reason provided").slice(0, 1024), inline: false }
+                ).setTimestamp();
+            await sendTranscript(guild, attachment, tEmbed);
+        } catch (e) { console.error("transcript:", e); }
+    })();
+
+    // Mark ticket closed
+    ticket.open = false;
+    ticket.closedAt = Date.now();
+    ticket.closedBy = interaction.user.id;
+    ticket.closeReason = reason || "No reason provided";
+    saveConfig();
+
+    // DM the opener
+    try {
+        const opener = await client.users.fetch(ticket.userId).catch(() => null);
+        if (opener) {
+            opener.send({
+                embeds: [new EmbedBuilder()
+                    .setTitle("🎫 Ticket Closed")
+                    .setDescription(
+                        "Your ticket **#" + ticket.number + "** in **" + guild.name + "** has been closed.\n\n" +
+                        "**Closed by:** " + interaction.user.tag + "\n" +
+                        "**Reason:** " + (reason || "No reason provided")
+                    )
+                    .setColor(WEBHOOK_COLOR)
+                    .setThumbnail(guild.iconURL({ size: 256 }))
+                    .setTimestamp()]
+            }).catch(() => {});
+        }
+    } catch {}
+
+    // Log
+    const logE = new EmbedBuilder().setTitle("Ticket Closed").setColor(0xED4245)
+        .addFields(
+            { name: "Ticket #", value: String(ticket.number), inline: true },
+            { name: "Type", value: ticket.type, inline: true },
+            { name: "Closed By", value: interaction.user.tag, inline: true },
+            { name: "Reason", value: (reason || "No reason provided").slice(0, 1024), inline: false }
+        ).setTimestamp();
+    broadcast(guild, logE, ["ticket", "webhook"]).catch(() => {});
+
+    // Delete the channel after 5s
+    setTimeout(async () => {
+        try { await channel.delete("Ticket closed"); } catch {}
+    }, 5000);
+}
+
+// ==========================================
 // INTERACTION HANDLER
 // ==========================================
 
@@ -1542,56 +1735,49 @@ client.on("interactionCreate", async interaction => {
             if (sub === "reset")   { an.counters = {}; saveConfig(); return interaction.reply({ embeds: [successEmbed("Reset.")] }); }
         }
 
+        // ---------- HR ----------
         if (command === "accept") {
             const targetUser = interaction.options.getUser("user");
             const notes = interaction.options.getString("notes") || null;
             await interaction.deferReply();
-            let roleGiven = 0;
-            if (gc.acceptRoleIds.length) {
-                const member = await guild.members.fetch(targetUser.id).catch(() => null);
-                if (member) for (const rid of gc.acceptRoleIds) { try { await member.roles.add(rid, "Accepted"); roleGiven++; } catch {} }
-            }
-            const dmSent = await tryDM(targetUser, buildTemplateDM(guild, "accept", { notes: notes || "" }));
-            const embed = new EmbedBuilder().setTitle("Application Accepted").setColor(0x57F287)
-                .addFields(
-                    { name: "User", value: targetUser.tag + " (" + targetUser.id + ")", inline: false },
-                    { name: "By", value: interaction.user.tag, inline: true },
-                    { name: "Roles", value: String(roleGiven), inline: true },
-                    { name: "DM", value: dmSent ? "Yes" : "No", inline: true }
-                ).setTimestamp();
-            if (notes) embed.addFields({ name: "Notes", value: notes.slice(0, 1024) });
-            await broadcast(guild, embed, ["hr", "log", "webhook"]);
-            return interaction.editReply({ embeds: [successEmbed(targetUser.tag + " accepted.")] });
+            const r = await doAccept(guild, interaction.user, targetUser, notes);
+            return interaction.editReply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
         }
-        if (command === "promote" || command === "demote" || command === "infract") {
+        if (command === "deny") {
             const targetUser = interaction.options.getUser("user");
+            const reason = interaction.options.getString("reason");
             const notes = interaction.options.getString("notes") || null;
             await interaction.deferReply();
-
-            let rank = null, type = null, reason = null, tplKey = command;
-            if (command !== "infract") rank = interaction.options.getString("rank");
-            else { type = interaction.options.getString("type"); reason = interaction.options.getString("reason"); }
-
-            const dmSent = await tryDM(targetUser, buildTemplateDM(guild, tplKey, { rank, type, reason, notes: notes || "" }));
-
-            const colorMap = { promote: 0x57F287, demote: 0xED4245, infract: { warn: 0xFEE75C, strike: 0xED4245, demotion: 0xED4245, suspension: 0x992D22 } };
-            const titleMap = { promote: "Promotion", demote: "Demotion", infract: "Infraction" };
-            const finalColor = command === "infract" ? (colorMap.infract[type] || 0xED4245) : colorMap[command];
-
-            const embed = new EmbedBuilder().setTitle(titleMap[command]).setColor(finalColor)
-                .addFields(
-                    { name: "User", value: targetUser.tag + " (" + targetUser.id + ")", inline: false },
-                    command === "infract" ? { name: "Type", value: type, inline: true } : { name: "New Rank", value: rank, inline: true },
-                    { name: "By", value: interaction.user.tag, inline: true },
-                    { name: "DM", value: dmSent ? "Yes" : "No", inline: true }
-                ).setTimestamp();
-            if (command === "infract") embed.addFields({ name: "Reason", value: reason, inline: false });
-            if (notes) embed.addFields({ name: "Notes", value: notes.slice(0, 1024) });
-
-            await broadcast(guild, embed, ["hr", "log", "webhook"]);
-            return interaction.editReply({ embeds: [successEmbed(targetUser.tag + " " + tplKey + "d.")] });
+            const r = await doDeny(guild, interaction.user, targetUser, reason, notes);
+            return interaction.editReply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
+        }
+        if (command === "promote") {
+            const targetUser = interaction.options.getUser("user");
+            const rank = interaction.options.getString("rank");
+            const notes = interaction.options.getString("notes") || null;
+            await interaction.deferReply();
+            const r = await doPromote(guild, interaction.user, targetUser, rank, notes);
+            return interaction.editReply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
+        }
+        if (command === "demote") {
+            const targetUser = interaction.options.getUser("user");
+            const rank = interaction.options.getString("rank");
+            const notes = interaction.options.getString("notes") || null;
+            await interaction.deferReply();
+            const r = await doDemote(guild, interaction.user, targetUser, rank, notes);
+            return interaction.editReply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
+        }
+        if (command === "infract") {
+            const targetUser = interaction.options.getUser("user");
+            const type = interaction.options.getString("type");
+            const reason = interaction.options.getString("reason");
+            const notes = interaction.options.getString("notes") || null;
+            await interaction.deferReply();
+            const r = await doInfract(guild, interaction.user, targetUser, type, reason, notes);
+            return interaction.editReply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
         }
 
+        // ---------- Moderation ----------
         if (command === "mute") {
             const target = await guild.members.fetch(interaction.options.getUser("user").id).catch(() => null);
             const reason = interaction.options.getString("reason") || "No reason provided";
@@ -1629,6 +1815,7 @@ client.on("interactionCreate", async interaction => {
             return interaction.editReply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
         }
 
+        // ---------- Logging ----------
         if (command === "loguser") {
             await interaction.deferReply();
             const r = await doLogUser(guild, interaction.user,
@@ -1639,6 +1826,7 @@ client.on("interactionCreate", async interaction => {
             return interaction.editReply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
         }
 
+        // ---------- Events ----------
         if (command === "poll") {
             const question = interaction.options.getString("question");
             const options = [];
@@ -1688,11 +1876,19 @@ client.on("interactionCreate", async interaction => {
             return;
         }
 
+        // ---------- Utility ----------
         if (command === "roles")      return cmdRoles(interaction, true);
         if (command === "serverinfo") return cmdServerInfo(interaction, true);
         if (command === "afk")        return cmdAfk(interaction, true, interaction.options.getString("reason"));
         if (command === "av")         return cmdAv(interaction, true, interaction.options.getUser("user"));
 
+        // ---------- Ticket close aliases ----------
+        if (command === "close" || command === "closeticket" || command === "ticketclose") {
+            const reason = interaction.options.getString("reason") || null;
+            return performTicketClose(interaction, guild, interaction.member, reason);
+        }
+
+        // ---------- Public ----------
         if (command === "suggest") {
             if (!gc.suggestionChannelId) return interaction.reply({ embeds: [errorEmbed("Suggestions channel not set.")], ephemeral: true });
             const suggestion = interaction.options.getString("suggestion");
@@ -1721,18 +1917,19 @@ client.on("interactionCreate", async interaction => {
 
         if (command === "help") {
             const prefix = getPrefix(guild.id);
-            const embed = new EmbedBuilder().setTitle(guild.name + " — Bot Commands V.2.0")
+            const embed = new EmbedBuilder().setTitle(guild.name + " — Bot Commands V.2.1")
                 .setColor(WEBHOOK_COLOR).setThumbnail(guild.iconURL())
                 .addFields(
                     { name: "Setup (Management)", value: "`/setup` `/setupverify` `/setuptickets`", inline: false },
                     { name: "Anti-Nuke", value: "`/antinuke status|enable|disable`\n`/antinuke threshold <n>` `/antinuke whitelist-*` `/antinuke watchlist`", inline: false },
-                    { name: "HR", value: "`/accept` `/promote` `/demote` `/infract`", inline: false },
+                    { name: "HR", value: "`/accept` `/deny` `/promote` `/demote` `/infract`", inline: false },
                     { name: "Moderation", value: "`/mute` `/unmute` `/warn` `/kick` `/ban` `/unban`", inline: false },
+                    { name: "Tickets", value: "`/close` `/closeticket` `/ticketclose` — close current ticket\n`/setupverify` `/setuptickets`", inline: false },
                     { name: "Logging", value: "`/loguser <user> <Warn|Kick|Ban> <reason>`", inline: false },
-                    { name: "Events", value: "`/poll` — multi-option poll\n`/giveaway` — role-locked giveaways", inline: false },
+                    { name: "Events", value: "`/poll` `/giveaway`", inline: false },
                     { name: "Utility", value: "`/roles` `/serverinfo` `/av` `/afk`", inline: false },
                     { name: "Public", value: "`/suggest` `/staff-feedback`", inline: false },
-                    { name: "Prefix Support", value: "All commands above also work with `" + prefix + "` prefix, e.g. `" + prefix + "ban @user reason`, `" + prefix + "av`, `" + prefix + "poll ...` (see below)", inline: false }
+                    { name: "Prefix Support", value: "All commands above also work with `" + prefix + "` prefix. Ticket-close aliases: `" + prefix + "close`, `" + prefix + "closeticket`, `" + prefix + "ticketclose`", inline: false }
                 );
             return interaction.reply({ embeds: [embed] });
         }
@@ -1795,6 +1992,45 @@ async function handleButton(interaction) {
                 if (msg) await msg.edit({ embeds: [buildGiveawayEmbed(g, false, [])], components: buildGiveawayRows(giveawayId, false) }).catch(() => {});
             }
         } catch {}
+        return;
+    }
+
+    // ---- TICKET CLOSE CONFIRMATION BUTTONS ----
+    if (id.startsWith("ticket_close_confirm_") || id.startsWith("ticket_close_cancel_")) {
+        const isConfirm = id.startsWith("ticket_close_confirm_");
+        const rest = id.slice(isConfirm ? "ticket_close_confirm_".length : "ticket_close_cancel_".length);
+        const [ticketChannelId, ...reasonParts] = rest.split("|");
+        const reason = reasonParts.join("|") || "No reason provided";
+
+        const pending = _pendingCloseConfirmations.get(interaction.message.id);
+        if (!pending) {
+            return interaction.reply({ embeds: [errorEmbed("This confirmation has expired.")], ephemeral: true });
+        }
+        if (pending.userId !== interaction.user.id) {
+            return interaction.reply({ embeds: [errorEmbed("Only the person who initiated this close can confirm.")], ephemeral: true });
+        }
+
+        _pendingCloseConfirmations.delete(interaction.message.id);
+
+        if (!isConfirm) {
+            await interaction.update({ embeds: [infoEmbed("❌ Ticket close cancelled.")], components: [] }).catch(() => {});
+            return;
+        }
+
+        // Perform the close
+        await interaction.update({ embeds: [infoEmbed("🔒 Closing ticket...")], components: [] }).catch(() => {});
+
+        const ticketChannel = await client.channels.fetch(ticketChannelId).catch(() => null);
+        if (!ticketChannel) return;
+
+        const ticket = gc.tickets[ticketChannelId];
+        if (!ticket || !ticket.open) {
+            return interaction.followUp({ embeds: [errorEmbed("This ticket is already closed.")], ephemeral: true }).catch(() => {});
+        }
+
+        // Reuse the same closing flow as performTicketClose but without the interaction.reply()
+        await doTicketCloseWork(guild, ticketChannel, ticket, interaction.user, reason);
+
         return;
     }
 
@@ -1970,6 +2206,7 @@ async function handleButton(interaction) {
 
     const tplMap = {
         setup_tpl_accept:  { key: "accept",  name: "Accept DM",  label: "Vars: {server} {notes}" },
+        setup_tpl_deny:    { key: "deny",    name: "Deny DM",    label: "Vars: {server} {reason}" },
         setup_tpl_promote: { key: "promote", name: "Promote DM", label: "Vars: {server} {rank} {notes}" },
         setup_tpl_demote:  { key: "demote",  name: "Demote DM",  label: "Vars: {server} {rank} {notes}" },
         setup_tpl_infract: { key: "infract", name: "Infract DM", label: "Vars: {server} {type} {reason} {notes}" }
@@ -1992,7 +2229,96 @@ async function handleButton(interaction) {
     if (id === "ticket_rules")             return interaction.reply({ embeds: [buildTicketRulesEmbed(guild)], ephemeral: true });
     if (id === "ticket_type_support")      return handleTicketCreate(interaction, "support");
     if (id === "ticket_type_highrank")     return handleTicketCreate(interaction, "highrank");
-    if (id === "ticket_close")             return handleTicketClose(interaction);
+    if (id === "ticket_close") {
+        // Show confirmation
+        const reason = "Closed via button";
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId("ticket_close_confirm_" + interaction.channel.id + "|" + reason).setLabel("Confirm Close").setEmoji("✅").setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId("ticket_close_cancel_" + interaction.channel.id + "|" + reason).setLabel("Cancel").setEmoji("❌").setStyle(ButtonStyle.Secondary)
+        );
+        const sent = await interaction.reply({
+            embeds: [infoEmbed("Are you sure you want to close this ticket?\n**Reason:** " + reason)],
+            components: [row],
+            ephemeral: false,
+            fetchReply: true
+        });
+        _pendingCloseConfirmations.set(sent.id, {
+            userId: interaction.user.id,
+            channelId: interaction.channel.id,
+            guildId: guild.id,
+            reason,
+            expiresAt: Date.now() + TICKET_CLOSE_CONFIRM_MS
+        });
+        return;
+    }
+}
+
+// ==========================================
+// SHARED CLOSE-WORKER (used by prefix, slash, button)
+// ==========================================
+
+async function doTicketCloseWork(guild, ticketChannel, ticket, executorUser, reason) {
+    const gc = getGuildConfig(guild.id);
+
+    // Generate transcript
+    (async () => {
+        try {
+            const messages = await ticketChannel.messages.fetch({ limit: 500 });
+            const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+            let text = "=== Ticket #" + ticket.number + " Transcript ===\nType: " + ticket.type + "\nUser ID: " + ticket.userId + "\nClosed by: " + executorUser.tag + " (" + executorUser.id + ")\nReason: " + (reason || "No reason provided") + "\nClosed at: " + new Date().toISOString() + "\n======================================\n\n";
+            for (const m of sorted) {
+                text += "[" + new Date(m.createdTimestamp).toISOString() + "] " + m.author.tag + ": " + (m.content || "<no text>") + "\n";
+                if (m.attachments.size) for (const a of m.attachments.values()) text += "   [attachment] " + a.url + "\n";
+            }
+            const attachment = new AttachmentBuilder(Buffer.from(text, "utf8"), { name: "transcript-" + ticket.number + "-" + ticket.type + ".txt" });
+            const tEmbed = new EmbedBuilder().setTitle("Ticket Transcript — #" + ticket.number).setColor(WEBHOOK_COLOR)
+                .addFields(
+                    { name: "Type", value: ticket.type, inline: true },
+                    { name: "Owner", value: "<@" + ticket.userId + ">", inline: true },
+                    { name: "Closed By", value: executorUser.tag, inline: true },
+                    { name: "Reason", value: (reason || "No reason provided").slice(0, 1024), inline: false }
+                ).setTimestamp();
+            await sendTranscript(guild, attachment, tEmbed);
+        } catch (e) { console.error("transcript:", e); }
+    })();
+
+    ticket.open = false;
+    ticket.closedAt = Date.now();
+    ticket.closedBy = executorUser.id;
+    ticket.closeReason = reason || "No reason provided";
+    saveConfig();
+
+    // DM the opener
+    try {
+        const opener = await client.users.fetch(ticket.userId).catch(() => null);
+        if (opener) {
+            opener.send({
+                embeds: [new EmbedBuilder()
+                    .setTitle("🎫 Ticket Closed")
+                    .setDescription(
+                        "Your ticket **#" + ticket.number + "** in **" + guild.name + "** has been closed.\n\n" +
+                        "**Closed by:** " + executorUser.tag + "\n" +
+                        "**Reason:** " + (reason || "No reason provided")
+                    )
+                    .setColor(WEBHOOK_COLOR)
+                    .setThumbnail(guild.iconURL({ size: 256 }))
+                    .setTimestamp()]
+            }).catch(() => {});
+        }
+    } catch {}
+
+    const logE = new EmbedBuilder().setTitle("Ticket Closed").setColor(0xED4245)
+        .addFields(
+            { name: "Ticket #", value: String(ticket.number), inline: true },
+            { name: "Type", value: ticket.type, inline: true },
+            { name: "Closed By", value: executorUser.tag, inline: true },
+            { name: "Reason", value: (reason || "No reason provided").slice(0, 1024), inline: false }
+        ).setTimestamp();
+    broadcast(guild, logE, ["ticket", "webhook"]).catch(() => {});
+
+    setTimeout(async () => {
+        try { await ticketChannel.delete("Ticket closed"); } catch {}
+    }, 5000);
 }
 
 // ==========================================
@@ -2125,7 +2451,7 @@ async function handleVerifyCheck(interaction) {
 }
 
 // ==========================================
-// TICKETS  (FIXED PERMISSIONS + MENTION)
+// TICKETS
 // ==========================================
 
 const TICKET_TYPES = {
@@ -2139,7 +2465,6 @@ async function handleTicketCreate(interaction, type, prefillReason) {
     const cfg = TICKET_TYPES[type];
     if (!cfg) return interaction.reply({ embeds: [errorEmbed("Unknown ticket type.")], ephemeral: true });
 
-    // Already has an open ticket?
     const existing = Object.entries(gc.tickets).find(([, t]) => t.userId === interaction.user.id && t.open);
     if (existing) {
         const ch = guild.channels.cache.get(existing[0]);
@@ -2158,64 +2483,21 @@ async function handleTicketCreate(interaction, type, prefillReason) {
     const cleanUser = (interaction.user.username.toLowerCase().replace(/[^a-z0-9]/g, "") || "user").slice(0, 15);
     const channelName = ticketNumber + "-" + cfg.slug + "-" + cleanUser;
 
-    // ============================================
-    // FIXED PERMISSIONS:
-    // - @everyone: DENY ViewChannel
-    // - Ticket opener: ALLOW full access
-    // - Bot: ALLOW full access
-    // - The specific ping role for this ticket type: ALLOW access
-    // - Management roles (so high-rank tickets are always visible to management): ALLOW access
-    // - All other staff/admin/highrank roles: NO access (deny ViewChannel)
-    // ============================================
     const pingRoleId = gc[cfg.pingKey] || null;
     const mgmtRoleIds = gc.managementRoles || [];
 
     const overwrites = [
         { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-        {
-            id: interaction.user.id,
-            allow: [
-                PermissionFlagsBits.ViewChannel,
-                PermissionFlagsBits.SendMessages,
-                PermissionFlagsBits.ReadMessageHistory,
-                PermissionFlagsBits.AttachFiles,
-                PermissionFlagsBits.EmbedLinks
-            ]
-        },
-        {
-            id: client.user.id,
-            allow: [
-                PermissionFlagsBits.ViewChannel,
-                PermissionFlagsBits.SendMessages,
-                PermissionFlagsBits.ManageChannels,
-                PermissionFlagsBits.ReadMessageHistory
-            ]
-        }
+        { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks] },
+        { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ReadMessageHistory] }
     ];
 
-    // Add the ticket-specific ping role (this is the ONLY role that can see the ticket)
     if (pingRoleId && !overwrites.find(o => o.id === pingRoleId)) {
-        overwrites.push({
-            id: pingRoleId,
-            allow: [
-                PermissionFlagsBits.ViewChannel,
-                PermissionFlagsBits.SendMessages,
-                PermissionFlagsBits.ReadMessageHistory
-            ]
-        });
+        overwrites.push({ id: pingRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
     }
-
-    // Always add management roles (so leadership can see high-rank tickets even if ping role changes)
     for (const rid of mgmtRoleIds) {
         if (!overwrites.find(o => o.id === rid)) {
-            overwrites.push({
-                id: rid,
-                allow: [
-                    PermissionFlagsBits.ViewChannel,
-                    PermissionFlagsBits.SendMessages,
-                    PermissionFlagsBits.ReadMessageHistory
-                ]
-            });
+            overwrites.push({ id: rid, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
         }
     }
 
@@ -2243,10 +2525,7 @@ async function handleTicketCreate(interaction, type, prefillReason) {
     };
     saveConfig();
 
-    // ============================================
-    // FIXED PING: Actually mention the user + ping role
-    // ============================================
-    const pingParts = [interaction.user.toString()]; // real mention
+    const pingParts = [interaction.user.toString()];
     if (pingRoleId) pingParts.push("<@&" + pingRoleId + ">");
 
     const welcome = new EmbedBuilder()
@@ -2254,7 +2533,8 @@ async function handleTicketCreate(interaction, type, prefillReason) {
         .setDescription(
             "**" + interaction.user + "**, thank you for opening a ticket.\n\n" +
             (prefillReason ? "**Reason:** " + prefillReason + "\n\n" : "") +
-            "A staff member will assist you shortly."
+            "A staff member will assist you shortly.\n\n" +
+            "**To close this ticket:** use `/close`, `/closeticket`, or the 🔒 button below."
         )
         .setColor(WEBHOOK_COLOR)
         .setThumbnail(guild.iconURL({ size: 256 }))
@@ -2269,10 +2549,7 @@ async function handleTicketCreate(interaction, type, prefillReason) {
         content: pingParts.join(" "),
         embeds: [welcome],
         components: [closeRow],
-        allowedMentions: {
-            users: [interaction.user.id],
-            roles: pingRoleId ? [pingRoleId] : []
-        }
+        allowedMentions: { users: [interaction.user.id], roles: pingRoleId ? [pingRoleId] : [] }
     }).catch(e => console.error("ticket send:", e));
 
     const logE = new EmbedBuilder().setTitle("Ticket Opened").setColor(WEBHOOK_COLOR)
@@ -2284,53 +2561,17 @@ async function handleTicketCreate(interaction, type, prefillReason) {
         ).setTimestamp();
     broadcast(guild, logE, ["ticket", "webhook"]).catch(() => {});
 
+    // DM the opener with the ticket link
+    interaction.user.send({
+        embeds: [new EmbedBuilder()
+            .setTitle("🎫 Ticket Created")
+            .setDescription("Your **" + cfg.label + "** ticket in **" + guild.name + "** has been created: " + channel)
+            .setColor(WEBHOOK_COLOR)
+            .setThumbnail(guild.iconURL({ size: 256 }))
+            .setTimestamp()]
+    }).catch(() => {});
+
     return interaction.editReply({ embeds: [successEmbed("Ticket created: " + channel)] });
-}
-
-async function handleTicketClose(interaction) {
-    const guild = interaction.guild;
-    const gc = getGuildConfig(guild.id);
-    const ticket = gc.tickets[interaction.channel.id];
-    if (!ticket) return interaction.reply({ embeds: [errorEmbed("Not a ticket.")], ephemeral: true });
-
-    const isOwner = interaction.user.id === ticket.userId;
-    const memberTiers = getMemberTiers(interaction.member);
-    const isStaffish = memberTiers.size > 0;
-    if (!isOwner && !isStaffish) return interaction.reply({ embeds: [errorEmbed("Only the ticket owner or staff can close.")], ephemeral: true });
-
-    await interaction.reply({ embeds: [infoEmbed("🔒 Closing and generating transcript...")] });
-
-    (async () => {
-        try {
-            const messages = await interaction.channel.messages.fetch({ limit: 500 });
-            const sorted = [...messages.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-            let text = "=== Ticket #" + ticket.number + " Transcript ===\nType: " + ticket.type + "\nUser ID: " + ticket.userId + "\nClosed by: " + interaction.user.tag + " (" + interaction.user.id + ")\nClosed at: " + new Date().toISOString() + "\n======================================\n\n";
-            for (const m of sorted) {
-                text += "[" + new Date(m.createdTimestamp).toISOString() + "] " + m.author.tag + ": " + (m.content || "<no text>") + "\n";
-                if (m.attachments.size) for (const a of m.attachments.values()) text += "   [attachment] " + a.url + "\n";
-            }
-            const attachment = new AttachmentBuilder(Buffer.from(text, "utf8"), { name: "transcript-" + ticket.number + "-" + ticket.type + ".txt" });
-            const tEmbed = new EmbedBuilder().setTitle("Ticket Transcript — #" + ticket.number).setColor(WEBHOOK_COLOR)
-                .addFields(
-                    { name: "Type", value: ticket.type, inline: true },
-                    { name: "Owner", value: "<@" + ticket.userId + ">", inline: true },
-                    { name: "Closed By", value: interaction.user.tag, inline: true }
-                ).setTimestamp();
-            await sendTranscript(guild, attachment, tEmbed);
-        } catch (e) { console.error("transcript:", e); }
-    })();
-
-    ticket.open = false; ticket.closedAt = Date.now(); ticket.closedBy = interaction.user.id; saveConfig();
-
-    const logE = new EmbedBuilder().setTitle("Ticket Closed").setColor(0xED4245)
-        .addFields(
-            { name: "Ticket #", value: String(ticket.number), inline: true },
-            { name: "Type", value: ticket.type, inline: true },
-            { name: "Closed By", value: interaction.user.tag, inline: true }
-        ).setTimestamp();
-    broadcast(guild, logE, ["ticket", "webhook"]).catch(() => {});
-
-    setTimeout(async () => { try { await interaction.channel.delete("Ticket closed"); } catch {} }, 5000);
 }
 
 // ==========================================
@@ -2414,7 +2655,7 @@ function buildVerifyRows() {
 }
 function buildTicketPanelEmbed(guild) {
     return new EmbedBuilder().setTitle("🎫 Need Assistance?")
-        .setDescription("**" + guild.name + " | Support Assistant**\n\n⚙️ **Need Assistance?**\n> Click **Open a Ticket** below.\n\nℹ️ **Server Rules**\n> Please review the Ticket Rules before proceeding.")
+        .setDescription("**" + guild.name + " | Support Assistant**\n\n⚙️ **Need Assistance?**\n> Click **Open a Ticket** below.\n\nℹ️ **Server Rules**\n> Please review the Ticket Rules before proceeding.\n\n**To close your ticket:** use `/close` or the 🔒 button.")
         .setColor(EMBED_ACCENT).setThumbnail(guild.iconURL({ size: 256 }))
         .setFooter({ text: guild.name + " • Support System", iconURL: guild.iconURL() || undefined }).setTimestamp();
 }
@@ -2541,7 +2782,7 @@ async function cmdAv(interactionOrMessage, isSlash, targetUser) {
 }
 
 // ==========================================
-// MESSAGE HANDLER — FULL PREFIX SUPPORT
+// MESSAGE HANDLER
 // ==========================================
 
 client.on("messageCreate", async message => {
@@ -2652,7 +2893,8 @@ client.on("messageCreate", async message => {
                     { name: "Setup", value: "`" + prefix + "help` — this menu\n`" + prefix + "setprefix <p>` — change prefix", inline: false },
                     { name: "Utility", value: "`" + prefix + "roles` — list roles (staff)\n`" + prefix + "serverinfo`\n`" + prefix + "av [@user]`\n`" + prefix + "afk [reason]`", inline: false },
                     { name: "Moderation", value: "`" + prefix + "mute @user 10m [reason]`\n`" + prefix + "unmute @user [reason]`\n`" + prefix + "warn @user [reason]`\n`" + prefix + "kick @user [reason]`\n`" + prefix + "ban @user [reason]`\n`" + prefix + "unban <userId> [reason]`", inline: false },
-                    { name: "HR", value: "`" + prefix + "accept @user [notes]`\n`" + prefix + "promote @user <rank> [notes]`\n`" + prefix + "demote @user <rank> [notes]`\n`" + prefix + "infract @user <warn|strike|demotion|suspension> <reason>`", inline: false },
+                    { name: "HR", value: "`" + prefix + "accept @user [notes]`\n`" + prefix + "deny @user <reason> [notes]`\n`" + prefix + "promote @user <rank> [notes]`\n`" + prefix + "demote @user <rank> [notes]`\n`" + prefix + "infract @user <warn|strike|demotion|suspension> <reason>`", inline: false },
+                    { name: "Tickets", value: "`" + prefix + "close [reason]` — close current ticket\n`" + prefix + "closeticket [reason]`\n`" + prefix + "ticketclose [reason]`", inline: false },
                     { name: "Logging", value: "`" + prefix + "loguser <username> <warn|kick|ban> <reason>`", inline: false },
                     { name: "Events", value: "`" + prefix + "poll <question> | <opt1> | <opt2> ...`\n`" + prefix + "giveaway <prize> <minutes> [winners]`", inline: false },
                     { name: "Public", value: "`" + prefix + "suggest <text>`\n`" + prefix + "staff-feedback @user <text>`", inline: false }
@@ -2776,72 +3018,91 @@ client.on("messageCreate", async message => {
             const target = await resolveMember(guild, targetInput);
             if (!target) return message.reply({ embeds: [errorEmbed("Member not found.")] });
             message.channel.sendTyping().catch(() => {});
-            let roleGiven = 0;
-            if (gc.acceptRoleIds.length) {
-                for (const rid of gc.acceptRoleIds) { try { await target.roles.add(rid, "Accepted"); roleGiven++; } catch {} }
-            }
-            const dmSent = await tryDM(target.user, buildTemplateDM(guild, "accept", { notes: notes || "" }));
-            const embed = new EmbedBuilder().setTitle("Application Accepted").setColor(0x57F287)
-                .addFields(
-                    { name: "User", value: target.user.tag + " (" + target.id + ")", inline: false },
-                    { name: "By", value: executor.tag, inline: true },
-                    { name: "Roles", value: String(roleGiven), inline: true },
-                    { name: "DM", value: dmSent ? "Yes" : "No", inline: true }
-                ).setTimestamp();
-            if (notes) embed.addFields({ name: "Notes", value: notes.slice(0, 1024) });
-            broadcast(guild, embed, ["hr", "log", "webhook"]).catch(() => {});
-            return message.reply({ embeds: [successEmbed(target.user.tag + " accepted.")] });
+            const r = await doAccept(guild, executor, target.user, notes);
+            return message.reply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
         }
-        if (command === "promote" || command === "demote" || command === "infract") {
-            if (!canRunCommand(executorMember, command)) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+        if (command === "deny") {
+            if (!canRunCommand(executorMember, "deny")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
             const targetInput = args[0];
-            if (!targetInput) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + command + " @user ...`")] });
+            const reason = args.slice(1).join(" ");
+            if (!targetInput || !reason) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "deny @user <reason>`")] });
             const target = await resolveMember(guild, targetInput);
             if (!target) return message.reply({ embeds: [errorEmbed("Member not found.")] });
+            message.channel.sendTyping().catch(() => {});
+            const r = await doDeny(guild, executor, target.user, reason, null);
+            return message.reply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
+        }
+        if (command === "promote") {
+            if (!canRunCommand(executorMember, "promote")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            const targetInput = args[0];
+            const rank = args[1];
+            const notes = args.slice(2).join(" ") || null;
+            if (!targetInput || !rank) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "promote @user <rank> [notes]`")] });
+            const target = await resolveMember(guild, targetInput);
+            if (!target) return message.reply({ embeds: [errorEmbed("Member not found.")] });
+            message.channel.sendTyping().catch(() => {});
+            const r = await doPromote(guild, executor, target.user, rank, notes);
+            return message.reply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
+        }
+        if (command === "demote") {
+            if (!canRunCommand(executorMember, "demote")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            const targetInput = args[0];
+            const rank = args[1];
+            const notes = args.slice(2).join(" ") || null;
+            if (!targetInput || !rank) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "demote @user <rank> [notes]`")] });
+            const target = await resolveMember(guild, targetInput);
+            if (!target) return message.reply({ embeds: [errorEmbed("Member not found.")] });
+            message.channel.sendTyping().catch(() => {});
+            const r = await doDemote(guild, executor, target.user, rank, notes);
+            return message.reply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
+        }
+        if (command === "infract") {
+            if (!canRunCommand(executorMember, "infract")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
+            const targetInput = args[0];
+            const type = (args[1] || "").toLowerCase();
+            const reason = args.slice(2).join(" ") || "No reason provided";
+            const validTypes = ["warn", "strike", "demotion", "suspension"];
+            if (!targetInput || !validTypes.includes(type)) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "infract @user <warn|strike|demotion|suspension> <reason>`")] });
+            const target = await resolveMember(guild, targetInput);
+            if (!target) return message.reply({ embeds: [errorEmbed("Member not found.")] });
+            message.channel.sendTyping().catch(() => {});
+            const r = await doInfract(guild, executor, target.user, type, reason, null);
+            return message.reply({ embeds: [r.ok ? successEmbed(r.msg) : errorEmbed(r.msg)] });
+        }
 
-            if (command === "infract") {
-                const type = (args[1] || "").toLowerCase();
-                const reason = args.slice(2).join(" ") || "No reason provided";
-                const validTypes = ["warn", "strike", "demotion", "suspension"];
-                if (!validTypes.includes(type)) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "infract @user <warn|strike|demotion|suspension> <reason>`")] });
-                message.channel.sendTyping().catch(() => {});
-                const dmSent = await tryDM(target.user, buildTemplateDM(guild, "infract", { type, reason, notes: "" }));
-                const colors = { warn: 0xFEE75C, strike: 0xED4245, demotion: 0xED4245, suspension: 0x992D22 };
-                const embed = new EmbedBuilder().setTitle("Infraction").setColor(colors[type] || 0xED4245)
-                    .addFields(
-                        { name: "User", value: target.user.tag + " (" + target.id + ")", inline: false },
-                        { name: "Type", value: type, inline: true },
-                        { name: "By", value: executor.tag, inline: true },
-                        { name: "DM", value: dmSent ? "Yes" : "No", inline: true },
-                        { name: "Reason", value: reason, inline: false }
-                    ).setTimestamp();
-                broadcast(guild, embed, ["hr", "log", "webhook"]).catch(() => {});
-                return message.reply({ embeds: [successEmbed(target.user.tag + " infracted: **" + type + "**.")] });
-            } else {
-                const rank = args[1];
-                const notes = args.slice(2).join(" ") || null;
-                if (!rank) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + command + " @user <rank> [notes]`")] });
-                message.channel.sendTyping().catch(() => {});
-                const dmSent = await tryDM(target.user, buildTemplateDM(guild, command, { rank, notes: notes || "" }));
-                const color = command === "promote" ? 0x57F287 : 0xED4245;
-                const title = command === "promote" ? "Promotion" : "Demotion";
-                const embed = new EmbedBuilder().setTitle(title).setColor(color)
-                    .addFields(
-                        { name: "User", value: target.user.tag + " (" + target.id + ")", inline: false },
-                        { name: "New Rank", value: rank, inline: true },
-                        { name: "By", value: executor.tag, inline: true },
-                        { name: "DM", value: dmSent ? "Yes" : "No", inline: true }
-                    ).setTimestamp();
-                if (notes) embed.addFields({ name: "Notes", value: notes.slice(0, 1024) });
-                broadcast(guild, embed, ["hr", "log", "webhook"]).catch(() => {});
-                return message.reply({ embeds: [successEmbed(target.user.tag + " " + command + "d to **" + rank + "**.")] });
-            }
+        // ---- TICKET CLOSE ALIASES (prefix) ----
+        if (command === "close" || command === "closeticket" || command === "ticketclose") {
+            const reason = args.join(" ").slice(0, 400) || null;
+            const ticket = gc.tickets[message.channel.id];
+            if (!ticket) return message.reply({ embeds: [errorEmbed("This channel is not an active ticket.")] });
+
+            const isOwner = executor.id === ticket.userId;
+            const memberTiers = getMemberTiers(executorMember);
+            const isStaffish = memberTiers.size > 0;
+            if (!isOwner && !isStaffish) return message.reply({ embeds: [errorEmbed("Only the ticket owner or staff can close this ticket.")] });
+
+            // Show confirmation buttons
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId("ticket_close_confirm_" + message.channel.id + "|" + (reason || "No reason provided")).setLabel("Confirm Close").setEmoji("✅").setStyle(ButtonStyle.Danger),
+                new ButtonBuilder().setCustomId("ticket_close_cancel_" + message.channel.id + "|" + (reason || "No reason provided")).setLabel("Cancel").setEmoji("❌").setStyle(ButtonStyle.Secondary)
+            );
+            const sent = await message.channel.send({
+                embeds: [infoEmbed("Are you sure you want to close this ticket?\n**Reason:** " + (reason || "No reason provided"))],
+                components: [row]
+            });
+            _pendingCloseConfirmations.set(sent.id, {
+                userId: executor.id,
+                channelId: message.channel.id,
+                guildId: guild.id,
+                reason: reason || "No reason provided",
+                expiresAt: Date.now() + TICKET_CLOSE_CONFIRM_MS
+            });
+            return;
         }
 
         // ---- EVENTS ----
         if (command === "poll") {
             if (!canRunCommand(executorMember, "poll")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
-            // Format: !poll Question | opt1 | opt2 | opt3
             const parts = args.join(" ").split("|").map(s => s.trim()).filter(Boolean);
             if (parts.length < 3) return message.reply({ embeds: [errorEmbed("Usage: `" + prefix + "poll <question> | <opt1> | <opt2> ...` (min 2 options)")] });
             const question = parts[0].slice(0, 250);
@@ -2855,7 +3116,6 @@ client.on("messageCreate", async message => {
         }
         if (command === "giveaway") {
             if (!canRunCommand(executorMember, "giveaway")) return message.reply({ embeds: [errorEmbed("You don't have permission.")] });
-            // Format: !giveaway <prize> <minutes> [winners]
             const prize = args[0];
             const minutes = parseInt(args[1], 10);
             const winners = parseInt(args[2], 10) || 1;
@@ -2908,7 +3168,6 @@ client.on("messageCreate", async message => {
             return message.reply({ embeds: [successEmbed("Feedback submitted!")] });
         }
 
-        // Unknown command — silent
     } catch (e) {
         console.error("prefix cmd error:", e);
         try { await message.reply({ embeds: [errorEmbed("Error: " + (e?.message || "unknown"))] }); } catch {}
