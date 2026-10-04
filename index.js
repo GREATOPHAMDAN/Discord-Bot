@@ -131,6 +131,13 @@ function defaultGuildConfig() {
     tickets: {
       supportCategory: null, supportPing: null,
       highrankCategory: null, highrankPing: null,
+      supportAccess: [],
+      highrankAccess: [],
+      supportStaff: [],
+      highrankStaff: [],
+      rules: 'Please review the Ticket Rules before proceeding to ensure your request is handled properly.',
+      panelTitle: 'Need Assistance?',
+      panelBody: 'Click the **Open a Ticket** button below to get started and open a support ticket.',
       counter: 0, open: {}
     },
     antinuke: { enabled: false, threshold: 5, windowMs: 10000, whitelist: [], counters: {}, watchlist: {} },
@@ -807,8 +814,40 @@ async function runAutomod(message, isUpdate = false) {
 // TICKETS
 // ============================================================================
 
-async function createTicket(guild, user, type) {
+function memberCanOpenTicket(member, type) {
+  if (!member) return false;
+  if (member.id === member.guild.ownerId || member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+  const gc = getGuildConfig(member.guild.id);
+  const access = type === 'highrank'
+    ? (gc.tickets.highrankAccess || [])
+    : (gc.tickets.supportAccess || []);
+  if (!access.length) return true;
+  return access.some(id => member.roles.cache.has(id));
+}
+
+function staffRolesForTicketType(gc, type) {
+  const custom = type === 'highrank'
+    ? (gc.tickets.highrankStaff || [])
+    : (gc.tickets.supportStaff || []);
+  if (custom.length) return [...custom];
+  if (type === 'highrank') {
+    return [...(gc.roles.highrank || []), ...(gc.roles.management || [])];
+  }
+  return [
+    ...(gc.roles.staff || []),
+    ...(gc.roles.admin || []),
+    ...(gc.roles.highrank || []),
+    ...(gc.roles.management || [])
+  ];
+}
+
+async function createTicket(guild, user, type, member) {
   const gc = getGuildConfig(guild.id);
+  const mem = member || await guild.members.fetch(user.id).catch(() => null);
+  if (mem && !memberCanOpenTicket(mem, type)) {
+    return { ok: false, msg: 'You do not have access to open this ticket type.' };
+  }
+
   for (const [tid, t] of Object.entries(gc.tickets.open || {})) {
     if (t.userId === user.id && !t.closed) {
       const ch = guild.channels.cache.get(t.channelId);
@@ -845,10 +884,7 @@ async function createTicket(guild, user, type) {
       PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory
     ]});
   }
-  for (const rid of [
-    ...(gc.roles.management || []), ...(gc.roles.highrank || []),
-    ...(gc.roles.admin || []), ...(gc.roles.staff || [])
-  ]) {
+  for (const rid of staffRolesForTicketType(gc, type)) {
     if (!overwrites.find(o => o.id === rid)) {
       overwrites.push({ id: rid, type: OverwriteType.Role, allow: [
         PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory
@@ -869,7 +905,7 @@ async function createTicket(guild, user, type) {
 
   const welcome = new EmbedBuilder().setTitle('Ticket opened')
     .setDescription(`${user} — ${type} ticket.\nDescribe your issue below.`)
-    .setColor(0x5865F2).setFooter({ text: `#${num}` }).setTimestamp();
+    .setColor(0xE67E22).setFooter({ text: `#${num}` }).setTimestamp();
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`ticket_close_${ticketId}`).setLabel('Close').setStyle(ButtonStyle.Danger),
@@ -881,7 +917,7 @@ async function createTicket(guild, user, type) {
 
   const logEmbed = new EmbedBuilder().setTitle('Ticket opened')
     .setDescription(`User: ${user.tag}\nType: ${type}\nChannel: <#${channel.id}>\n#${num}`)
-    .setColor(0x5865F2).setTimestamp();
+    .setColor(0xE67E22).setTimestamp();
   await broadcast(guild, logEmbed, ['ticket', 'webhook']);
   await user.send(`Ticket opened — ${guild.name}\n<#${channel.id}>`).catch(() => {});
   return { ok: true, channel };
@@ -1312,14 +1348,22 @@ async function handleSetupButton(interaction) {
 
   // ---------- TICKETS ----------
   if (id === 'setup_tickets') {
-    const embed = new EmbedBuilder().setTitle('🎫 Tickets')
+    const fmtRoles = (arr) => (Array.isArray(arr) && arr.length) ? arr.map(r => `<@&${r}>`).join(', ') : 'everyone / default';
+    const embed = new EmbedBuilder().setTitle('Tickets')
       .setDescription([
-        `**Support category:** ${gc.tickets.supportCategory ? `<#${gc.tickets.supportCategory}>` : '—'}`,
-        `**Support ping:** ${gc.tickets.supportPing ? `<@&${gc.tickets.supportPing}>` : '—'}`,
-        `**HR category:** ${gc.tickets.highrankCategory ? `<#${gc.tickets.highrankCategory}>` : '—'}`,
-        `**HR ping:** ${gc.tickets.highrankPing ? `<@&${gc.tickets.highrankPing}>` : '—'}`
+        `Support category: ${gc.tickets.supportCategory ? `<#${gc.tickets.supportCategory}>` : '—'}`,
+        `Support ping: ${gc.tickets.supportPing ? `<@&${gc.tickets.supportPing}>` : '—'}`,
+        `Support open access: ${fmtRoles(gc.tickets.supportAccess)}`,
+        `Support staff roles: ${fmtRoles(gc.tickets.supportStaff)}`,
+        '',
+        `HR category: ${gc.tickets.highrankCategory ? `<#${gc.tickets.highrankCategory}>` : '—'}`,
+        `HR ping: ${gc.tickets.highrankPing ? `<@&${gc.tickets.highrankPing}>` : '—'}`,
+        `HR open access: ${fmtRoles(gc.tickets.highrankAccess)}`,
+        `HR staff roles: ${fmtRoles(gc.tickets.highrankStaff)}`,
+        '',
+        `Rules: ${(gc.tickets.rules || '').slice(0, 120)}${(gc.tickets.rules || '').length > 120 ? '…' : ''}`
       ].join('\n'))
-      .setColor(0x5865F2);
+      .setColor(0xE67E22);
 
     const typeSelect = new StringSelectMenuBuilder()
       .setCustomId('setup_ticket_type')
@@ -1327,8 +1371,12 @@ async function handleSetupButton(interaction) {
       .addOptions(
         new StringSelectMenuOptionBuilder().setLabel('Support category').setValue('supportCat'),
         new StringSelectMenuOptionBuilder().setLabel('Support ping role').setValue('supportPing'),
+        new StringSelectMenuOptionBuilder().setLabel('Support open access roles').setValue('supportAccess'),
+        new StringSelectMenuOptionBuilder().setLabel('Support staff roles').setValue('supportStaff'),
         new StringSelectMenuOptionBuilder().setLabel('HR category').setValue('highrankCat'),
-        new StringSelectMenuOptionBuilder().setLabel('HR ping role').setValue('highrankPing')
+        new StringSelectMenuOptionBuilder().setLabel('HR ping role').setValue('highrankPing'),
+        new StringSelectMenuOptionBuilder().setLabel('HR open access roles').setValue('highrankAccess'),
+        new StringSelectMenuOptionBuilder().setLabel('HR staff roles').setValue('highrankStaff')
       );
 
     const catSelect = new ChannelSelectMenuBuilder()
@@ -1337,22 +1385,54 @@ async function handleSetupButton(interaction) {
       .setMinValues(1).setMaxValues(1)
       .addChannelTypes(ChannelType.GuildCategory);
 
-    const pingSelect = new RoleSelectMenuBuilder()
-      .setCustomId('setup_ticket_ping')
-      .setPlaceholder('Pick a ping role...')
-      .setMinValues(1).setMaxValues(1);
+    const roleSelect = new RoleSelectMenuBuilder()
+      .setCustomId('setup_ticket_roles')
+      .setPlaceholder('Pick role(s) for selected setting...')
+      .setMinValues(1).setMaxValues(25);
 
     await interaction.update({
       embeds: [embed],
       components: [
         new ActionRowBuilder().addComponents(typeSelect),
         new ActionRowBuilder().addComponents(catSelect),
-        new ActionRowBuilder().addComponents(pingSelect),
+        new ActionRowBuilder().addComponents(roleSelect),
         new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('setup_ticket_rules').setLabel('Edit rules text').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('setup_ticket_clear_access').setLabel('Clear access lists').setStyle(ButtonStyle.Danger),
           new ButtonBuilder().setCustomId('setup_back').setLabel('Back').setStyle(ButtonStyle.Danger)
         )
       ]
     });
+    return;
+  }
+
+  if (id === 'setup_ticket_rules') {
+    const modal = new ModalBuilder().setCustomId('setup_ticket_rules_modal').setTitle('Ticket rules / panel text');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('title').setLabel('Panel title').setStyle(TextInputStyle.Short)
+          .setRequired(true).setValue((gc.tickets.panelTitle || 'Need Assistance?').slice(0, 100))
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('body').setLabel('Panel body').setStyle(TextInputStyle.Paragraph)
+          .setRequired(true).setValue((gc.tickets.panelBody || '').slice(0, 1000))
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('rules').setLabel('Ticket rules text').setStyle(TextInputStyle.Paragraph)
+          .setRequired(true).setValue((gc.tickets.rules || '').slice(0, 1000))
+      )
+    );
+    await interaction.showModal(modal);
+    return;
+  }
+
+  if (id === 'setup_ticket_clear_access') {
+    gc.tickets.supportAccess = [];
+    gc.tickets.highrankAccess = [];
+    gc.tickets.supportStaff = [];
+    gc.tickets.highrankStaff = [];
+    saveConfig();
+    await interaction.reply({ content: 'Cleared all ticket access and staff role lists (defaults restored).', flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -1724,13 +1804,27 @@ async function handleSetupButton(interaction) {
 
   // ---------- POST TICKETS PANEL ----------
   if (id === 'setup_posttickets') {
+    const title = gc.tickets.panelTitle || 'Need Assistance?';
+    const body = gc.tickets.panelBody || 'Click the **Open a Ticket** button below to get started and open a support ticket.';
+    const rules = gc.tickets.rules || 'Please review the Ticket Rules before proceeding to ensure your request is handled properly.';
     const embed = new EmbedBuilder()
-      .setTitle('Tickets')
-      .setDescription('Open a support or highrank ticket.')
-      .setColor(0x5865F2);
+      .setColor(0xE67E22)
+      .setTitle(title)
+      .setDescription([
+        `**${guild.name} | Support Assistant**`,
+        '',
+        body,
+        '',
+        '**Server Rules**',
+        rules
+      ].join('\n'))
+      .setFooter({ text: `${guild.name} | Support System` })
+      .setTimestamp();
+    if (guild.iconURL()) embed.setThumbnail(guild.iconURL({ size: 128 }));
+
     const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('ticket_open_support').setLabel('Support').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('ticket_open_highrank').setLabel('Highrank').setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId('ticket_panel_open').setLabel('Open a Ticket').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('ticket_panel_rules').setLabel('Ticket Rules').setStyle(ButtonStyle.Secondary)
     );
     await interaction.channel.send({ embeds: [embed], components: [row] });
     await interaction.reply({ content: 'Panel posted', flags: MessageFlags.Ephemeral });
@@ -1868,7 +1962,7 @@ async function handleSetupSelect(interaction) {
     return;
   }
 
-  if (id === 'setup_ticket_ping') {
+  if (id === 'setup_ticket_roles' || id === 'setup_ticket_ping') {
     const pending = pendingSetupTicketType.get(interaction.user.id);
     if (!pending || pending.expires < Date.now()) {
       pendingSetupTicketType.delete(interaction.user.id);
@@ -1876,15 +1970,29 @@ async function handleSetupSelect(interaction) {
       return;
     }
     const type = pending.type;
-    const roleId = interaction.values[0];
-    if (type === 'supportPing') gc.tickets.supportPing = roleId;
-    else if (type === 'highrankPing') gc.tickets.highrankPing = roleId;
-    else {
-      await interaction.reply({ content: 'Pick Support or HR ping type, not a category type.', flags: MessageFlags.Ephemeral });
+    const roleIds = interaction.values;
+    const roleId = roleIds[0];
+    if (type === 'supportPing') {
+      gc.tickets.supportPing = roleId;
+    } else if (type === 'highrankPing') {
+      gc.tickets.highrankPing = roleId;
+    } else if (type === 'supportAccess') {
+      gc.tickets.supportAccess = [...new Set([...(gc.tickets.supportAccess || []), ...roleIds])];
+    } else if (type === 'highrankAccess') {
+      gc.tickets.highrankAccess = [...new Set([...(gc.tickets.highrankAccess || []), ...roleIds])];
+    } else if (type === 'supportStaff') {
+      gc.tickets.supportStaff = [...new Set([...(gc.tickets.supportStaff || []), ...roleIds])];
+    } else if (type === 'highrankStaff') {
+      gc.tickets.highrankStaff = [...new Set([...(gc.tickets.highrankStaff || []), ...roleIds])];
+    } else {
+      await interaction.reply({ content: 'Pick a role-based setting (ping / access / staff), not a category.', flags: MessageFlags.Ephemeral });
       return;
     }
     saveConfig();
-    await interaction.reply({ content: `Set **${type}** → <@&${roleId}>`, flags: MessageFlags.Ephemeral });
+    await interaction.reply({
+      content: `Set **${type}** → ${roleIds.map(r => `<@&${r}>`).join(', ')}`,
+      flags: MessageFlags.Ephemeral
+    });
     await interaction.message.edit({ embeds: [setupTicketsEmbed(guild)] }).catch(() => {});
     return;
   }
@@ -1979,14 +2087,19 @@ function setupRolesEmbed(guild) {
 
 function setupTicketsEmbed(guild) {
   const gc = getGuildConfig(guild.id);
-  return new EmbedBuilder().setTitle('🎫 Tickets')
+  const fmtRoles = (arr) => (Array.isArray(arr) && arr.length) ? arr.map(r => `<@&${r}>`).join(', ') : 'everyone / default';
+  return new EmbedBuilder().setTitle('Tickets')
     .setDescription([
-      `**Support category:** ${gc.tickets.supportCategory ? `<#${gc.tickets.supportCategory}>` : '—'}`,
-      `**Support ping:** ${gc.tickets.supportPing ? `<@&${gc.tickets.supportPing}>` : '—'}`,
-      `**HR category:** ${gc.tickets.highrankCategory ? `<#${gc.tickets.highrankCategory}>` : '—'}`,
-      `**HR ping:** ${gc.tickets.highrankPing ? `<@&${gc.tickets.highrankPing}>` : '—'}`
+      `Support category: ${gc.tickets.supportCategory ? `<#${gc.tickets.supportCategory}>` : '—'}`,
+      `Support ping: ${gc.tickets.supportPing ? `<@&${gc.tickets.supportPing}>` : '—'}`,
+      `Support open access: ${fmtRoles(gc.tickets.supportAccess)}`,
+      `Support staff roles: ${fmtRoles(gc.tickets.supportStaff)}`,
+      `HR category: ${gc.tickets.highrankCategory ? `<#${gc.tickets.highrankCategory}>` : '—'}`,
+      `HR ping: ${gc.tickets.highrankPing ? `<@&${gc.tickets.highrankPing}>` : '—'}`,
+      `HR open access: ${fmtRoles(gc.tickets.highrankAccess)}`,
+      `HR staff roles: ${fmtRoles(gc.tickets.highrankStaff)}`
     ].join('\n'))
-    .setColor(0x5865F2);
+    .setColor(0xE67E22);
 }
 
 // ============================================================================
@@ -2074,6 +2187,15 @@ async function handleModal(interaction) {
     gc.dmTemplates[key] = interaction.fields.getTextInputValue('template');
     saveConfig();
     await interaction.reply({ content: `Template ${key} updated`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (id === 'setup_ticket_rules_modal') {
+    gc.tickets.panelTitle = interaction.fields.getTextInputValue('title').slice(0, 100);
+    gc.tickets.panelBody = interaction.fields.getTextInputValue('body').slice(0, 2000);
+    gc.tickets.rules = interaction.fields.getTextInputValue('rules').slice(0, 2000);
+    saveConfig();
+    await interaction.reply({ content: 'Ticket panel text updated', flags: MessageFlags.Ephemeral });
     return;
   }
 }
@@ -2305,7 +2427,7 @@ async function handleCommand(ctx) {
       }
       case 'ticket': {
         const type = options.type || 'support';
-        const res = await createTicket(guild, user, type);
+        const res = await createTicket(guild, user, type, member);
         if (res.ok) await reply(`Ticket: <#${res.channel.id}>`);
         else await reply(res.msg);
         break;
@@ -2685,6 +2807,22 @@ client.on('interactionCreate', async (interaction) => {
         interaction.isChannelSelectMenu() ||
         interaction.isRoleSelectMenu() ||
         interaction.isUserSelectMenu()) {
+      if (interaction.customId === 'ticket_type_select') {
+        const type = interaction.values[0];
+        await interaction.deferUpdate().catch(() => {});
+        const member = interaction.member || await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+        const res = await createTicket(interaction.guild, interaction.user, type, member);
+        await interaction.editReply({
+          content: res.ok ? `Ticket: <#${res.channel.id}>` : res.msg,
+          components: []
+        }).catch(async () => {
+          await interaction.followUp({
+            content: res.ok ? `Ticket: <#${res.channel.id}>` : res.msg,
+            flags: MessageFlags.Ephemeral
+          }).catch(() => {});
+        });
+        return;
+      }
       if (interaction.customId.startsWith('setup_')) {
         if (!canRunCommand(interaction.member, 'setup')) {
           await interaction.reply({ content: 'No permission', flags: MessageFlags.Ephemeral });
@@ -2708,10 +2846,53 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
+      if (id === 'ticket_panel_open') {
+        const gc = getGuildConfig(interaction.guild.id);
+        const options = [];
+        if (gc.tickets.supportCategory) {
+          options.push(new StringSelectMenuOptionBuilder().setLabel('Support').setDescription('General support ticket').setValue('support'));
+        }
+        if (gc.tickets.highrankCategory) {
+          options.push(new StringSelectMenuOptionBuilder().setLabel('Highrank').setDescription('High rank ticket').setValue('highrank'));
+        }
+        if (!options.length) {
+          await interaction.reply({ content: 'Ticket categories are not configured.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (options.length === 1) {
+          await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+          const member = interaction.member || await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+          const res = await createTicket(interaction.guild, interaction.user, options[0].data.value, member);
+          await interaction.editReply({ content: res.ok ? `Ticket: <#${res.channel.id}>` : res.msg });
+          return;
+        }
+        const select = new StringSelectMenuBuilder()
+          .setCustomId('ticket_type_select')
+          .setPlaceholder('Select a ticket type...')
+          .addOptions(options);
+        await interaction.reply({
+          content: 'Select a ticket type:',
+          components: [new ActionRowBuilder().addComponents(select)],
+          flags: MessageFlags.Ephemeral
+        });
+        return;
+      }
+
+      if (id === 'ticket_panel_rules') {
+        const gc = getGuildConfig(interaction.guild.id);
+        const embed = new EmbedBuilder()
+          .setTitle('Ticket Rules')
+          .setDescription(gc.tickets.rules || 'No rules configured.')
+          .setColor(0xE67E22);
+        await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+        return;
+      }
+
       if (id === 'ticket_open_support' || id === 'ticket_open_highrank') {
         const type = id === 'ticket_open_highrank' ? 'highrank' : 'support';
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-        const res = await createTicket(interaction.guild, interaction.user, type);
+        const member = interaction.member || await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+        const res = await createTicket(interaction.guild, interaction.user, type, member);
         await interaction.editReply({ content: res.ok ? `Ticket: <#${res.channel.id}>` : res.msg });
         return;
       }
