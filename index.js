@@ -1,18 +1,21 @@
 // ============================================================================
-// MERGED DISCORD BOT — Best of Code 1 + Code 2
-// discord.js v14, single-file, production-ready
+// MERGED DISCORD BOT — with multi-select setup menus
+// discord.js v14
 // ============================================================================
 
 const {
   Client,
   GatewayIntentBits,
   Partials,
-  Collection,
   EmbedBuilder,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
   StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
+  ChannelSelectMenuBuilder,
+  RoleSelectMenuBuilder,
+  UserSelectMenuBuilder,
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
@@ -23,6 +26,7 @@ const {
   AttachmentBuilder,
   OverwriteType
 } = require('discord.js');
+
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -31,7 +35,7 @@ const https = require('https');
 require('dotenv').config();
 
 // ============================================================================
-// CONFIG PATHS & CONSTANTS
+// PATHS & CONSTANTS
 // ============================================================================
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
@@ -45,64 +49,32 @@ const TIER_INHERITANCE = {
   management: ['staff', 'admin', 'highrank', 'management']
 };
 
-// Merged: Code 1's safer kick default + Code 2's full command set
 const DEFAULT_COMMAND_PERMS = {
-  help: ['everyone'],
-  ping: ['everyone'],
-  avatar: ['everyone'],
-  whois: ['everyone'],
-  userinfo: ['everyone'],
-  serverinfo: ['everyone'],
-  suggest: ['everyone'],
-  feedback: ['everyone'],
-  ticket: ['everyone'],
-
-  mute: ['staff'],
-  unmute: ['staff'],
-  warn: ['staff'],
-  clear: ['staff'],
-  purge: ['staff'],
-  history: ['staff'],
-  loguser: ['staff'],
-  robloxhistory: ['staff'],
-  nickname: ['staff'],
-  close: ['staff'],
-  claim: ['staff'],
-  unclaim: ['staff'],
-  tadd: ['staff'],
-  tremove: ['staff'],
-  infract: ['staff'],
-  poll: ['staff'],
-
-  kick: ['admin'],           // Code 1's safer default
-  ban: ['admin'],
-  unban: ['admin'],
-  addrole: ['admin'],
-  removerole: ['admin'],
-  giveaway: ['admin'],
-  'giveaway-end': ['admin'],
-  'giveaway-reroll': ['admin'],
-  'suggestion-approve': ['admin'],
-  'suggestion-deny': ['admin'],
-
-  accept: ['highrank'],
-  deny: ['highrank'],
-  promote: ['highrank'],
-  demote: ['highrank'],
-
-  acceptsetup: ['management'],
-  setup: ['management'],
-  antinuke: ['management'],
-  customcmd: ['management']
+  help: ['everyone'], ping: ['everyone'], avatar: ['everyone'],
+  whois: ['everyone'], userinfo: ['everyone'], serverinfo: ['everyone'],
+  suggest: ['everyone'], feedback: ['everyone'], ticket: ['everyone'],
+  mute: ['staff'], unmute: ['staff'], warn: ['staff'], clear: ['staff'],
+  purge: ['staff'], history: ['staff'], loguser: ['staff'],
+  robloxhistory: ['staff'], nickname: ['staff'], close: ['staff'],
+  claim: ['staff'], unclaim: ['staff'], tadd: ['staff'], tremove: ['staff'],
+  infract: ['staff'], poll: ['staff'],
+  kick: ['admin'], ban: ['admin'], unban: ['admin'],
+  addrole: ['admin'], removerole: ['admin'],
+  giveaway: ['admin'], 'giveaway-end': ['admin'], 'giveaway-reroll': ['admin'],
+  'suggestion-approve': ['admin'], 'suggestion-deny': ['admin'],
+  accept: ['highrank'], deny: ['highrank'], promote: ['highrank'], demote: ['highrank'],
+  acceptsetup: ['management'], setup: ['management'],
+  antinuke: ['management'], customcmd: ['management']
 };
 
 const RESERVED_COMMAND_NAMES = new Set([
   ...Object.keys(DEFAULT_COMMAND_PERMS),
-  'mc', 'whois', 'avatar', 'clear', 'purge', 'tadd', 'tremove', 'help', 'ping',
-  'userinfo', 'serverinfo', 'mute', 'unmute', 'warn', 'kick', 'ban', 'unban',
-  'history', 'loguser', 'robloxhistory', 'addrole', 'removerole', 'nickname',
-  'ticket', 'close', 'claim', 'unclaim', 'accept', 'deny', 'promote', 'demote',
-  'infract', 'acceptsetup', 'setup', 'poll', 'giveaway', 'suggest', 'feedback',
+  'mc', 'whois', 'avatar', 'clear', 'purge', 'tadd', 'tremove',
+  'help', 'ping', 'userinfo', 'serverinfo', 'mute', 'unmute', 'warn',
+  'kick', 'ban', 'unban', 'history', 'loguser', 'robloxhistory',
+  'addrole', 'removerole', 'nickname', 'ticket', 'close', 'claim',
+  'unclaim', 'accept', 'deny', 'promote', 'demote', 'infract',
+  'acceptsetup', 'setup', 'poll', 'giveaway', 'suggest', 'feedback',
   'antinuke', 'customcmd'
 ]);
 
@@ -130,27 +102,28 @@ const client = new Client({
 let config = { guilds: {} };
 let saveTimer = null;
 
-const tierCache = new Map();          // member tier cache
-const guildConfigCache = new Map();   // merged guild config cache (fixes Code 2 perf issue)
+const tierCache = new Map();
+const guildConfigCache = new Map();
 const ghostPingTracker = new Map();
 const pollStore = new Map();
 const giveawayStore = new Map();
-const _pendingCloseConfirmations = new Map();
+const endedGiveawayStore = new Map();
+const pendingCloseConfirmations = new Map();
 const slurRegexCache = new Map();
-const _slashCache = new Map();
-const dailyCaps = new Map();
+const slashCache = new Map();
+const automodDeletedIds = new Set();
+const pendingSetupChannel = new Map();
+const pendingSetupRoles = new Map();
+const pendingSetupTicketType = new Map();
 
 // ============================================================================
-// DEFAULT GUILD CONFIG (Code 2's cleaner nested schema)
+// DEFAULT CONFIG
 // ============================================================================
 
-function createDefaultGuildConfig() {
+function defaultGuildConfig() {
   return {
     prefix: '!',
-    roles: {
-      staff: [], admin: [], highrank: [], management: [],
-      exempt: [], accept: [], hrPing: null
-    },
+    roles: { staff: [], admin: [], highrank: [], management: [], exempt: [], accept: [], hrPing: null },
     channels: {
       log: null, staffLog: null, hrLog: null, ticketLog: null,
       transcripts: null, welcome: null, suggestions: null, staffFeedback: null
@@ -160,15 +133,10 @@ function createDefaultGuildConfig() {
       highrankCategory: null, highrankPing: null,
       counter: 0, open: {}
     },
-    antinuke: {
-      enabled: false, threshold: 5, windowMs: 10000,
-      whitelist: [], counters: {}, watchlist: {}
-    },
+    antinuke: { enabled: false, threshold: 5, windowMs: 10000, whitelist: [], counters: {}, watchlist: {} },
     automod: {
-      slurEnabled: false, slurList: [],
-      ghostPingEnabled: false,
-      linkEnabled: false, linkWhitelist: [],
-      ignoredChannelIds: []
+      slurEnabled: false, slurList: [], ghostPingEnabled: false,
+      linkEnabled: false, linkWhitelist: [], ignoredChannelIds: []
     },
     commandPerms: {},
     customCommands: {},
@@ -206,7 +174,7 @@ function deepMerge(target, source) {
 }
 
 // ============================================================================
-// CONFIG LOAD / SAVE (atomic with .tmp + .bak)
+// CONFIG LOAD / SAVE
 // ============================================================================
 
 function loadConfig() {
@@ -263,34 +231,28 @@ function flushConfig() {
   }
 }
 
-// ============================================================================
-// GUILD CONFIG (cached — fixes Code 2's deep-merge-on-every-call)
-// ============================================================================
-
 function getGuildConfig(guildId) {
   if (!config.guilds[guildId]) {
-    config.guilds[guildId] = createDefaultGuildConfig();
+    config.guilds[guildId] = defaultGuildConfig();
     guildConfigCache.set(guildId, config.guilds[guildId]);
     saveConfig();
     return config.guilds[guildId];
   }
-  // Cache merged result; invalidate on write via saveConfig (see below)
   const cached = guildConfigCache.get(guildId);
   if (cached) return cached;
-
-  const merged = deepMerge(createDefaultGuildConfig(), config.guilds[guildId]);
+  const merged = deepMerge(defaultGuildConfig(), config.guilds[guildId]);
   config.guilds[guildId] = merged;
   guildConfigCache.set(guildId, merged);
   return merged;
 }
 
-function invalidateGuildConfigCache(guildId) {
+function invalidateGuildCache(guildId) {
   if (guildId) guildConfigCache.delete(guildId);
   else guildConfigCache.clear();
 }
 
 // ============================================================================
-// TIER / PERMISSION HELPERS
+// TIER / PERMISSIONS
 // ============================================================================
 
 function getMemberTiers(member) {
@@ -301,13 +263,13 @@ function getMemberTiers(member) {
 
   const gc = getGuildConfig(member.guild.id);
   const tiers = new Set();
-
   if (member.id === member.guild.ownerId || member.permissions.has(PermissionFlagsBits.Administrator)) {
     tiers.add('staff'); tiers.add('admin'); tiers.add('highrank'); tiers.add('management');
   } else {
-    const roleIds = member.roles.cache.map(r => r.id);
-    for (const [tier, ids] of Object.entries(gc.roles)) {
-      if (Array.isArray(ids) && ids.some(id => roleIds.includes(id))) tiers.add(tier);
+    const roleIds = new Set(member.roles.cache.map(r => r.id));
+    for (const tier of ['staff', 'admin', 'highrank', 'management']) {
+      const list = gc.roles[tier] || [];
+      if (list.some(id => roleIds.has(id))) tiers.add(tier);
     }
   }
   tierCache.set(key, { tiers, ts: Date.now() });
@@ -345,8 +307,7 @@ function canModerate(executor, target) {
       !target.permissions.has(PermissionFlagsBits.Administrator)) return true;
   const gc = getGuildConfig(executor.guild.id);
   if (gc.roles.exempt && gc.roles.exempt.some(id => target.roles.cache.has(id))) return false;
-  if (target.roles.highest.position >= executor.roles.highest.position) return false;
-  return true;
+  return target.roles.highest.position < executor.roles.highest.position;
 }
 
 function canManageRole(member, role) {
@@ -389,10 +350,6 @@ function incrementDailyCap(guildId, type) {
   saveConfig();
 }
 
-// ============================================================================
-// MOD HISTORY
-// ============================================================================
-
 function addHistory(guildId, userId, entry) {
   const gc = getGuildConfig(guildId);
   if (!gc.modHistory[userId]) gc.modHistory[userId] = [];
@@ -402,7 +359,7 @@ function addHistory(guildId, userId, entry) {
 }
 
 // ============================================================================
-// WEBHOOK SENDER (Code 2)
+// WEBHOOK / BROADCAST
 // ============================================================================
 
 function sendWebhook(url, embed, guild) {
@@ -428,10 +385,6 @@ function sendWebhook(url, embed, guild) {
     } catch { resolve(); }
   });
 }
-
-// ============================================================================
-// BROADCAST
-// ============================================================================
 
 async function broadcast(guild, embed, targets) {
   if (!guild || !embed) return;
@@ -471,9 +424,7 @@ async function stripAllRoles(member) {
     r.position < botHighest &&
     botMember.permissions.has(PermissionFlagsBits.ManageRoles)
   );
-  if (toRemove.size > 0) {
-    await member.roles.remove(toRemove, 'Anti-nuke / watchlist').catch(() => {});
-  }
+  if (toRemove.size > 0) await member.roles.remove(toRemove, 'Anti-nuke / watchlist').catch(() => {});
 }
 
 async function handleAntinukeEvent(guild, executorId, actionType) {
@@ -502,9 +453,8 @@ async function handleAntinukeEvent(guild, executorId, actionType) {
 
     const embed = new EmbedBuilder()
       .setTitle('Anti-nuke fired')
-      .setDescription(`User: <@${executorId}> (${executorId})\nAction: ${actionType}\nRoles stripped, kicked, added to watchlist (24h)`)
-      .setColor(0xFF0000)
-      .setTimestamp();
+      .setDescription(`User: <@${executorId}> (${executorId})\nAction: ${actionType}\nRoles stripped, kicked, watchlisted 24h`)
+      .setColor(0xFF0000).setTimestamp();
     await broadcast(guild, embed, ['log', 'staff', 'webhook']);
     try {
       const user = await client.users.fetch(executorId);
@@ -512,7 +462,7 @@ async function handleAntinukeEvent(guild, executorId, actionType) {
     } catch {}
     try {
       const owner = await client.users.fetch(guild.ownerId);
-      await owner.send(`Anti-nuke — ${guild.name}\nTriggered on <@${executorId}> for ${actionType}`).catch(() => {});
+      await owner.send(`Anti-nuke — ${guild.name}\nTriggered on <@${executorId}> (${executorId}) for ${actionType}`).catch(() => {});
     } catch {}
   }
 }
@@ -541,8 +491,7 @@ async function doMute(executor, target, durationMs, reason) {
     type: 'mute', moderator: executor.user.tag, moderatorId: executor.id,
     reason: reason || 'No reason', duration: ms, at: Date.now()
   });
-  const embed = new EmbedBuilder()
-    .setTitle('Mute')
+  const embed = new EmbedBuilder().setTitle('Mute')
     .setDescription(`Target: ${target.user.tag} (${target.id})\nModerator: ${executor.user.tag}\nDuration: ${Math.round(ms / 60000)}m\nReason: ${reason || 'No reason'}`)
     .setColor(0xFFAA00).setTimestamp();
   await broadcast(executor.guild, embed, ['log', 'staff', 'webhook']);
@@ -557,12 +506,10 @@ async function doUnmute(executor, target, reason) {
     type: 'unmute', moderator: executor.user.tag, moderatorId: executor.id,
     reason: reason || 'No reason', at: Date.now()
   });
-  const embed = new EmbedBuilder()
-    .setTitle('Unmute')
+  const embed = new EmbedBuilder().setTitle('Unmute')
     .setDescription(`Target: ${target.user.tag}\nModerator: ${executor.user.tag}\nReason: ${reason || 'No reason'}`)
     .setColor(0x00AA00).setTimestamp();
   await broadcast(executor.guild, embed, ['log', 'staff', 'webhook']);
-  await target.send(`Unmuted — ${executor.guild.name}\n${reason || ''}`).catch(() => {});
   return { ok: true };
 }
 
@@ -572,8 +519,7 @@ async function doWarn(executor, target, reason) {
     type: 'warn', moderator: executor.user.tag, moderatorId: executor.id,
     reason: reason || 'No reason', at: Date.now()
   });
-  const embed = new EmbedBuilder()
-    .setTitle('Warn')
+  const embed = new EmbedBuilder().setTitle('Warn')
     .setDescription(`Target: ${target.user.tag}\nModerator: ${executor.user.tag}\nReason: ${reason || 'No reason'}`)
     .setColor(0xFFCC00).setTimestamp();
   await broadcast(executor.guild, embed, ['log', 'staff', 'webhook']);
@@ -592,13 +538,11 @@ async function doKick(executor, target, reason) {
     type: 'kick', moderator: executor.user.tag, moderatorId: executor.id,
     reason: reason || 'No reason', at: Date.now()
   });
-  const embed = new EmbedBuilder()
-    .setTitle('Kick')
+  const embed = new EmbedBuilder().setTitle('Kick')
     .setDescription(`Target: ${target.user.tag}\nModerator: ${executor.user.tag}\nReason: ${reason || 'No reason'}`)
     .setColor(0xFF6600).setTimestamp();
   await broadcast(executor.guild, embed, ['log', 'staff', 'webhook']);
-  // NOTE: intentionally NOT calling handleAntinukeEvent here — the bot itself
-  // performed the kick, so it should not count toward anti-nuke (fixes Code 1 bug).
+  await handleAntinukeEvent(executor.guild, executor.id, 'kick');
   return { ok: true };
 }
 
@@ -626,9 +570,7 @@ async function doBan(executor, targetOrId, reason, deleteDays = 0) {
   }
   if (!checkDailyCap(guild.id, 'bans')) return { ok: false, msg: 'Daily ban cap reached.' };
 
-  if (targetMember) {
-    await targetMember.send(`Banned — ${guild.name}\n${reason || 'No reason'}`).catch(() => {});
-  }
+  if (targetMember) await targetMember.send(`Banned — ${guild.name}\n${reason || 'No reason'}`).catch(() => {});
   await guild.members.ban(targetId, {
     reason: reason || 'No reason',
     deleteMessageSeconds: Math.min(deleteDays, 7) * 86400
@@ -638,11 +580,11 @@ async function doBan(executor, targetOrId, reason, deleteDays = 0) {
     type: 'ban', moderator: executor.user.tag, moderatorId: executor.id,
     reason: reason || 'No reason', at: Date.now()
   });
-  const embed = new EmbedBuilder()
-    .setTitle('Ban')
+  const embed = new EmbedBuilder().setTitle('Ban')
     .setDescription(`Target: ${targetTag} (${targetId})\nModerator: ${executor.user.tag}\nReason: ${reason || 'No reason'}`)
     .setColor(0xCC0000).setTimestamp();
   await broadcast(guild, embed, ['log', 'staff', 'webhook']);
+  await handleAntinukeEvent(guild, executor.id, 'ban');
   return { ok: true };
 }
 
@@ -653,8 +595,7 @@ async function doUnban(executor, userId, reason) {
     type: 'unban', moderator: executor.user.tag, moderatorId: executor.id,
     reason: reason || 'No reason', at: Date.now()
   });
-  const embed = new EmbedBuilder()
-    .setTitle('Unban')
+  const embed = new EmbedBuilder().setTitle('Unban')
     .setDescription(`Target: ${userId}\nModerator: ${executor.user.tag}\nReason: ${reason || 'No reason'}`)
     .setColor(0x00AA00).setTimestamp();
   await broadcast(guild, embed, ['log', 'staff', 'webhook']);
@@ -672,8 +613,7 @@ async function doLogUser(executor, robloxUsername, reason) {
     gc.robloxLogs[robloxUsername] = gc.robloxLogs[robloxUsername].slice(0, 100);
   }
   saveConfig();
-  const embed = new EmbedBuilder()
-    .setTitle('Roblox log')
+  const embed = new EmbedBuilder().setTitle('Roblox log')
     .setDescription(`Username: ${robloxUsername}\nModerator: ${executor.user.tag}\nReason: ${reason || 'No reason'}`)
     .setColor(0x5865F2).setTimestamp();
   await broadcast(executor.guild, embed, ['log', 'staff', 'webhook']);
@@ -694,12 +634,16 @@ function applyTemplate(template, vars) {
 
 async function doAccept(executor, target, rank, notes) {
   const gc = getGuildConfig(executor.guild.id);
-  // FIX: check canManageRole before adding (Code 1 bug)
-  for (const rid of gc.acceptRoleIds || []) {
+  const roleIds = [
+    ...(gc.acceptRoleIds || []),
+    ...(Array.isArray(gc.roles.accept) ? gc.roles.accept : [])
+  ];
+  const seen = new Set();
+  for (const rid of roleIds) {
+    if (seen.has(rid)) continue;
+    seen.add(rid);
     const role = executor.guild.roles.cache.get(rid);
-    if (role && canManageRole(executor, role)) {
-      await target.roles.add(role).catch(() => {});
-    }
+    if (role && canManageRole(executor, role)) await target.roles.add(role).catch(() => {});
   }
   const msg = applyTemplate(gc.dmTemplates.accept, {
     server: executor.guild.name, rank: rank || '', type: 'accept', reason: '', notes: notes || ''
@@ -709,8 +653,7 @@ async function doAccept(executor, target, rank, notes) {
     type: 'accept', moderator: executor.user.tag, moderatorId: executor.id,
     rank, notes, at: Date.now()
   });
-  const embed = new EmbedBuilder()
-    .setTitle('Accept')
+  const embed = new EmbedBuilder().setTitle('Accept')
     .setDescription(`Target: ${target.user.tag}\nBy: ${executor.user.tag}\nRank: ${rank || '—'}\n${notes || ''}`)
     .setColor(0x00AA00).setTimestamp();
   await broadcast(executor.guild, embed, ['hr', 'log', 'webhook']);
@@ -727,8 +670,7 @@ async function doDeny(executor, target, reason) {
     type: 'deny', moderator: executor.user.tag, moderatorId: executor.id,
     reason: reason || 'No reason', at: Date.now()
   });
-  const embed = new EmbedBuilder()
-    .setTitle('Deny')
+  const embed = new EmbedBuilder().setTitle('Deny')
     .setDescription(`Target: ${target.user.tag}\nBy: ${executor.user.tag}\nReason: ${reason || 'No reason'}`)
     .setColor(0xCC0000).setTimestamp();
   await broadcast(executor.guild, embed, ['hr', 'log', 'webhook']);
@@ -749,8 +691,7 @@ async function doPromote(executor, target, rank, notes, role) {
     type: 'promote', moderator: executor.user.tag, moderatorId: executor.id,
     rank, notes, roleId: role?.id, at: Date.now()
   });
-  const embed = new EmbedBuilder()
-    .setTitle('Promote')
+  const embed = new EmbedBuilder().setTitle('Promote')
     .setDescription(`Target: ${target.user.tag}\nBy: ${executor.user.tag}\nRank: ${rank || role?.name || '—'}\n${notes || ''}`)
     .setColor(0x00AA00).setTimestamp();
   await broadcast(executor.guild, embed, ['hr', 'log', 'webhook']);
@@ -771,8 +712,7 @@ async function doDemote(executor, target, rank, reason, role) {
     type: 'demote', moderator: executor.user.tag, moderatorId: executor.id,
     rank, reason, roleId: role?.id, at: Date.now()
   });
-  const embed = new EmbedBuilder()
-    .setTitle('Demote')
+  const embed = new EmbedBuilder().setTitle('Demote')
     .setDescription(`Target: ${target.user.tag}\nBy: ${executor.user.tag}\nRank: ${rank || role?.name || '—'}\nReason: ${reason || 'No reason'}`)
     .setColor(0xFF6600).setTimestamp();
   await broadcast(executor.guild, embed, ['hr', 'log', 'webhook']);
@@ -789,8 +729,7 @@ async function doInfract(executor, target, type, reason) {
     type: 'infract', infractType: type, moderator: executor.user.tag, moderatorId: executor.id,
     reason: reason || 'No reason', at: Date.now()
   });
-  const embed = new EmbedBuilder()
-    .setTitle('Infraction')
+  const embed = new EmbedBuilder().setTitle('Infraction')
     .setDescription(`Target: ${target.user.tag}\nBy: ${executor.user.tag}\nType: ${type || '—'}\nReason: ${reason || 'No reason'}`)
     .setColor(0xFFAA00).setTimestamp();
   await broadcast(executor.guild, embed, ['hr', 'log', 'webhook']);
@@ -798,7 +737,7 @@ async function doInfract(executor, target, type, reason) {
 }
 
 // ============================================================================
-// AUTOMOD (Code 2's regex caching)
+// AUTOMOD
 // ============================================================================
 
 function getSlurRegex(guildId) {
@@ -823,13 +762,12 @@ async function runAutomod(message, isUpdate = false) {
   if (gc.automod.slurEnabled) {
     const re = getSlurRegex(message.guild.id);
     if (re && re.test(message.content)) {
+      automodDeletedIds.add(message.id);
+      setTimeout(() => automodDeletedIds.delete(message.id), 15000);
       await message.delete().catch(() => {});
       const member = message.member || await message.guild.members.fetch(message.author.id).catch(() => null);
-      if (member && member.moderatable) {
-        await member.timeout(60 * 60 * 1000, 'Slur filter').catch(() => {});
-      }
-      const embed = new EmbedBuilder()
-        .setTitle('Slur filter triggered')
+      if (member && member.moderatable) await member.timeout(60 * 60 * 1000, 'Slur filter').catch(() => {});
+      const embed = new EmbedBuilder().setTitle('Slur filter triggered')
         .setDescription(`User: ${message.author.tag} (${message.author.id})\nChannel: <#${message.channel.id}>\nContent: ${message.content.slice(0, 500)}`)
         .setColor(0xFF0000).setTimestamp();
       const ping = gc.roles.hrPing ? `<@&${gc.roles.hrPing}>` : '';
@@ -844,10 +782,11 @@ async function runAutomod(message, isUpdate = false) {
 
   if (gc.automod.linkEnabled && !gc.automod.linkWhitelist?.includes(message.channel.id)) {
     if (LINK_REGEX.test(message.content)) {
+      automodDeletedIds.add(message.id);
+      setTimeout(() => automodDeletedIds.delete(message.id), 15000);
       await message.delete().catch(() => {});
       await message.channel.send(`${message.author} — links are not allowed here.`)
-        .then(m => setTimeout(() => m.delete().catch(() => {}), 5000))
-        .catch(() => {});
+        .then(m => setTimeout(() => m.delete().catch(() => {}), 5000)).catch(() => {});
       return true;
     }
   }
@@ -856,12 +795,8 @@ async function runAutomod(message, isUpdate = false) {
     const mentions = [...message.mentions.users.keys()].filter(id => id !== message.author.id);
     if (mentions.length > 0) {
       ghostPingTracker.set(message.id, {
-        authorId: message.author.id,
-        guildId: message.guild.id,
-        channelId: message.channel.id,
-        mentions,
-        content: message.content,
-        expires: Date.now() + 60000
+        authorId: message.author.id, guildId: message.guild.id, channelId: message.channel.id,
+        mentions, content: message.content, expires: Date.now() + 60000
       });
     }
   }
@@ -869,7 +804,7 @@ async function runAutomod(message, isUpdate = false) {
 }
 
 // ============================================================================
-// TICKET SYSTEM (Code 2, with confirmations)
+// TICKETS
 // ============================================================================
 
 async function createTicket(guild, user, type) {
@@ -878,9 +813,7 @@ async function createTicket(guild, user, type) {
     if (t.userId === user.id && !t.closed) {
       const ch = guild.channels.cache.get(t.channelId);
       if (ch) return { ok: false, msg: `You already have an open ticket: <#${t.channelId}>` };
-      t.closed = true;
-      t.closedAt = Date.now();
-      saveConfig();
+      t.closed = true; t.closedAt = Date.now(); saveConfig();
     }
   }
 
@@ -934,12 +867,9 @@ async function createTicket(guild, user, type) {
   };
   saveConfig();
 
-  const welcome = new EmbedBuilder()
-    .setTitle('Ticket opened')
+  const welcome = new EmbedBuilder().setTitle('Ticket opened')
     .setDescription(`${user} — ${type} ticket.\nDescribe your issue below.`)
-    .setColor(0x5865F2)
-    .setFooter({ text: `#${num}` })
-    .setTimestamp();
+    .setColor(0x5865F2).setFooter({ text: `#${num}` }).setTimestamp();
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`ticket_close_${ticketId}`).setLabel('Close').setStyle(ButtonStyle.Danger),
@@ -949,13 +879,11 @@ async function createTicket(guild, user, type) {
   const ping = pingId ? `<@&${pingId}>` : '';
   await channel.send({ content: `${user} ${ping}`, embeds: [welcome], components: [row] });
 
-  const logEmbed = new EmbedBuilder()
-    .setTitle('Ticket opened')
+  const logEmbed = new EmbedBuilder().setTitle('Ticket opened')
     .setDescription(`User: ${user.tag}\nType: ${type}\nChannel: <#${channel.id}>\n#${num}`)
     .setColor(0x5865F2).setTimestamp();
   await broadcast(guild, logEmbed, ['ticket', 'webhook']);
   await user.send(`Ticket opened — ${guild.name}\n<#${channel.id}>`).catch(() => {});
-
   return { ok: true, channel };
 }
 
@@ -965,9 +893,7 @@ async function closeTicket(guild, ticketId, closer, reason) {
   if (!ticket || ticket.closed) return { ok: false, msg: 'Ticket not found or already closed.' };
   const channel = guild.channels.cache.get(ticket.channelId);
   if (!channel) {
-    ticket.closed = true;
-    ticket.closedAt = Date.now();
-    saveConfig();
+    ticket.closed = true; ticket.closedAt = Date.now(); saveConfig();
     return { ok: false, msg: 'Channel missing. Marked closed.' };
   }
 
@@ -1000,19 +926,14 @@ async function closeTicket(guild, ticketId, closer, reason) {
     }
   }
 
-  ticket.closed = true;
-  ticket.closedAt = Date.now();
-  ticket.closedBy = closer.id;
-  ticket.closeReason = reason || '';
+  ticket.closed = true; ticket.closedAt = Date.now();
+  ticket.closedBy = closer.id; ticket.closeReason = reason || '';
   saveConfig();
 
   const opener = await client.users.fetch(ticket.userId).catch(() => null);
-  if (opener) {
-    await opener.send(`Ticket closed — ${guild.name}\n#${ticket.number}\n${reason || ''}`).catch(() => {});
-  }
+  if (opener) await opener.send(`Ticket closed — ${guild.name}\n#${ticket.number}\n${reason || ''}`).catch(() => {});
 
-  const logEmbed = new EmbedBuilder()
-    .setTitle('Ticket closed')
+  const logEmbed = new EmbedBuilder().setTitle('Ticket closed')
     .setDescription(`#${ticket.number} (${ticket.type})\nClosed by: ${closer.user?.tag || closer.tag}\nReason: ${reason || '—'}`)
     .setColor(0x990000).setTimestamp();
   await broadcast(guild, logEmbed, ['ticket', 'webhook']);
@@ -1022,7 +943,7 @@ async function closeTicket(guild, ticketId, closer, reason) {
 }
 
 // ============================================================================
-// SLASH COMMAND BUILDER (cached — fixes Code 2 perf issue)
+// SLASH COMMAND BUILDER
 // ============================================================================
 
 function buildSlashCommands(guildId) {
@@ -1125,6 +1046,7 @@ function buildSlashCommands(guildId) {
     ]},
     { name: 'acceptsetup', description: 'Set accept roles', options: [{ name: 'roles', type: 3, description: 'Role IDs space-separated', required: true }] },
     { name: 'setup', description: 'Open setup menu' },
+    { name: 'antinuke', description: 'Anti-nuke status' },
     { name: 'poll', description: 'Create a poll', options: [
       { name: 'question', type: 3, description: 'Question', required: true },
       { name: 'options', type: 3, description: 'Options separated by |', required: true },
@@ -1163,10 +1085,10 @@ function hashCommands(cmds) {
 async function registerCommands(guild) {
   const cmds = buildSlashCommands(guild.id);
   const hash = hashCommands(cmds);
-  if (_slashCache.get(guild.id) === hash) return;
+  if (slashCache.get(guild.id) === hash) return;
   try {
     await guild.commands.set(cmds);
-    _slashCache.set(guild.id, hash);
+    slashCache.set(guild.id, hash);
   } catch (e) {
     console.error(`[slash] Failed for ${guild.id}:`, e.message);
   }
@@ -1190,20 +1112,39 @@ function parseDuration(str) {
 }
 
 // ============================================================================
-// SETUP UI (Code 2)
+// SETUP UI — MAIN
 // ============================================================================
 
 function setupMainEmbed(guild) {
   const gc = getGuildConfig(guild.id);
+  const ch = (id) => id ? `<#${id}>` : '—';
+  const roles = (arr) => (Array.isArray(arr) && arr.length) ? arr.map(id => `<@&${id}>`).join(', ') : '—';
+
   return new EmbedBuilder()
-    .setTitle('Setup')
+    .setTitle('⚙️ Setup Menu')
     .setDescription([
-      `Prefix: \`${gc.prefix}\``,
-      `Anti-nuke: ${gc.antinuke.enabled ? 'on' : 'off'}`,
-      `Slur filter: ${gc.automod.slurEnabled ? 'on' : 'off'}`,
-      `Ghost ping: ${gc.automod.ghostPingEnabled ? 'on' : 'off'}`,
-      `Link filter: ${gc.automod.linkEnabled ? 'on' : 'off'}`,
-      `Webhook: ${gc.webhookUrl ? 'set' : 'none'}`
+      `**Prefix:** \`${gc.prefix}\``,
+      `**Anti-nuke:** ${gc.antinuke.enabled ? '🟢 on' : '🔴 off'} (threshold ${gc.antinuke.threshold})`,
+      `**Slur filter:** ${gc.automod.slurEnabled ? '🟢 on' : '🔴 off'} (${(gc.automod.slurList || []).length} words)`,
+      `**Ghost ping:** ${gc.automod.ghostPingEnabled ? '🟢 on' : '🔴 off'}`,
+      `**Link filter:** ${gc.automod.linkEnabled ? '🟢 on' : '🔴 off'}`,
+      `**Webhook:** ${gc.webhookUrl ? '🟢 set' : '—'}`,
+      '',
+      '**Channels**',
+      `Log: ${ch(gc.channels.log)}`,
+      `Staff log: ${ch(gc.channels.staffLog)}`,
+      `HR log: ${ch(gc.channels.hrLog)}`,
+      `Ticket log: ${ch(gc.channels.ticketLog)}`,
+      `Transcripts: ${ch(gc.channels.transcripts)}`,
+      `Suggestions: ${ch(gc.channels.suggestions)}`,
+      `Staff feedback: ${ch(gc.channels.staffFeedback)}`,
+      '',
+      '**Roles**',
+      `Staff: ${roles(gc.roles.staff)}`,
+      `Admin: ${roles(gc.roles.admin)}`,
+      `Highrank: ${roles(gc.roles.highrank)}`,
+      `Management: ${roles(gc.roles.management)}`,
+      `Exempt: ${roles(gc.roles.exempt)}`
     ].join('\n'))
     .setColor(0x5865F2);
 }
@@ -1211,11 +1152,11 @@ function setupMainEmbed(guild) {
 function setupMainRows() {
   return [
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('setup_channels').setLabel('Channels').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('setup_roles').setLabel('Roles').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('setup_tickets').setLabel('Tickets').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('setup_antinuke').setLabel('Anti-nuke').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('setup_automod').setLabel('Automod').setStyle(ButtonStyle.Primary)
+      new ButtonBuilder().setCustomId('setup_channels').setLabel('Channels').setStyle(ButtonStyle.Primary).setEmoji('📁'),
+      new ButtonBuilder().setCustomId('setup_roles').setLabel('Roles').setStyle(ButtonStyle.Primary).setEmoji('🎭'),
+      new ButtonBuilder().setCustomId('setup_tickets').setLabel('Tickets').setStyle(ButtonStyle.Primary).setEmoji('🎫'),
+      new ButtonBuilder().setCustomId('setup_antinuke').setLabel('Anti-nuke').setStyle(ButtonStyle.Primary).setEmoji('🛡️'),
+      new ButtonBuilder().setCustomId('setup_automod').setLabel('Automod').setStyle(ButtonStyle.Primary).setEmoji('🤖')
     ),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('setup_permissions').setLabel('Permissions').setStyle(ButtonStyle.Secondary),
@@ -1227,155 +1168,228 @@ function setupMainRows() {
   ];
 }
 
+// ============================================================================
+// SETUP BUTTON HANDLER
+// ============================================================================
+
 async function handleSetupButton(interaction) {
   const id = interaction.customId;
   const guild = interaction.guild;
   const gc = getGuildConfig(guild.id);
 
+  // ---------- MAIN / BACK ----------
   if (id === 'setup_main' || id === 'setup_back') {
     await interaction.update({ embeds: [setupMainEmbed(guild)], components: setupMainRows() });
     return;
   }
 
+  // ---------- CHANNELS ----------
   if (id === 'setup_channels') {
-    const embed = new EmbedBuilder().setTitle('Channels')
-      .setDescription('Click a button to set the current channel, or use the buttons below.')
+    const embed = new EmbedBuilder().setTitle('📁 Channels')
+      .setDescription([
+        'Use the dropdowns to set a channel or clear one.',
+        '',
+        `**Log:** ${gc.channels.log ? `<#${gc.channels.log}>` : '—'}`,
+        `**Staff log:** ${gc.channels.staffLog ? `<#${gc.channels.staffLog}>` : '—'}`,
+        `**HR log:** ${gc.channels.hrLog ? `<#${gc.channels.hrLog}>` : '—'}`,
+        `**Ticket log:** ${gc.channels.ticketLog ? `<#${gc.channels.ticketLog}>` : '—'}`,
+        `**Transcripts:** ${gc.channels.transcripts ? `<#${gc.channels.transcripts}>` : '—'}`,
+        `**Welcome:** ${gc.channels.welcome ? `<#${gc.channels.welcome}>` : '—'}`,
+        `**Suggestions:** ${gc.channels.suggestions ? `<#${gc.channels.suggestions}>` : '—'}`,
+        `**Staff feedback:** ${gc.channels.staffFeedback ? `<#${gc.channels.staffFeedback}>` : '—'}`
+      ].join('\n'))
       .setColor(0x5865F2);
-    const row1 = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('setup_ch_log').setLabel('Log').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('setup_ch_staffLog').setLabel('Staff log').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('setup_ch_hrLog').setLabel('HR log').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('setup_ch_ticketLog').setLabel('Ticket log').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('setup_ch_transcripts').setLabel('Transcripts').setStyle(ButtonStyle.Secondary)
-    );
-    const row2 = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('setup_ch_welcome').setLabel('Welcome').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('setup_ch_suggestions').setLabel('Suggestions').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('setup_ch_staffFeedback').setLabel('Staff feedback').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('setup_back').setLabel('Back').setStyle(ButtonStyle.Danger)
-    );
-    await interaction.update({ embeds: [embed], components: [row1, row2] });
+
+    const channelSelect = new ChannelSelectMenuBuilder()
+      .setCustomId('setup_channel_pick')
+      .setPlaceholder('Pick a channel...')
+      .setMinValues(1).setMaxValues(1)
+      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement);
+
+    const purposeSelect = new StringSelectMenuBuilder()
+      .setCustomId('setup_channel_purpose')
+      .setPlaceholder('Assign it as...')
+      .addOptions(
+        new StringSelectMenuOptionBuilder().setLabel('Log').setValue('log'),
+        new StringSelectMenuOptionBuilder().setLabel('Staff log').setValue('staffLog'),
+        new StringSelectMenuOptionBuilder().setLabel('HR log').setValue('hrLog'),
+        new StringSelectMenuOptionBuilder().setLabel('Ticket log').setValue('ticketLog'),
+        new StringSelectMenuOptionBuilder().setLabel('Transcripts').setValue('transcripts'),
+        new StringSelectMenuOptionBuilder().setLabel('Welcome').setValue('welcome'),
+        new StringSelectMenuOptionBuilder().setLabel('Suggestions').setValue('suggestions'),
+        new StringSelectMenuOptionBuilder().setLabel('Staff feedback').setValue('staffFeedback')
+      );
+
+    const clearSelect = new StringSelectMenuBuilder()
+      .setCustomId('setup_channel_clear')
+      .setPlaceholder('Clear a channel...')
+      .addOptions(
+        new StringSelectMenuOptionBuilder().setLabel('Log').setValue('log'),
+        new StringSelectMenuOptionBuilder().setLabel('Staff log').setValue('staffLog'),
+        new StringSelectMenuOptionBuilder().setLabel('HR log').setValue('hrLog'),
+        new StringSelectMenuOptionBuilder().setLabel('Ticket log').setValue('ticketLog'),
+        new StringSelectMenuOptionBuilder().setLabel('Transcripts').setValue('transcripts'),
+        new StringSelectMenuOptionBuilder().setLabel('Welcome').setValue('welcome'),
+        new StringSelectMenuOptionBuilder().setLabel('Suggestions').setValue('suggestions'),
+        new StringSelectMenuOptionBuilder().setLabel('Staff feedback').setValue('staffFeedback')
+      );
+
+    await interaction.update({
+      embeds: [embed],
+      components: [
+        new ActionRowBuilder().addComponents(channelSelect),
+        new ActionRowBuilder().addComponents(purposeSelect),
+        new ActionRowBuilder().addComponents(clearSelect),
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('setup_back').setLabel('Back').setStyle(ButtonStyle.Danger)
+        )
+      ]
+    });
     return;
   }
 
-  if (id.startsWith('setup_ch_')) {
-    const key = id.slice('setup_ch_'.length);
-    gc.channels[key] = interaction.channel.id;
-    saveConfig();
-    await interaction.reply({ content: `Set ${key} to <#${interaction.channel.id}>`, flags: MessageFlags.Ephemeral });
-    return;
-  }
-
+  // ---------- ROLES ----------
   if (id === 'setup_roles') {
-    const embed = new EmbedBuilder().setTitle('Roles')
-      .setDescription('Add your highest role as the tier, or clear.')
+    const fmt = (arr) => (Array.isArray(arr) && arr.length) ? arr.map(r => `<@&${r}>`).join(', ') : '—';
+    const embed = new EmbedBuilder().setTitle('🎭 Roles')
+      .setDescription([
+        'Use the dropdowns to add roles to a tier or remove them.',
+        '',
+        `**Staff:** ${fmt(gc.roles.staff)}`,
+        `**Admin:** ${fmt(gc.roles.admin)}`,
+        `**Highrank:** ${fmt(gc.roles.highrank)}`,
+        `**Management:** ${fmt(gc.roles.management)}`,
+        `**Exempt:** ${fmt(gc.roles.exempt)}`,
+        `**Accept (auto-granted):** ${fmt(gc.roles.accept)}`,
+        `**HR ping:** ${gc.roles.hrPing ? `<@&${gc.roles.hrPing}>` : '—'}`
+      ].join('\n'))
       .setColor(0x5865F2);
-    const row1 = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('setup_role_staff').setLabel('Staff').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('setup_role_admin').setLabel('Admin').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('setup_role_highrank').setLabel('Highrank').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('setup_role_management').setLabel('Management').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('setup_role_exempt').setLabel('Exempt').setStyle(ButtonStyle.Primary)
-    );
-    const row2 = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('setup_role_accept').setLabel('Accept').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('setup_role_hrPing').setLabel('HR ping').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('setup_clear_staff').setLabel('Clear staff').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('setup_clear_admin').setLabel('Clear admin').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('setup_clear_highrank').setLabel('Clear HR').setStyle(ButtonStyle.Secondary)
-    );
-    const row3 = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('setup_clear_management').setLabel('Clear mgmt').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('setup_clear_exempt').setLabel('Clear exempt').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('setup_back').setLabel('Back').setStyle(ButtonStyle.Danger)
-    );
-    await interaction.update({ embeds: [embed], components: [row1, row2, row3] });
+
+    const roleSelect = new RoleSelectMenuBuilder()
+      .setCustomId('setup_role_pick')
+      .setPlaceholder('Pick role(s) to add...')
+      .setMinValues(1).setMaxValues(25);
+
+    const tierSelect = new StringSelectMenuBuilder()
+      .setCustomId('setup_role_tier')
+      .setPlaceholder('Add to tier...')
+      .addOptions(
+        new StringSelectMenuOptionBuilder().setLabel('Staff').setValue('staff'),
+        new StringSelectMenuOptionBuilder().setLabel('Admin').setValue('admin'),
+        new StringSelectMenuOptionBuilder().setLabel('Highrank').setValue('highrank'),
+        new StringSelectMenuOptionBuilder().setLabel('Management').setValue('management'),
+        new StringSelectMenuOptionBuilder().setLabel('Exempt').setValue('exempt'),
+        new StringSelectMenuOptionBuilder().setLabel('Accept').setValue('accept'),
+        new StringSelectMenuOptionBuilder().setLabel('HR ping (single)').setValue('hrPing')
+      );
+
+    const removeSelect = new StringSelectMenuBuilder()
+      .setCustomId('setup_role_remove')
+      .setPlaceholder('Remove tier roles...')
+      .addOptions(
+        new StringSelectMenuOptionBuilder().setLabel('Staff').setValue('staff'),
+        new StringSelectMenuOptionBuilder().setLabel('Admin').setValue('admin'),
+        new StringSelectMenuOptionBuilder().setLabel('Highrank').setValue('highrank'),
+        new StringSelectMenuOptionBuilder().setLabel('Management').setValue('management'),
+        new StringSelectMenuOptionBuilder().setLabel('Exempt').setValue('exempt'),
+        new StringSelectMenuOptionBuilder().setLabel('Accept').setValue('accept'),
+        new StringSelectMenuOptionBuilder().setLabel('HR ping').setValue('hrPing')
+      );
+
+    await interaction.update({
+      embeds: [embed],
+      components: [
+        new ActionRowBuilder().addComponents(roleSelect),
+        new ActionRowBuilder().addComponents(tierSelect),
+        new ActionRowBuilder().addComponents(removeSelect),
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('setup_back').setLabel('Back').setStyle(ButtonStyle.Danger)
+        )
+      ]
+    });
     return;
   }
 
-  if (id.startsWith('setup_role_')) {
-    const key = id.slice('setup_role_'.length);
-    const role = interaction.member.roles.highest;
-    if (key === 'hrPing') gc.roles.hrPing = role.id;
-    else {
-      if (!Array.isArray(gc.roles[key])) gc.roles[key] = [];
-      if (!gc.roles[key].includes(role.id)) gc.roles[key].push(role.id);
-    }
-    saveConfig();
-    tierCache.clear();
-    await interaction.reply({ content: `Added ${role.name} to ${key}`, flags: MessageFlags.Ephemeral });
-    return;
-  }
-
-  if (id.startsWith('setup_clear_')) {
-    const key = id.slice('setup_clear_'.length);
-    if (key === 'hrPing') gc.roles.hrPing = null;
-    else gc.roles[key] = [];
-    saveConfig();
-    tierCache.clear();
-    await interaction.reply({ content: `Cleared ${key}`, flags: MessageFlags.Ephemeral });
-    return;
-  }
-
+  // ---------- TICKETS ----------
   if (id === 'setup_tickets') {
-    const embed = new EmbedBuilder().setTitle('Tickets').setDescription([
-      `Support cat: ${gc.tickets.supportCategory ? `<#${gc.tickets.supportCategory}>` : '—'}`,
-      `Support ping: ${gc.tickets.supportPing ? `<@&${gc.tickets.supportPing}>` : '—'}`,
-      `HR cat: ${gc.tickets.highrankCategory ? `<#${gc.tickets.highrankCategory}>` : '—'}`,
-      `HR ping: ${gc.tickets.highrankPing ? `<@&${gc.tickets.highrankPing}>` : '—'}`
-    ].join('\n')).setColor(0x5865F2);
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('setup_tcat_support').setLabel('Support category').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('setup_tping_support').setLabel('Support ping').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('setup_tcat_highrank').setLabel('HR category').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('setup_tping_highrank').setLabel('HR ping').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('setup_back').setLabel('Back').setStyle(ButtonStyle.Danger)
-    );
-    await interaction.update({ embeds: [embed], components: [row] });
+    const embed = new EmbedBuilder().setTitle('🎫 Tickets')
+      .setDescription([
+        `**Support category:** ${gc.tickets.supportCategory ? `<#${gc.tickets.supportCategory}>` : '—'}`,
+        `**Support ping:** ${gc.tickets.supportPing ? `<@&${gc.tickets.supportPing}>` : '—'}`,
+        `**HR category:** ${gc.tickets.highrankCategory ? `<#${gc.tickets.highrankCategory}>` : '—'}`,
+        `**HR ping:** ${gc.tickets.highrankPing ? `<@&${gc.tickets.highrankPing}>` : '—'}`
+      ].join('\n'))
+      .setColor(0x5865F2);
+
+    const typeSelect = new StringSelectMenuBuilder()
+      .setCustomId('setup_ticket_type')
+      .setPlaceholder('What are you setting?')
+      .addOptions(
+        new StringSelectMenuOptionBuilder().setLabel('Support category').setValue('supportCat'),
+        new StringSelectMenuOptionBuilder().setLabel('Support ping role').setValue('supportPing'),
+        new StringSelectMenuOptionBuilder().setLabel('HR category').setValue('highrankCat'),
+        new StringSelectMenuOptionBuilder().setLabel('HR ping role').setValue('highrankPing')
+      );
+
+    const catSelect = new ChannelSelectMenuBuilder()
+      .setCustomId('setup_ticket_category')
+      .setPlaceholder('Pick a category channel...')
+      .setMinValues(1).setMaxValues(1)
+      .addChannelTypes(ChannelType.GuildCategory);
+
+    const pingSelect = new RoleSelectMenuBuilder()
+      .setCustomId('setup_ticket_ping')
+      .setPlaceholder('Pick a ping role...')
+      .setMinValues(1).setMaxValues(1);
+
+    await interaction.update({
+      embeds: [embed],
+      components: [
+        new ActionRowBuilder().addComponents(typeSelect),
+        new ActionRowBuilder().addComponents(catSelect),
+        new ActionRowBuilder().addComponents(pingSelect),
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('setup_back').setLabel('Back').setStyle(ButtonStyle.Danger)
+        )
+      ]
+    });
     return;
   }
 
-  if (id === 'setup_tcat_support') {
-    gc.tickets.supportCategory = interaction.channel.parentId || interaction.channel.id;
-    saveConfig();
-    await interaction.reply({ content: 'Support category set', flags: MessageFlags.Ephemeral });
-    return;
-  }
-  if (id === 'setup_tcat_highrank') {
-    gc.tickets.highrankCategory = interaction.channel.parentId || interaction.channel.id;
-    saveConfig();
-    await interaction.reply({ content: 'HR category set', flags: MessageFlags.Ephemeral });
-    return;
-  }
-  if (id === 'setup_tping_support') {
-    gc.tickets.supportPing = interaction.member.roles.highest.id;
-    saveConfig();
-    await interaction.reply({ content: `Support ping set to ${interaction.member.roles.highest.name}`, flags: MessageFlags.Ephemeral });
-    return;
-  }
-  if (id === 'setup_tping_highrank') {
-    gc.tickets.highrankPing = interaction.member.roles.highest.id;
-    saveConfig();
-    await interaction.reply({ content: `HR ping set to ${interaction.member.roles.highest.name}`, flags: MessageFlags.Ephemeral });
-    return;
-  }
-
+  // ---------- ANTI-NUKE ----------
   if (id === 'setup_antinuke') {
-    const embed = new EmbedBuilder().setTitle('Anti-nuke')
-      .setDescription(`Enabled: ${gc.antinuke.enabled}\nThreshold: ${gc.antinuke.threshold}\nWindow: ${gc.antinuke.windowMs}ms\nWhitelist: ${gc.antinuke.whitelist.length}\nWatchlist: ${Object.keys(gc.antinuke.watchlist).length}`)
+    const embed = new EmbedBuilder().setTitle('🛡️ Anti-nuke')
+      .setDescription([
+        `**Enabled:** ${gc.antinuke.enabled}`,
+        `**Threshold:** ${gc.antinuke.threshold} actions / ${gc.antinuke.windowMs}ms`,
+        `**Whitelist:** ${gc.antinuke.whitelist.length ? gc.antinuke.whitelist.map(u => `<@${u}>`).join(', ') : '—'}`,
+        `**Watchlist:** ${Object.keys(gc.antinuke.watchlist).length ? Object.keys(gc.antinuke.watchlist).map(u => `<@${u}>`).join(', ') : '—'}`
+      ].join('\n'))
       .setColor(0xFF0000);
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('setup_an_toggle').setLabel('Toggle').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('setup_an_threshold').setLabel('Threshold').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('setup_an_wl_add').setLabel('WL add me').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('setup_an_wl_remove').setLabel('WL remove me').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('setup_an_reset').setLabel('Reset counters').setStyle(ButtonStyle.Danger)
-    );
-    const row2 = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('setup_an_list').setLabel('Show lists').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('setup_back').setLabel('Back').setStyle(ButtonStyle.Danger)
-    );
-    await interaction.update({ embeds: [embed], components: [row, row2] });
+
+    const addSelect = new UserSelectMenuBuilder()
+      .setCustomId('setup_an_wl_add')
+      .setPlaceholder('Add users to whitelist...')
+      .setMinValues(1).setMaxValues(25);
+
+    const removeSelect = new UserSelectMenuBuilder()
+      .setCustomId('setup_an_wl_remove')
+      .setPlaceholder('Remove users from whitelist...')
+      .setMinValues(1).setMaxValues(25);
+
+    await interaction.update({
+      embeds: [embed],
+      components: [
+        new ActionRowBuilder().addComponents(addSelect),
+        new ActionRowBuilder().addComponents(removeSelect),
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('setup_an_toggle').setLabel('Toggle').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId('setup_an_threshold').setLabel('Threshold').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('setup_an_reset').setLabel('Reset counters').setStyle(ButtonStyle.Danger),
+          new ButtonBuilder().setCustomId('setup_back').setLabel('Back').setStyle(ButtonStyle.Danger)
+        )
+      ]
+    });
     return;
   }
 
@@ -1393,48 +1407,81 @@ async function handleSetupButton(interaction) {
     await interaction.showModal(modal);
     return;
   }
-  if (id === 'setup_an_wl_add') {
-    if (!gc.antinuke.whitelist.includes(interaction.user.id)) gc.antinuke.whitelist.push(interaction.user.id);
-    saveConfig();
-    await interaction.reply({ content: 'Added to whitelist', flags: MessageFlags.Ephemeral });
-    return;
-  }
-  if (id === 'setup_an_wl_remove') {
-    gc.antinuke.whitelist = gc.antinuke.whitelist.filter(x => x !== interaction.user.id);
-    saveConfig();
-    await interaction.reply({ content: 'Removed from whitelist', flags: MessageFlags.Ephemeral });
-    return;
-  }
   if (id === 'setup_an_reset') {
     gc.antinuke.counters = {};
     saveConfig();
     await interaction.reply({ content: 'Counters reset', flags: MessageFlags.Ephemeral });
     return;
   }
-  if (id === 'setup_an_list') {
-    await interaction.reply({
-      content: `Whitelist: ${gc.antinuke.whitelist.join(', ') || 'none'}\nWatchlist: ${Object.keys(gc.antinuke.watchlist).join(', ') || 'none'}`,
-      flags: MessageFlags.Ephemeral
+
+  // ---------- AUTOMOD ----------
+  if (id === 'setup_automod') {
+    const embed = new EmbedBuilder().setTitle('Automod')
+      .setDescription([
+        `Slur filter: ${gc.automod.slurEnabled} (${(gc.automod.slurList || []).length} words)`,
+        `Ghost ping: ${gc.automod.ghostPingEnabled}`,
+        `Link filter: ${gc.automod.linkEnabled}`,
+        `Link whitelist: ${(gc.automod.linkWhitelist || []).map(c => `<#${c}>`).join(', ') || '—'}`,
+        `Ignored channels: ${(gc.automod.ignoredChannelIds || []).map(c => `<#${c}>`).join(', ') || '—'}`
+      ].join('\n'))
+      .setColor(0x5865F2);
+
+    const linkWlAdd = new ChannelSelectMenuBuilder()
+      .setCustomId('setup_am_linkwl_add')
+      .setPlaceholder('Add to link whitelist...')
+      .setMinValues(1).setMaxValues(25)
+      .addChannelTypes(ChannelType.GuildText);
+
+    const ignoreAdd = new ChannelSelectMenuBuilder()
+      .setCustomId('setup_am_ignore_add')
+      .setPlaceholder('Add to ignore list...')
+      .setMinValues(1).setMaxValues(25)
+      .addChannelTypes(ChannelType.GuildText);
+
+    await interaction.update({
+      embeds: [embed],
+      components: [
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('setup_am_slur_toggle').setLabel('Slur').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId('setup_am_slur_edit').setLabel('Edit slurs').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('setup_am_ghost').setLabel('Ghost ping').setStyle(ButtonStyle.Primary),
+          new ButtonBuilder().setCustomId('setup_am_link').setLabel('Link filter').setStyle(ButtonStyle.Primary)
+        ),
+        new ActionRowBuilder().addComponents(linkWlAdd),
+        new ActionRowBuilder().addComponents(ignoreAdd),
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('setup_am_lists').setLabel('Remove from lists').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('setup_back').setLabel('Back').setStyle(ButtonStyle.Danger)
+        )
+      ]
     });
     return;
   }
 
-  if (id === 'setup_automod') {
-    const embed = new EmbedBuilder().setTitle('Automod')
-      .setDescription(`Slur: ${gc.automod.slurEnabled} (${(gc.automod.slurList || []).length} words)\nGhost ping: ${gc.automod.ghostPingEnabled}\nLinks: ${gc.automod.linkEnabled}\nLink WL: ${(gc.automod.linkWhitelist || []).length}\nIgnored: ${(gc.automod.ignoredChannelIds || []).length}`)
+  if (id === 'setup_am_lists') {
+    const embed = new EmbedBuilder().setTitle('Automod — remove channels')
+      .setDescription('Select channels to remove from link whitelist or ignore list.')
       .setColor(0x5865F2);
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('setup_am_slur_toggle').setLabel('Slur toggle').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('setup_am_slur_edit').setLabel('Edit slurs').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('setup_am_ghost').setLabel('Ghost toggle').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('setup_am_link').setLabel('Link toggle').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('setup_am_link_wl').setLabel('Add link WL').setStyle(ButtonStyle.Secondary)
-    );
-    const row2 = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('setup_am_ignore').setLabel('Ignore this channel').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId('setup_back').setLabel('Back').setStyle(ButtonStyle.Danger)
-    );
-    await interaction.update({ embeds: [embed], components: [row, row2] });
+    const linkWlRemove = new ChannelSelectMenuBuilder()
+      .setCustomId('setup_am_linkwl_remove')
+      .setPlaceholder('Remove from link whitelist...')
+      .setMinValues(1).setMaxValues(25)
+      .addChannelTypes(ChannelType.GuildText);
+    const ignoreRemove = new ChannelSelectMenuBuilder()
+      .setCustomId('setup_am_ignore_remove')
+      .setPlaceholder('Remove from ignore list...')
+      .setMinValues(1).setMaxValues(25)
+      .addChannelTypes(ChannelType.GuildText);
+    await interaction.update({
+      embeds: [embed],
+      components: [
+        new ActionRowBuilder().addComponents(linkWlRemove),
+        new ActionRowBuilder().addComponents(ignoreRemove),
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('setup_automod').setLabel('Back').setStyle(ButtonStyle.Danger)
+        )
+      ]
+    });
     return;
   }
 
@@ -1464,21 +1511,8 @@ async function handleSetupButton(interaction) {
     await interaction.reply({ content: `Link filter ${gc.automod.linkEnabled ? 'on' : 'off'}`, flags: MessageFlags.Ephemeral });
     return;
   }
-  if (id === 'setup_am_link_wl') {
-    if (!gc.automod.linkWhitelist) gc.automod.linkWhitelist = [];
-    if (!gc.automod.linkWhitelist.includes(interaction.channel.id)) gc.automod.linkWhitelist.push(interaction.channel.id);
-    saveConfig();
-    await interaction.reply({ content: `Added <#${interaction.channel.id}> to link whitelist`, flags: MessageFlags.Ephemeral });
-    return;
-  }
-  if (id === 'setup_am_ignore') {
-    if (!gc.automod.ignoredChannelIds) gc.automod.ignoredChannelIds = [];
-    if (!gc.automod.ignoredChannelIds.includes(interaction.channel.id)) gc.automod.ignoredChannelIds.push(interaction.channel.id);
-    saveConfig();
-    await interaction.reply({ content: `Ignoring <#${interaction.channel.id}> for automod`, flags: MessageFlags.Ephemeral });
-    return;
-  }
 
+  // ---------- PERMISSIONS ----------
   if (id === 'setup_permissions') {
     const groups = {
       general: ['help', 'ping', 'avatar', 'whois', 'userinfo', 'serverinfo'],
@@ -1488,7 +1522,7 @@ async function handleSetupButton(interaction) {
       hr: ['accept', 'deny', 'promote', 'demote', 'infract', 'acceptsetup'],
       other: ['setup', 'poll', 'giveaway', 'giveaway-end', 'giveaway-reroll', 'suggest', 'feedback', 'suggestion-approve', 'suggestion-deny']
     };
-    const embed = new EmbedBuilder().setTitle('Permissions').setDescription('Select a group').setColor(0x5865F2);
+    const embed = new EmbedBuilder().setTitle('🔐 Permissions').setDescription('Select a group').setColor(0x5865F2);
     const row = new ActionRowBuilder().addComponents(
       ...Object.keys(groups).slice(0, 5).map(g =>
         new ButtonBuilder().setCustomId(`setup_perm_group_${g}`).setLabel(g).setStyle(ButtonStyle.Primary)
@@ -1512,7 +1546,7 @@ async function handleSetupButton(interaction) {
       other: ['setup', 'poll', 'giveaway', 'giveaway-end', 'giveaway-reroll', 'suggest', 'feedback', 'suggestion-approve', 'suggestion-deny']
     };
     const cmds = groups[group] || [];
-    const embed = new EmbedBuilder().setTitle(`Permissions — ${group}`).setDescription('Select a command').setColor(0x5865F2);
+    const embed = new EmbedBuilder().setTitle(`🔐 Permissions — ${group}`).setDescription('Select a command').setColor(0x5865F2);
     const rows = [];
     for (let i = 0; i < cmds.length; i += 5) {
       const chunk = cmds.slice(i, i + 5);
@@ -1532,7 +1566,7 @@ async function handleSetupButton(interaction) {
     const required = gc.commandPerms[cmd] !== undefined
       ? gc.commandPerms[cmd]
       : (DEFAULT_COMMAND_PERMS[cmd] || ['management']);
-    const embed = new EmbedBuilder().setTitle(`Perm — ${cmd}`)
+    const embed = new EmbedBuilder().setTitle(`🔐 Perm — ${cmd}`)
       .setDescription(`Current: ${Array.isArray(required) ? required.join(', ') : required}\nEmpty override = deny`)
       .setColor(0x5865F2);
     const tiers = ['everyone', 'staff', 'admin', 'highrank', 'management'];
@@ -1558,9 +1592,8 @@ async function handleSetupButton(interaction) {
     let current = gc.commandPerms[cmd];
     if (current === undefined) current = [...(DEFAULT_COMMAND_PERMS[cmd] || ['management'])];
     else current = [...current];
-    if (tier === 'everyone') {
-      current = ['everyone'];
-    } else {
+    if (tier === 'everyone') current = ['everyone'];
+    else {
       current = current.filter(t => t !== 'everyone');
       if (current.includes(tier)) current = current.filter(t => t !== tier);
       else current.push(tier);
@@ -1579,14 +1612,14 @@ async function handleSetupButton(interaction) {
     return;
   }
 
+  // ---------- CUSTOM COMMANDS ----------
   if (id === 'setup_customcmds') {
     const list = Object.keys(gc.customCommands || {});
-    const embed = new EmbedBuilder().setTitle('Custom commands')
+    const embed = new EmbedBuilder().setTitle('💬 Custom commands')
       .setDescription(list.length ? list.map(n => `\`${n}\``).join(', ') : 'None')
       .setColor(0x5865F2);
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('setup_cc_add').setLabel('Add').setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId('setup_cc_list').setLabel('List').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('setup_cc_delete').setLabel('Delete').setStyle(ButtonStyle.Danger),
       new ButtonBuilder().setCustomId('setup_cc_clear').setLabel('Clear all').setStyle(ButtonStyle.Danger),
       new ButtonBuilder().setCustomId('setup_back').setLabel('Back').setStyle(ButtonStyle.Secondary)
@@ -1603,12 +1636,6 @@ async function handleSetupButton(interaction) {
       new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('type').setLabel('Type: text or embed').setStyle(TextInputStyle.Short).setRequired(false).setValue('text'))
     );
     await interaction.showModal(modal);
-    return;
-  }
-  if (id === 'setup_cc_list') {
-    const entries = Object.entries(gc.customCommands || {});
-    const text = entries.length ? entries.map(([n, d]) => `**${n}** (${d.type || 'text'})`).join('\n') : 'None';
-    await interaction.reply({ content: text.slice(0, 2000), flags: MessageFlags.Ephemeral });
     return;
   }
   if (id === 'setup_cc_delete') {
@@ -1629,15 +1656,16 @@ async function handleSetupButton(interaction) {
     }
     gc.customCommands = {};
     saveConfig();
-    _slashCache.delete(guild.id);
+    slashCache.delete(guild.id);
     await registerCommands(guild);
     await interaction.reply({ content: 'Cleared all custom commands', flags: MessageFlags.Ephemeral });
     return;
   }
 
+  // ---------- GENERAL ----------
   if (id === 'setup_general') {
-    const embed = new EmbedBuilder().setTitle('General')
-      .setDescription(`Prefix: \`${gc.prefix}\`\nWebhook: ${gc.webhookUrl ? 'set' : 'none'}`)
+    const embed = new EmbedBuilder().setTitle('⚙️ General')
+      .setDescription(`**Prefix:** \`${gc.prefix}\`\n**Webhook:** ${gc.webhookUrl ? 'set' : 'none'}`)
       .setColor(0x5865F2);
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('setup_gen_prefix').setLabel('Prefix').setStyle(ButtonStyle.Primary),
@@ -1665,8 +1693,9 @@ async function handleSetupButton(interaction) {
     return;
   }
 
+  // ---------- DM TEMPLATES ----------
   if (id === 'setup_dmtemplates') {
-    const embed = new EmbedBuilder().setTitle('DM templates')
+    const embed = new EmbedBuilder().setTitle('📨 DM templates')
       .setDescription('Variables: {server} {rank} {type} {reason} {notes}')
       .setColor(0x5865F2);
     const row = new ActionRowBuilder().addComponents(
@@ -1693,6 +1722,7 @@ async function handleSetupButton(interaction) {
     return;
   }
 
+  // ---------- POST TICKETS PANEL ----------
   if (id === 'setup_posttickets') {
     const embed = new EmbedBuilder()
       .setTitle('Tickets')
@@ -1707,6 +1737,261 @@ async function handleSetupButton(interaction) {
     return;
   }
 }
+
+// ============================================================================
+// SETUP SELECT HANDLER — the new multi-select logic
+// ============================================================================
+
+async function handleSetupSelect(interaction) {
+  const id = interaction.customId;
+  const guild = interaction.guild;
+  const gc = getGuildConfig(guild.id);
+
+  // ---------- CHANNELS ----------
+  if (id === 'setup_channel_pick') {
+    const channelId = interaction.values[0];
+    pendingSetupChannel.set(interaction.user.id, { channelId, expires: Date.now() + 120000 });
+    await interaction.reply({
+      content: `Selected <#${channelId}>. Now pick a purpose in the dropdown above.`,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  if (id === 'setup_channel_purpose') {
+    const purpose = interaction.values[0];
+    const pending = pendingSetupChannel.get(interaction.user.id);
+    if (!pending || pending.expires < Date.now()) {
+      pendingSetupChannel.delete(interaction.user.id);
+      await interaction.reply({ content: 'Pick a channel first (top dropdown).', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const channelId = pending.channelId;
+    gc.channels[purpose] = channelId;
+    pendingSetupChannel.delete(interaction.user.id);
+    saveConfig();
+    await interaction.reply({ content: `Set **${purpose}** → <#${channelId}>`, flags: MessageFlags.Ephemeral });
+    await interaction.message.edit({ embeds: [setupChannelsEmbed(guild)] }).catch(() => {});
+    return;
+  }
+
+  if (id === 'setup_channel_clear') {
+    const purpose = interaction.values[0];
+    gc.channels[purpose] = null;
+    saveConfig();
+    await interaction.reply({ content: `Cleared **${purpose}**`, flags: MessageFlags.Ephemeral });
+    await interaction.message.edit({ embeds: [setupChannelsEmbed(guild)] }).catch(() => {});
+    return;
+  }
+
+  // ---------- ROLES ----------
+  if (id === 'setup_role_pick') {
+    const roleIds = interaction.values;
+    pendingSetupRoles.set(interaction.user.id, { roleIds, expires: Date.now() + 120000 });
+    await interaction.reply({
+      content: `Selected ${roleIds.map(r => `<@&${r}>`).join(', ')}. Now pick a tier in the dropdown above.`,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  if (id === 'setup_role_tier') {
+    const tier = interaction.values[0];
+    const pending = pendingSetupRoles.get(interaction.user.id);
+    if (!pending || !pending.roleIds?.length || pending.expires < Date.now()) {
+      pendingSetupRoles.delete(interaction.user.id);
+      await interaction.reply({ content: 'Pick roles first (top dropdown).', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const roleIds = pending.roleIds;
+    if (tier === 'hrPing') {
+      gc.roles.hrPing = roleIds[0];
+    } else if (tier === 'accept') {
+      if (!Array.isArray(gc.roles.accept)) gc.roles.accept = [];
+      for (const r of roleIds) {
+        if (!gc.roles.accept.includes(r)) gc.roles.accept.push(r);
+      }
+      gc.acceptRoleIds = [...new Set([...(gc.acceptRoleIds || []), ...roleIds])];
+    } else {
+      if (!Array.isArray(gc.roles[tier])) gc.roles[tier] = [];
+      for (const r of roleIds) {
+        if (!gc.roles[tier].includes(r)) gc.roles[tier].push(r);
+      }
+    }
+    pendingSetupRoles.delete(interaction.user.id);
+    saveConfig();
+    tierCache.clear();
+    await interaction.reply({ content: `Added ${roleIds.map(r => `<@&${r}>`).join(', ')} to **${tier}**`, flags: MessageFlags.Ephemeral });
+    await interaction.message.edit({ embeds: [setupRolesEmbed(guild)] }).catch(() => {});
+    return;
+  }
+
+  if (id === 'setup_role_remove') {
+    const tier = interaction.values[0];
+    if (tier === 'hrPing') gc.roles.hrPing = null;
+    else {
+      gc.roles[tier] = [];
+      if (tier === 'accept') gc.acceptRoleIds = [];
+    }
+    saveConfig();
+    tierCache.clear();
+    await interaction.reply({ content: `Cleared **${tier}**`, flags: MessageFlags.Ephemeral });
+    await interaction.message.edit({ embeds: [setupRolesEmbed(guild)] }).catch(() => {});
+    return;
+  }
+
+  // ---------- TICKETS ----------
+  if (id === 'setup_ticket_type') {
+    pendingSetupTicketType.set(interaction.user.id, { type: interaction.values[0], expires: Date.now() + 120000 });
+    await interaction.reply({ content: `Selected **${interaction.values[0]}**. Now use the category or ping dropdown above.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (id === 'setup_ticket_category') {
+    const pending = pendingSetupTicketType.get(interaction.user.id);
+    if (!pending || pending.expires < Date.now()) {
+      pendingSetupTicketType.delete(interaction.user.id);
+      await interaction.reply({ content: 'Pick a type first (top dropdown).', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const type = pending.type;
+    const catId = interaction.values[0];
+    if (type === 'supportCat') gc.tickets.supportCategory = catId;
+    else if (type === 'highrankCat') gc.tickets.highrankCategory = catId;
+    else {
+      await interaction.reply({ content: 'Pick Support or HR category type, not a ping type.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    saveConfig();
+    await interaction.reply({ content: `Set **${type}** → <#${catId}>`, flags: MessageFlags.Ephemeral });
+    await interaction.message.edit({ embeds: [setupTicketsEmbed(guild)] }).catch(() => {});
+    return;
+  }
+
+  if (id === 'setup_ticket_ping') {
+    const pending = pendingSetupTicketType.get(interaction.user.id);
+    if (!pending || pending.expires < Date.now()) {
+      pendingSetupTicketType.delete(interaction.user.id);
+      await interaction.reply({ content: 'Pick a type first (top dropdown).', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const type = pending.type;
+    const roleId = interaction.values[0];
+    if (type === 'supportPing') gc.tickets.supportPing = roleId;
+    else if (type === 'highrankPing') gc.tickets.highrankPing = roleId;
+    else {
+      await interaction.reply({ content: 'Pick Support or HR ping type, not a category type.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    saveConfig();
+    await interaction.reply({ content: `Set **${type}** → <@&${roleId}>`, flags: MessageFlags.Ephemeral });
+    await interaction.message.edit({ embeds: [setupTicketsEmbed(guild)] }).catch(() => {});
+    return;
+  }
+
+  // ---------- ANTI-NUKE ----------
+  if (id === 'setup_an_wl_add') {
+    for (const uid of interaction.values) {
+      if (!gc.antinuke.whitelist.includes(uid)) gc.antinuke.whitelist.push(uid);
+    }
+    saveConfig();
+    await interaction.reply({ content: `Added ${interaction.values.length} user(s) to whitelist.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (id === 'setup_an_wl_remove') {
+    for (const uid of interaction.values) {
+      gc.antinuke.whitelist = gc.antinuke.whitelist.filter(u => u !== uid);
+    }
+    saveConfig();
+    await interaction.reply({ content: `Removed ${interaction.values.length} user(s) from whitelist.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  // ---------- AUTOMOD LISTS ----------
+  if (id === 'setup_am_linkwl_add') {
+    if (!gc.automod.linkWhitelist) gc.automod.linkWhitelist = [];
+    for (const cid of interaction.values) {
+      if (!gc.automod.linkWhitelist.includes(cid)) gc.automod.linkWhitelist.push(cid);
+    }
+    saveConfig();
+    await interaction.reply({ content: `Added ${interaction.values.length} channel(s) to link whitelist.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (id === 'setup_am_linkwl_remove') {
+    for (const cid of interaction.values) {
+      gc.automod.linkWhitelist = (gc.automod.linkWhitelist || []).filter(c => c !== cid);
+    }
+    saveConfig();
+    await interaction.reply({ content: `Removed ${interaction.values.length} channel(s) from link whitelist.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (id === 'setup_am_ignore_add') {
+    if (!gc.automod.ignoredChannelIds) gc.automod.ignoredChannelIds = [];
+    for (const cid of interaction.values) {
+      if (!gc.automod.ignoredChannelIds.includes(cid)) gc.automod.ignoredChannelIds.push(cid);
+    }
+    saveConfig();
+    await interaction.reply({ content: `Added ${interaction.values.length} channel(s) to ignore list.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (id === 'setup_am_ignore_remove') {
+    for (const cid of interaction.values) {
+      gc.automod.ignoredChannelIds = (gc.automod.ignoredChannelIds || []).filter(c => c !== cid);
+    }
+    saveConfig();
+    await interaction.reply({ content: `Removed ${interaction.values.length} channel(s) from ignore list.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+}
+
+// Helpers to re-render the setup sub-embeds after a selection
+function setupChannelsEmbed(guild) {
+  const gc = getGuildConfig(guild.id);
+  return new EmbedBuilder().setTitle('📁 Channels')
+    .setDescription([
+      `**Log:** ${gc.channels.log ? `<#${gc.channels.log}>` : '—'}`,
+      `**Staff log:** ${gc.channels.staffLog ? `<#${gc.channels.staffLog}>` : '—'}`,
+      `**HR log:** ${gc.channels.hrLog ? `<#${gc.channels.hrLog}>` : '—'}`,
+      `**Ticket log:** ${gc.channels.ticketLog ? `<#${gc.channels.ticketLog}>` : '—'}`,
+      `**Transcripts:** ${gc.channels.transcripts ? `<#${gc.channels.transcripts}>` : '—'}`,
+      `**Welcome:** ${gc.channels.welcome ? `<#${gc.channels.welcome}>` : '—'}`,
+      `**Suggestions:** ${gc.channels.suggestions ? `<#${gc.channels.suggestions}>` : '—'}`,
+      `**Staff feedback:** ${gc.channels.staffFeedback ? `<#${gc.channels.staffFeedback}>` : '—'}`
+    ].join('\n'))
+    .setColor(0x5865F2);
+}
+
+function setupRolesEmbed(guild) {
+  const gc = getGuildConfig(guild.id);
+  const fmt = (arr) => (Array.isArray(arr) && arr.length) ? arr.map(r => `<@&${r}>`).join(', ') : '—';
+  return new EmbedBuilder().setTitle('🎭 Roles')
+    .setDescription([
+      `**Staff:** ${fmt(gc.roles.staff)}`,
+      `**Admin:** ${fmt(gc.roles.admin)}`,
+      `**Highrank:** ${fmt(gc.roles.highrank)}`,
+      `**Management:** ${fmt(gc.roles.management)}`,
+      `**Exempt:** ${fmt(gc.roles.exempt)}`,
+      `**Accept:** ${fmt(gc.roles.accept)}`,
+      `**HR ping:** ${gc.roles.hrPing ? `<@&${gc.roles.hrPing}>` : '—'}`
+    ].join('\n'))
+    .setColor(0x5865F2);
+}
+
+function setupTicketsEmbed(guild) {
+  const gc = getGuildConfig(guild.id);
+  return new EmbedBuilder().setTitle('🎫 Tickets')
+    .setDescription([
+      `**Support category:** ${gc.tickets.supportCategory ? `<#${gc.tickets.supportCategory}>` : '—'}`,
+      `**Support ping:** ${gc.tickets.supportPing ? `<@&${gc.tickets.supportPing}>` : '—'}`,
+      `**HR category:** ${gc.tickets.highrankCategory ? `<#${gc.tickets.highrankCategory}>` : '—'}`,
+      `**HR ping:** ${gc.tickets.highrankPing ? `<@&${gc.tickets.highrankPing}>` : '—'}`
+    ].join('\n'))
+    .setColor(0x5865F2);
+}
+
+// ============================================================================
+// MODAL HANDLER
+// ============================================================================
 
 async function handleModal(interaction) {
   const id = interaction.customId;
@@ -1744,7 +2029,7 @@ async function handleModal(interaction) {
     }
     gc.customCommands[name] = { response, type, color: 0x5865F2, deleteTrigger: false, enabled: true };
     saveConfig();
-    _slashCache.delete(guild.id);
+    slashCache.delete(guild.id);
     await registerCommands(guild);
     await interaction.reply({ content: `Added /${name}`, flags: MessageFlags.Ephemeral });
     return;
@@ -1760,7 +2045,7 @@ async function handleModal(interaction) {
         const existing = cmds.find(c => c.name === name);
         if (existing) await guild.commands.delete(existing.id);
       } catch {}
-      _slashCache.delete(guild.id);
+      slashCache.delete(guild.id);
       await interaction.reply({ content: `Deleted ${name}`, flags: MessageFlags.Ephemeral });
     } else {
       await interaction.reply({ content: 'Not found', flags: MessageFlags.Ephemeral });
@@ -1794,7 +2079,7 @@ async function handleModal(interaction) {
 }
 
 // ============================================================================
-// GIVEAWAY END (fixed — no gc._giveaways)
+// GIVEAWAY
 // ============================================================================
 
 async function endGiveaway(guild, messageId) {
@@ -1802,7 +2087,10 @@ async function endGiveaway(guild, messageId) {
   const g = giveawayStore.get(key);
   if (!g || g.ended) return;
   g.ended = true;
+  g.endedAt = Date.now();
   giveawayStore.delete(key);
+  endedGiveawayStore.set(key, g);
+  setTimeout(() => endedGiveawayStore.delete(key), 60 * 60 * 1000);
 
   const entries = g.entries || [];
   const winnerCount = Math.min(g.winners || 1, entries.length);
@@ -1812,13 +2100,13 @@ async function endGiveaway(guild, messageId) {
     const idx = Math.floor(Math.random() * pool.length);
     winners.push(pool.splice(idx, 1)[0]);
   }
+  g.lastWinners = winners;
 
   const channel = guild.channels.cache.get(g.channelId);
   if (channel) {
     const msg = await channel.messages.fetch(messageId).catch(() => null);
     const winnerMentions = winners.map(id => `<@${id}>`).join(', ') || 'No valid entries';
-    const embed = new EmbedBuilder()
-      .setTitle('Giveaway ended')
+    const embed = new EmbedBuilder().setTitle('Giveaway ended')
       .setDescription(`Prize: ${g.prize}\nWinner: ${winnerMentions}`)
       .setColor(0x57F287).setTimestamp();
     if (msg) await msg.edit({ embeds: [embed], components: [] }).catch(() => {});
@@ -1834,7 +2122,6 @@ async function handleCommand(ctx) {
   const { guild, member, user, channel, commandName, options, isSlash, interaction, message, args } = ctx;
   const gc = getGuildConfig(guild.id);
 
-  // Custom commands
   if (gc.customCommands?.[commandName] && gc.customCommands[commandName].enabled !== false) {
     const cc = gc.customCommands[commandName];
     if (cc.type === 'embed') {
@@ -1870,8 +2157,7 @@ async function handleCommand(ctx) {
     switch (commandName) {
       case 'help': {
         const cmds = Object.keys(DEFAULT_COMMAND_PERMS).filter(c => canRunCommand(member, c));
-        const embed = new EmbedBuilder()
-          .setTitle('Commands')
+        const embed = new EmbedBuilder().setTitle('Commands')
           .setDescription(cmds.map(c => `\`${gc.prefix}${c}\` / \`/${c}\``).join('\n').slice(0, 4000))
           .setColor(0x5865F2);
         await reply(null, [embed]);
@@ -1892,31 +2178,25 @@ async function handleCommand(ctx) {
       case 'userinfo': {
         const u = options.user || user;
         const m = options.member || (u.id === user.id ? member : await guild.members.fetch(u.id).catch(() => null));
-        const embed = new EmbedBuilder()
-          .setTitle(u.tag || u.username)
-          .setThumbnail(u.displayAvatarURL())
+        const embed = new EmbedBuilder().setTitle(u.tag || u.username).setThumbnail(u.displayAvatarURL())
           .addFields(
             { name: 'ID', value: u.id, inline: true },
             { name: 'Created', value: `<t:${Math.floor(u.createdTimestamp / 1000)}:R>`, inline: true },
             { name: 'Joined', value: m ? `<t:${Math.floor(m.joinedTimestamp / 1000)}:R>` : '—', inline: true },
             { name: 'Roles', value: m ? m.roles.cache.filter(r => r.id !== guild.id).map(r => r.name).slice(0, 15).join(', ') || '—' : '—', inline: false }
-          )
-          .setColor(0x5865F2);
+          ).setColor(0x5865F2);
         await reply(null, [embed]);
         break;
       }
       case 'serverinfo': {
-        const embed = new EmbedBuilder()
-          .setTitle(guild.name)
-          .setThumbnail(guild.iconURL())
+        const embed = new EmbedBuilder().setTitle(guild.name).setThumbnail(guild.iconURL())
           .addFields(
             { name: 'Members', value: String(guild.memberCount), inline: true },
             { name: 'Channels', value: String(guild.channels.cache.size), inline: true },
             { name: 'Roles', value: String(guild.roles.cache.size), inline: true },
             { name: 'Owner', value: `<@${guild.ownerId}>`, inline: true },
             { name: 'Created', value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:R>`, inline: true }
-          )
-          .setColor(0x5865F2);
+          ).setColor(0x5865F2);
         await reply(null, [embed]);
         break;
       }
@@ -2034,7 +2314,7 @@ async function handleCommand(ctx) {
         const ticket = Object.entries(gc.tickets.open || {}).find(([, t]) => t.channelId === channel.id && !t.closed);
         if (!ticket) { await reply('Not a ticket channel'); break; }
         const confirmId = `tclose_${ticket[0]}_${Date.now()}`;
-        _pendingCloseConfirmations.set(confirmId, { ticketId: ticket[0], reason: options.reason || '', closerId: user.id, expires: Date.now() + 30000 });
+        pendingCloseConfirmations.set(confirmId, { ticketId: ticket[0], reason: options.reason || '', closerId: user.id, expires: Date.now() + 30000 });
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId(`confirm_${confirmId}`).setLabel('Confirm').setStyle(ButtonStyle.Danger),
           new ButtonBuilder().setCustomId(`cancel_${confirmId}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary)
@@ -2114,8 +2394,22 @@ async function handleCommand(ctx) {
       case 'acceptsetup': {
         const ids = (options.roles || '').split(/\s+/).filter(Boolean);
         gc.acceptRoleIds = ids;
+        gc.roles.accept = ids;
         saveConfig();
         await reply(`Accept roles set: ${ids.length}`);
+        break;
+      }
+      case 'antinuke': {
+        const embed = new EmbedBuilder()
+          .setTitle('Anti-nuke')
+          .setDescription([
+            `Enabled: ${gc.antinuke.enabled}`,
+            `Threshold: ${gc.antinuke.threshold} / ${gc.antinuke.windowMs}ms`,
+            `Whitelist: ${gc.antinuke.whitelist.length}`,
+            `Watchlist: ${Object.keys(gc.antinuke.watchlist || {}).length}`
+          ].join('\n'))
+          .setColor(0xFF0000);
+        await reply(null, [embed]);
         break;
       }
       case 'setup': {
@@ -2130,11 +2424,9 @@ async function handleCommand(ctx) {
         if (!question || opts.length < 2) { await reply('Need question and 2–10 options separated by |'); break; }
         const votes = {};
         opts.forEach((_, i) => { votes[i] = []; });
-        const embed = new EmbedBuilder()
-          .setTitle(question)
+        const embed = new EmbedBuilder().setTitle(question)
           .setDescription(opts.map((o, i) => `**${i + 1}.** ${o} — 0`).join('\n'))
-          .setFooter({ text: 'Total votes: 0' })
-          .setColor(0x5865F2);
+          .setFooter({ text: 'Total votes: 0' }).setColor(0x5865F2);
         const rows = [];
         for (let i = 0; i < opts.length; i += 5) {
           rows.push(new ActionRowBuilder().addComponents(
@@ -2177,8 +2469,7 @@ async function handleCommand(ctx) {
         const winners = options.winners || 1;
         const targetCh = options.channel || channel;
         if (!prize) { await reply('Prize required'); break; }
-        const embed = new EmbedBuilder()
-          .setTitle('Giveaway')
+        const embed = new EmbedBuilder().setTitle('Giveaway')
           .setDescription(`Prize: **${prize}**\nWinners: ${winners}\nEnds: <t:${Math.floor((Date.now() + duration * 60000) / 1000)}:R>\nEntries: 0`)
           .setColor(0xFEE75C);
         const row = new ActionRowBuilder().addComponents(
@@ -2203,7 +2494,8 @@ async function handleCommand(ctx) {
       case 'giveaway-reroll': {
         const mid = options.messageid;
         if (!mid) { await reply('Message ID required'); break; }
-        const g = giveawayStore.get(`${guild.id}:${mid}`);
+        const key = `${guild.id}:${mid}`;
+        const g = giveawayStore.get(key) || endedGiveawayStore.get(key);
         if (!g) { await reply('Giveaway data not in memory — cannot reroll'); break; }
         const pool = [...(g.entries || [])];
         if (!pool.length) { await reply('No entries'); break; }
@@ -2218,8 +2510,7 @@ async function handleCommand(ctx) {
         if (!ch) { await reply('Suggestions channel missing'); break; }
         const text = options.text;
         if (!text) { await reply('Text required'); break; }
-        const embed = new EmbedBuilder()
-          .setTitle('Suggestion').setDescription(text)
+        const embed = new EmbedBuilder().setTitle('Suggestion').setDescription(text)
           .setFooter({ text: `By ${user.tag}` }).setColor(0x5865F2).setTimestamp();
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('sug_up').setLabel('0').setStyle(ButtonStyle.Success),
@@ -2237,14 +2528,16 @@ async function handleCommand(ctx) {
         if (!ch) { await reply('Channel missing'); break; }
         const text = options.text;
         if (!text) { await reply('Text required'); break; }
-        const embed = new EmbedBuilder()
-          .setTitle('Staff feedback').setDescription(text)
+        const embed = new EmbedBuilder().setTitle('Staff feedback').setDescription(text)
           .setFooter({ text: `By ${user.tag}` }).setColor(0xEB459E).setTimestamp();
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('fb_up').setLabel('0').setStyle(ButtonStyle.Success),
           new ButtonBuilder().setCustomId('fb_down').setLabel('0').setStyle(ButtonStyle.Danger)
         );
-        await ch.send({ embeds: [embed], components: [row] });
+        const msg = await ch.send({ embeds: [embed], components: [row] });
+        if (!gc.feedback) gc.feedback = {};
+        gc.feedback[msg.id] = { up: [], down: [], authorId: user.id, text };
+        saveConfig();
         await reply('Feedback submitted');
         break;
       }
@@ -2277,16 +2570,17 @@ async function handleCommand(ctx) {
 }
 
 // ============================================================================
-// CLIENT EVENTS
+// CLIENT READY
 // ============================================================================
 
-client.once('clientReady', async () => {
+async function onClientReady() {
   console.log(`Logged in as ${client.user.tag}`);
   const hasMC = client.options.intents.has(GatewayIntentBits.MessageContent);
   if (!hasMC) {
     console.error('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!');
     console.error('MessageContent intent is DISABLED.');
     console.error('Prefix commands and automod will not work.');
+    console.error('Enable it in the Discord Developer Portal.');
     console.error('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!');
   }
   loadConfig();
@@ -2295,22 +2589,28 @@ client.once('clientReady', async () => {
     await registerCommands(guild);
   }
 
-  // Housekeeping interval
   setInterval(() => {
     const now = Date.now();
     for (const [mid, data] of ghostPingTracker) {
       if (data.expires < now) ghostPingTracker.delete(mid);
     }
-    for (const [id, data] of _pendingCloseConfirmations) {
-      if (data.expires < now) _pendingCloseConfirmations.delete(id);
+    for (const [id, data] of pendingCloseConfirmations) {
+      if (data.expires < now) pendingCloseConfirmations.delete(id);
+    }
+    for (const [uid, data] of pendingSetupChannel) {
+      if (data.expires < now) pendingSetupChannel.delete(uid);
+    }
+    for (const [uid, data] of pendingSetupRoles) {
+      if (data.expires < now) pendingSetupRoles.delete(uid);
+    }
+    for (const [uid, data] of pendingSetupTicketType) {
+      if (data.expires < now) pendingSetupTicketType.delete(uid);
     }
     for (const gid of Object.keys(config.guilds || {})) {
       const gc = config.guilds[gid];
       if (!gc?.tickets?.open) continue;
       for (const [tid, t] of Object.entries(gc.tickets.open)) {
-        if (t.closed && t.closedAt && now - t.closedAt > 7 * 24 * 60 * 60 * 1000) {
-          delete gc.tickets.open[tid];
-        }
+        if (t.closed && t.closedAt && now - t.closedAt > 7 * 24 * 60 * 60 * 1000) delete gc.tickets.open[tid];
       }
       if (gc.antinuke?.watchlist) {
         for (const [uid, exp] of Object.entries(gc.antinuke.watchlist)) {
@@ -2320,7 +2620,16 @@ client.once('clientReady', async () => {
     }
     saveConfig();
   }, 60000);
-});
+}
+
+let _readyRan = false;
+const _runReadyOnce = async () => {
+  if (_readyRan) return;
+  _readyRan = true;
+  await onClientReady();
+};
+client.once('clientReady', _runReadyOnce);
+client.once('ready', _runReadyOnce);
 
 client.on('guildCreate', async (guild) => {
   getGuildConfig(guild.id);
@@ -2333,18 +2642,14 @@ client.on('guildCreate', async (guild) => {
 
 client.on('interactionCreate', async (interaction) => {
   try {
+    // ---- Slash commands ----
     if (interaction.isChatInputCommand()) {
       const guild = interaction.guild;
       if (!guild) return;
       await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => interaction.deferReply().catch(() => {}));
       let member = interaction.member;
-      if (!member || !member.roles) {
-        member = await guild.members.fetch(interaction.user.id).catch(() => null);
-      }
-      if (!member) {
-        await interaction.editReply({ content: 'Member fetch failed' });
-        return;
-      }
+      if (!member || !member.roles) member = await guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!member) { await interaction.editReply({ content: 'Member fetch failed' }); return; }
 
       const gc = getGuildConfig(guild.id);
       const commandName = interaction.commandName;
@@ -2362,17 +2667,11 @@ client.on('interactionCreate', async (interaction) => {
         if (opt.type === 6) {
           options.user = opt.user;
           options.member = opt.member || await guild.members.fetch(opt.user.id).catch(() => null);
-        } else if (opt.type === 8) {
-          options.role = opt.role;
-        } else if (opt.type === 7) {
-          options.channel = opt.channel;
-        } else {
-          options[opt.name] = opt.value;
-        }
+        } else if (opt.type === 8) options.role = opt.role;
+        else if (opt.type === 7) options.channel = opt.channel;
+        else options[opt.name] = opt.value;
       }
-      if (options.user && !options.member) {
-        options.member = await guild.members.fetch(options.user.id).catch(() => null);
-      }
+      if (options.user && !options.member) options.member = await guild.members.fetch(options.user.id).catch(() => null);
 
       await handleCommand({
         guild, member, user: interaction.user, channel: interaction.channel,
@@ -2381,6 +2680,22 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
+    // ---- Select menus ----
+    if (interaction.isStringSelectMenu() ||
+        interaction.isChannelSelectMenu() ||
+        interaction.isRoleSelectMenu() ||
+        interaction.isUserSelectMenu()) {
+      if (interaction.customId.startsWith('setup_')) {
+        if (!canRunCommand(interaction.member, 'setup')) {
+          await interaction.reply({ content: 'No permission', flags: MessageFlags.Ephemeral });
+          return;
+        }
+        await handleSetupSelect(interaction);
+        return;
+      }
+    }
+
+    // ---- Buttons ----
     if (interaction.isButton()) {
       const id = interaction.customId;
 
@@ -2404,7 +2719,7 @@ client.on('interactionCreate', async (interaction) => {
       if (id.startsWith('ticket_close_')) {
         const ticketId = id.slice('ticket_close_'.length);
         const confirmId = `tclose_${ticketId}_${Date.now()}`;
-        _pendingCloseConfirmations.set(confirmId, {
+        pendingCloseConfirmations.set(confirmId, {
           ticketId, reason: '', closerId: interaction.user.id, expires: Date.now() + 30000
         });
         const row = new ActionRowBuilder().addComponents(
@@ -2417,12 +2732,12 @@ client.on('interactionCreate', async (interaction) => {
 
       if (id.startsWith('confirm_')) {
         const confirmId = id.slice('confirm_'.length);
-        const pending = _pendingCloseConfirmations.get(confirmId);
+        const pending = pendingCloseConfirmations.get(confirmId);
         if (!pending || pending.expires < Date.now()) {
           await interaction.reply({ content: 'Expired', flags: MessageFlags.Ephemeral });
           return;
         }
-        _pendingCloseConfirmations.delete(confirmId);
+        pendingCloseConfirmations.delete(confirmId);
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const res = await closeTicket(interaction.guild, pending.ticketId, interaction.member, pending.reason);
         await interaction.editReply({ content: res.ok ? 'Closing' : res.msg });
@@ -2431,7 +2746,7 @@ client.on('interactionCreate', async (interaction) => {
 
       if (id.startsWith('cancel_')) {
         const confirmId = id.slice('cancel_'.length);
-        _pendingCloseConfirmations.delete(confirmId);
+        pendingCloseConfirmations.delete(confirmId);
         await interaction.update({ content: 'Cancelled', components: [] });
         return;
       }
@@ -2453,13 +2768,8 @@ client.on('interactionCreate', async (interaction) => {
       if (id.startsWith('poll_vote_')) {
         const idx = parseInt(id.slice('poll_vote_'.length), 10);
         const poll = pollStore.get(interaction.message.id);
-        if (!poll) {
-          await interaction.reply({ content: 'Poll ended', flags: MessageFlags.Ephemeral });
-          return;
-        }
-        for (const k of Object.keys(poll.votes)) {
-          poll.votes[k] = poll.votes[k].filter(uid => uid !== interaction.user.id);
-        }
+        if (!poll) { await interaction.reply({ content: 'Poll ended', flags: MessageFlags.Ephemeral }); return; }
+        for (const k of Object.keys(poll.votes)) poll.votes[k] = poll.votes[k].filter(uid => uid !== interaction.user.id);
         if (!poll.votes[idx]) poll.votes[idx] = [];
         poll.votes[idx].push(interaction.user.id);
         const total = Object.values(poll.votes).reduce((a, v) => a + v.length, 0);
@@ -2472,10 +2782,7 @@ client.on('interactionCreate', async (interaction) => {
       if (id === 'giveaway_join') {
         const key = `${interaction.guild.id}:${interaction.message.id}`;
         const g = giveawayStore.get(key);
-        if (!g || g.ended) {
-          await interaction.reply({ content: 'Giveaway ended', flags: MessageFlags.Ephemeral });
-          return;
-        }
+        if (!g || g.ended) { await interaction.reply({ content: 'Giveaway ended', flags: MessageFlags.Ephemeral }); return; }
         if (g.requiredRole && !interaction.member.roles.cache.has(g.requiredRole)) {
           await interaction.reply({ content: 'Missing required role', flags: MessageFlags.Ephemeral });
           return;
@@ -2495,15 +2802,11 @@ client.on('interactionCreate', async (interaction) => {
       if (id === 'sug_up' || id === 'sug_down') {
         const gc = getGuildConfig(interaction.guild.id);
         const sug = gc.suggestions[interaction.message.id];
-        if (!sug) {
-          await interaction.reply({ content: 'Not found', flags: MessageFlags.Ephemeral });
-          return;
-        }
+        if (!sug) { await interaction.reply({ content: 'Not found', flags: MessageFlags.Ephemeral }); return; }
         const uid = interaction.user.id;
         sug.up = sug.up.filter(x => x !== uid);
         sug.down = sug.down.filter(x => x !== uid);
-        if (id === 'sug_up') sug.up.push(uid);
-        else sug.down.push(uid);
+        if (id === 'sug_up') sug.up.push(uid); else sug.down.push(uid);
         saveConfig();
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('sug_up').setLabel(String(sug.up.length)).setStyle(ButtonStyle.Success),
@@ -2514,11 +2817,29 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       if (id === 'fb_up' || id === 'fb_down') {
-        await interaction.reply({ content: 'Recorded', flags: MessageFlags.Ephemeral });
+        const gc = getGuildConfig(interaction.guild.id);
+        if (!gc.feedback) gc.feedback = {};
+        let fb = gc.feedback[interaction.message.id];
+        if (!fb) {
+          fb = { up: [], down: [] };
+          gc.feedback[interaction.message.id] = fb;
+        }
+        const uid = interaction.user.id;
+        fb.up = fb.up.filter(x => x !== uid);
+        fb.down = fb.down.filter(x => x !== uid);
+        if (id === 'fb_up') fb.up.push(uid);
+        else fb.down.push(uid);
+        saveConfig();
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('fb_up').setLabel(String(fb.up.length)).setStyle(ButtonStyle.Success),
+          new ButtonBuilder().setCustomId('fb_down').setLabel(String(fb.down.length)).setStyle(ButtonStyle.Danger)
+        );
+        await interaction.update({ components: [row] });
         return;
       }
     }
 
+    // ---- Modals ----
     if (interaction.isModalSubmit()) {
       await handleModal(interaction);
       return;
@@ -2536,7 +2857,7 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 // ============================================================================
-// MESSAGE HANDLER (single — fixes Code 1's duplicate handler)
+// MESSAGE HANDLER
 // ============================================================================
 
 client.on('messageCreate', async (message) => {
@@ -2549,7 +2870,6 @@ client.on('messageCreate', async (message) => {
   const prefix = gc.prefix || '!';
   const content = message.content.trim();
 
-  // Mention help
   const botMention = new RegExp(`^<@!?${client.user.id}>\\s*help$`, 'i');
   if (botMention.test(content)) {
     const member = message.member || await message.guild.members.fetch(message.author.id).catch(() => null);
@@ -2592,10 +2912,7 @@ client.on('messageCreate', async (message) => {
 
   if (['mute', 'unmute', 'warn', 'kick', 'ban', 'history', 'addrole', 'removerole', 'nickname', 'accept', 'deny', 'promote', 'demote', 'infract', 'tadd', 'tremove', 'avatar', 'whois', 'userinfo'].includes(commandName)) {
     const resolved = await resolveUser(args[0]);
-    if (resolved) {
-      options.user = resolved.user;
-      options.member = resolved.member;
-    }
+    if (resolved) { options.user = resolved.user; options.member = resolved.member; }
   }
 
   if (commandName === 'mute') {
@@ -2611,10 +2928,7 @@ client.on('messageCreate', async (message) => {
     options.reason = args.slice(1).join(' ');
   } else if (commandName === 'clear' || commandName === 'purge') {
     options.amount = args[0];
-    if (args[1]) {
-      const r = await resolveUser(args[1]);
-      if (r) options.user = r.user;
-    }
+    if (args[1]) { const r = await resolveUser(args[1]); if (r) options.user = r.user; }
   } else if (commandName === 'loguser') {
     options.username = args[0];
     options.reason = args.slice(1).join(' ');
@@ -2649,27 +2963,14 @@ client.on('messageCreate', async (message) => {
   } else if (commandName === 'poll') {
     const full = args.join(' ');
     const pipeIdx = full.indexOf('|');
-    if (pipeIdx === -1) {
-      options.question = args[0];
-      options.options = args.slice(1).join(' ');
-    } else {
-      options.question = full.slice(0, pipeIdx).trim();
-      options.options = full.slice(pipeIdx + 1).trim();
-    }
+    if (pipeIdx === -1) { options.question = args[0]; options.options = args.slice(1).join(' '); }
+    else { options.question = full.slice(0, pipeIdx).trim(); options.options = full.slice(pipeIdx + 1).trim(); }
   } else if (commandName === 'giveaway') {
     if (args.length >= 2) {
       const last = args[args.length - 1];
-      if (/^\d+$/.test(last)) {
-        options.duration = parseInt(last, 10);
-        options.prize = args.slice(0, -1).join(' ');
-      } else {
-        options.prize = args.join(' ');
-        options.duration = 60;
-      }
-    } else {
-      options.prize = args[0];
-      options.duration = 60;
-    }
+      if (/^\d+$/.test(last)) { options.duration = parseInt(last, 10); options.prize = args.slice(0, -1).join(' '); }
+      else { options.prize = args.join(' '); options.duration = 60; }
+    } else { options.prize = args[0]; options.duration = 60; }
   } else if (['giveaway-end', 'giveaway-reroll', 'suggestion-approve', 'suggestion-deny'].includes(commandName)) {
     options.messageid = args[0];
   } else if (commandName === 'suggest' || commandName === 'feedback') {
@@ -2683,35 +2984,37 @@ client.on('messageCreate', async (message) => {
 });
 
 // ============================================================================
-// MESSAGE UPDATE (automod re-check)
+// MESSAGE UPDATE
 // ============================================================================
 
 client.on('messageUpdate', async (oldMsg, newMsg) => {
   if (!newMsg.guild || newMsg.author?.bot) return;
   if (oldMsg.content === newMsg.content) return;
-  if (newMsg.partial) {
-    try { newMsg = await newMsg.fetch(); } catch { return; }
-  }
+  if (newMsg.partial) { try { newMsg = await newMsg.fetch(); } catch { return; } }
   await runAutomod(newMsg, true);
 });
 
 // ============================================================================
-// GHOST PING DETECTION
+// GHOST PING
 // ============================================================================
 
 client.on('messageDelete', async (message) => {
   if (!message.guild || !message.id) return;
+  if (automodDeletedIds.has(message.id)) {
+    automodDeletedIds.delete(message.id);
+    ghostPingTracker.delete(message.id);
+    return;
+  }
   const tracked = ghostPingTracker.get(message.id);
   if (!tracked) return;
   ghostPingTracker.delete(message.id);
-  if (message.author?.bot || tracked.authorId === client.user.id) return;
+  if (tracked.authorId === client.user.id) return;
 
   const guild = message.guild;
   const gc = getGuildConfig(guild.id);
   if (!gc.automod.ghostPingEnabled) return;
 
-  const embed = new EmbedBuilder()
-    .setTitle('Ghost ping')
+  const embed = new EmbedBuilder().setTitle('Ghost ping')
     .setDescription(`Author: <@${tracked.authorId}>\nChannel: <#${tracked.channelId}>\nMentions: ${tracked.mentions.map(id => `<@${id}>`).join(', ')}\nContent: ${tracked.content?.slice(0, 300) || '—'}`)
     .setColor(0xFFAA00).setTimestamp();
   await broadcast(guild, embed, ['staff', 'log', 'webhook']);
@@ -2725,20 +3028,15 @@ client.on('messageDelete', async (message) => {
 });
 
 // ============================================================================
-// ANTINUKE EVENT LISTENERS (audit-log based — fixes Code 1's over-trigger)
+// ANTINUKE EVENTS
 // ============================================================================
 
 client.on('channelDelete', async (channel) => {
   if (!channel.guild) return;
   const guild = channel.guild;
   const gc = getGuildConfig(guild.id);
-
   for (const [tid, t] of Object.entries(gc.tickets.open || {})) {
-    if (t.channelId === channel.id && !t.closed) {
-      t.closed = true;
-      t.closedAt = Date.now();
-      saveConfig();
-    }
+    if (t.channelId === channel.id && !t.closed) { t.closed = true; t.closedAt = Date.now(); saveConfig(); }
   }
   await processAuditAntinuke(guild, 'channelDelete', AuditLogEvent.ChannelDelete);
 });
@@ -2761,11 +3059,8 @@ client.on('guildMemberAdd', async (member) => {
   const exp = gc.antinuke.watchlist?.[member.id];
   if (exp && exp > Date.now()) {
     await stripAllRoles(member);
-    if (member.moderatable) {
-      await member.timeout(24 * 60 * 60 * 1000, 'Anti-nuke watchlist').catch(() => {});
-    }
-    const embed = new EmbedBuilder()
-      .setTitle('Watchlist rejoin')
+    if (member.moderatable) await member.timeout(24 * 60 * 60 * 1000, 'Anti-nuke watchlist').catch(() => {});
+    const embed = new EmbedBuilder().setTitle('Watchlist rejoin')
       .setDescription(`${member.user.tag} (${member.id}) — roles stripped, 24h timeout`)
       .setColor(0xFF0000).setTimestamp();
     await broadcast(member.guild, embed, ['log', 'staff', 'webhook']);
@@ -2773,15 +3068,11 @@ client.on('guildMemberAdd', async (member) => {
 });
 
 // ============================================================================
-// GRACEFUL SHUTDOWN
+// SHUTDOWN & BOOT
 // ============================================================================
 
 process.on('SIGINT', () => { flushConfig(); process.exit(0); });
 process.on('SIGTERM', () => { flushConfig(); process.exit(0); });
-
-// ============================================================================
-// BOOT
-// ============================================================================
 
 if (!process.env.TOKEN) {
   console.error('TOKEN missing in .env');
